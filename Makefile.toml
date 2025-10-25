@@ -1,0 +1,426 @@
+# Makefile.toml for cargo-make automation
+# Run with: cargo make <task>
+# Install cargo-make: cargo install cargo-make
+
+[config]
+default_to_workspace = false
+skip_core_tasks = true
+
+[env]
+CARGO_MAKE_EXTEND_WORKSPACE_MAKEFILE = true
+RUST_BACKTRACE = 1
+
+# Default task
+[tasks.default]
+alias = "check-all"
+
+# Quick check (formatting and clippy)
+[tasks.check]
+description = "Quick check: format and clippy"
+dependencies = ["format-check", "clippy"]
+
+# Full check (all quality checks)
+[tasks.check-all]
+description = "Run all checks"
+dependencies = [
+    "format-check",
+    "clippy",
+    "test",
+    "doc",
+]
+
+# Formatting check
+[tasks.format-check]
+description = "Check code formatting"
+command = "cargo"
+args = ["fmt", "--all", "--", "--check"]
+
+# Format code
+[tasks.format]
+description = "Format code"
+command = "cargo"
+args = ["fmt", "--all"]
+
+# Clippy linting
+[tasks.clippy]
+description = "Run clippy lints"
+command = "cargo"
+args = ["clippy", "--all-targets", "--all-features", "--", "-D", "warnings"]
+
+# Clippy with fixes
+[tasks.clippy-fix]
+description = "Run clippy with automatic fixes"
+command = "cargo"
+args = ["clippy", "--all-targets", "--all-features", "--fix", "--allow-dirty"]
+
+# Build
+[tasks.build]
+description = "Build the project"
+command = "cargo"
+args = ["build", "--all-features"]
+
+# Build release
+[tasks.build-release]
+description = "Build release version"
+command = "cargo"
+args = ["build", "--release", "--all-features"]
+
+# Run tests
+[tasks.test]
+description = "Run tests"
+command = "cargo"
+args = ["test", "--all-features", "--verbose"]
+
+# Run tests with nextest
+[tasks.nextest]
+description = "Run tests with nextest"
+command = "cargo"
+args = ["nextest", "run", "--all-features"]
+install_crate = { crate_name = "cargo-nextest", binary = "cargo-nextest", test_arg = "--help" }
+
+# Run specific test
+[tasks.test-one]
+description = "Run a specific test (use: cargo make test-one -- test_name)"
+command = "cargo"
+args = ["test", "--all-features", "${@}"]
+
+# Watch tests
+[tasks.test-watch]
+description = "Watch and run tests on changes"
+command = "cargo"
+args = ["watch", "-x", "test"]
+install_crate = { crate_name = "cargo-watch", binary = "cargo-watch", test_arg = "--help" }
+
+# Code coverage with tarpaulin
+[tasks.coverage]
+description = "Generate code coverage report"
+command = "cargo"
+args = ["tarpaulin", "--all-features", "--workspace", "--timeout", "300", "--out", "Html", "--out", "Xml"]
+install_crate = { crate_name = "cargo-tarpaulin", binary = "cargo-tarpaulin", test_arg = "--help" }
+
+# Open coverage report
+[tasks.coverage-open]
+description = "Generate and open coverage report"
+dependencies = ["coverage"]
+command = "open"
+args = ["tarpaulin-report.html"]
+
+# Security audit
+[tasks.audit]
+description = "Run security audit"
+command = "cargo"
+args = ["audit"]
+install_crate = { crate_name = "cargo-audit", binary = "cargo-audit", test_arg = "--help" }
+
+# Check for unused dependencies
+[tasks.udeps]
+description = "Check for unused dependencies"
+toolchain = "nightly"
+command = "cargo"
+args = ["udeps", "--all-targets"]
+install_crate = { crate_name = "cargo-udeps", binary = "cargo-udeps", test_arg = "--help" }
+
+# Check for unused dependencies with machete
+[tasks.machete]
+description = "Check for unused dependencies (machete)"
+command = "cargo"
+args = ["machete"]
+install_crate = { crate_name = "cargo-machete", binary = "cargo-machete", test_arg = "--help" }
+
+# Check licenses and advisories
+[tasks.deny]
+description = "Check licenses and advisories"
+command = "cargo"
+args = ["deny", "check"]
+install_crate = { crate_name = "cargo-deny", binary = "cargo-deny", test_arg = "--help" }
+
+# Check for outdated dependencies
+[tasks.outdated]
+description = "Check for outdated dependencies"
+command = "cargo"
+args = ["outdated"]
+install_crate = { crate_name = "cargo-outdated", binary = "cargo-outdated", test_arg = "--help" }
+
+# Update dependencies
+[tasks.update]
+description = "Update dependencies"
+command = "cargo"
+args = ["update"]
+
+# Generate documentation
+[tasks.doc]
+description = "Generate documentation"
+command = "cargo"
+args = ["doc", "--all-features", "--no-deps"]
+env = { "RUSTDOCFLAGS" = "-D warnings" }
+
+# Generate and open documentation
+[tasks.doc-open]
+description = "Generate and open documentation"
+command = "cargo"
+args = ["doc", "--all-features", "--no-deps", "--open"]
+
+# Build examples
+[tasks.examples]
+description = "Build all examples"
+command = "cargo"
+args = ["build", "--examples"]
+
+# Run specific example
+[tasks.example]
+description = "Run an example (use: cargo make example -- example_name)"
+command = "cargo"
+args = ["run", "--example", "${@}"]
+
+# Clean build artifacts
+[tasks.clean]
+description = "Clean build artifacts"
+command = "cargo"
+args = ["clean"]
+
+# Full clean (including cache)
+[tasks.clean-all]
+description = "Clean all artifacts including cache"
+dependencies = ["clean"]
+script = '''
+rm -rf target/
+rm -f Cargo.lock
+rm -rf ~/.cargo/registry/cache/*zenoh*
+rm -rf ~/.cargo/git/checkouts/*zenoh*
+'''
+
+# Pre-commit checks
+[tasks.pre-commit]
+description = "Run all pre-commit checks"
+dependencies = [
+    "format-check",
+    "clippy",
+    "test",
+    "doc",
+    "audit",
+]
+
+# CI simulation
+[tasks.ci]
+description = "Simulate CI pipeline locally"
+dependencies = [
+    "format-check",
+    "clippy",
+    "test",
+    "doc",
+    "audit",
+    "deny",
+]
+
+# Install all quality tools
+[tasks.install-tools]
+description = "Install all quality tools"
+script = '''
+echo "Installing quality tools..."
+cargo install cargo-nextest
+cargo install cargo-tarpaulin
+cargo install cargo-audit
+cargo install cargo-udeps --locked
+cargo install cargo-machete
+cargo install cargo-deny
+cargo install cargo-outdated
+cargo install cargo-watch
+cargo install cargo-make
+echo "All tools installed!"
+'''
+
+# Quick fix - format and clippy fix
+[tasks.fix]
+description = "Auto-fix formatting and clippy issues"
+dependencies = ["format", "clippy-fix"]
+
+# Build plugin for release
+[tasks.plugin]
+description = "Build plugin library for release"
+command = "cargo"
+args = ["build", "--release", "--features", "plugin"]
+
+# Install plugin locally
+[tasks.install-plugin]
+description = "Install plugin to ~/.zenoh/lib/"
+dependencies = ["plugin"]
+script = '''
+mkdir -p ~/.zenoh/lib
+cp target/release/libzenoh_backend_redb.so ~/.zenoh/lib/ 2>/dev/null || \
+cp target/release/libzenoh_backend_redb.dylib ~/.zenoh/lib/ 2>/dev/null || \
+cp target/release/zenoh_backend_redb.dll ~/.zenoh/lib/ 2>/dev/null || true
+echo "Plugin installed to ~/.zenoh/lib/"
+'''
+
+# Run all quality checks (comprehensive)
+[tasks.quality]
+description = "Run comprehensive quality checks"
+dependencies = [
+    "format-check",
+    "clippy",
+    "test",
+    "coverage",
+    "doc",
+    "audit",
+    "udeps",
+    "machete",
+    "deny",
+    "outdated",
+]
+
+# Run all benchmarks
+[tasks.bench]
+description = "Run all benchmarks"
+command = "cargo"
+args = ["bench", "--all-features"]
+
+# Run storage benchmarks only
+[tasks.bench-storage]
+description = "Run storage benchmarks only"
+command = "cargo"
+args = ["bench", "--bench", "storage_benchmarks"]
+
+# Run backend benchmarks only
+[tasks.bench-backend]
+description = "Run backend benchmarks only"
+command = "cargo"
+args = ["bench", "--bench", "backend_benchmarks"]
+
+# Run specific benchmark
+[tasks.bench-one]
+description = "Run specific benchmark (use: cargo make bench-one -- benchmark_name)"
+command = "cargo"
+args = ["bench", "--bench", "${@}"]
+
+# Save benchmark baseline
+[tasks.bench-baseline]
+description = "Save benchmark baseline (use: cargo make bench-baseline -- baseline_name)"
+command = "cargo"
+args = ["bench", "--", "--save-baseline", "${@}"]
+
+# Compare against baseline
+[tasks.bench-compare]
+description = "Compare benchmarks against baseline (use: cargo make bench-compare -- baseline_name)"
+command = "cargo"
+args = ["bench", "--", "--baseline", "${@}"]
+
+# Run quick benchmarks
+[tasks.bench-quick]
+description = "Run quick benchmarks (less accurate, faster)"
+command = "cargo"
+args = ["bench", "--", "--quick"]
+
+# Open benchmark report
+[tasks.bench-report]
+description = "Open benchmark HTML report"
+script = '''
+if [ -f target/criterion/report/index.html ]; then
+    open target/criterion/report/index.html 2>/dev/null || \
+    xdg-open target/criterion/report/index.html 2>/dev/null || \
+    start target/criterion/report/index.html 2>/dev/null || \
+    echo "Please open target/criterion/report/index.html manually"
+else
+    echo "No benchmark report found. Run 'cargo make bench' first."
+fi
+'''
+
+# Clean benchmark data
+[tasks.bench-clean]
+description = "Clean benchmark data"
+script = '''
+rm -rf target/criterion
+echo "Benchmark data cleaned"
+'''
+
+# Watch and rebuild on changes
+[tasks.watch]
+description = "Watch and rebuild on changes"
+command = "cargo"
+args = ["watch", "-x", "build"]
+install_crate = { crate_name = "cargo-watch", binary = "cargo-watch", test_arg = "--help" }
+
+# MSRV check
+[tasks.msrv]
+description = "Check minimum supported Rust version"
+script = '''
+echo "Checking MSRV (Rust 1.70)..."
+rustup toolchain install 1.70
+cargo +1.70 check --all-features
+'''
+
+# Release preparation
+[tasks.release-prep]
+description = "Prepare for release"
+dependencies = [
+    "format",
+    "clippy",
+    "test",
+    "doc",
+    "audit",
+    "deny",
+]
+script = '''
+echo "Release preparation complete!"
+echo "Don't forget to:"
+echo "  1. Update version in Cargo.toml"
+echo "  2. Update CHANGELOG.md"
+echo "  3. Create git tag"
+echo "  4. Push with: git push --tags"
+'''
+
+# Help
+[tasks.help]
+description = "Show available tasks"
+script = '''
+echo "Available tasks:"
+echo ""
+echo "Development:"
+echo "  check          - Quick check (format + clippy)"
+echo "  check-all      - Full check (format + clippy + test + doc)"
+echo "  format         - Format code"
+echo "  clippy         - Run clippy"
+echo "  fix            - Auto-fix formatting and clippy issues"
+echo "  build          - Build project"
+echo "  test           - Run tests"
+echo "  nextest        - Run tests with nextest"
+echo "  watch          - Watch and rebuild on changes"
+echo ""
+echo "Quality:"
+echo "  coverage       - Generate code coverage"
+echo "  audit          - Security audit"
+echo "  udeps          - Check unused dependencies"
+echo "  machete        - Check unused dependencies (alternative)"
+echo "  deny           - Check licenses and advisories"
+echo "  outdated       - Check outdated dependencies"
+echo "  quality        - Run all quality checks"
+echo ""
+echo "Benchmarks:"
+echo "  bench          - Run all benchmarks"
+echo "  bench-storage  - Run storage benchmarks only"
+echo "  bench-backend  - Run backend benchmarks only"
+echo "  bench-quick    - Run quick benchmarks (faster)"
+echo "  bench-baseline - Save benchmark baseline"
+echo "  bench-compare  - Compare against baseline"
+echo "  bench-report   - Open benchmark HTML report"
+echo "  bench-clean    - Clean benchmark data"
+echo ""
+echo "Documentation:"
+echo "  doc            - Generate documentation"
+echo "  doc-open       - Generate and open documentation"
+echo ""
+echo "Plugin:"
+echo "  plugin         - Build plugin for release"
+echo "  install-plugin - Install plugin to ~/.zenoh/lib/"
+echo ""
+echo "CI/CD:"
+echo "  ci             - Simulate CI pipeline"
+echo "  pre-commit     - Run pre-commit checks"
+echo "  release-prep   - Prepare for release"
+echo ""
+echo "Utilities:"
+echo "  clean          - Clean build artifacts"
+echo "  install-tools  - Install all quality tools"
+echo "  help           - Show this help"
+echo ""
+echo "Usage: cargo make <task>"
+'''

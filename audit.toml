@@ -1,0 +1,35 @@
+# Cargo audit configuration
+# This file documents known security advisories that we are aware of but cannot fix
+# because they are in upstream dependencies (Zenoh).
+
+[advisories]
+# Ignore advisories for vulnerabilities in upstream dependencies that we don't control
+ignore = [
+    # RUSTSEC-2023-0071: Marvin Attack in rsa crate
+    # This is a transitive dependency from zenoh-transport
+    # Waiting for upstream Zenoh to address this issue
+    # Severity: Medium (5.9)
+    # Status: No fixed upgrade available as of 2024
+    "RUSTSEC-2023-0071",
+
+    # RUSTSEC-2024-0436: paste crate unmaintained
+    # This is a transitive dependency from zenoh and token-cell
+    # Waiting for upstream Zenoh to migrate to an alternative
+    # This is a warning rather than a vulnerability
+    "RUSTSEC-2024-0436",
+]
+
+[licenses]
+# We allow all licenses by default since this is handled by cargo-deny
+unlicensed = "deny"
+copyleft = "allow"
+allow-osi-fsf-free = "both"
+
+[bans]
+# Deny multiple versions of the same crate
+multiple-versions = "warn"
+
+[sources]
+# Deny crates from unknown registries
+unknown-registry = "deny"
+unknown-git = "deny"

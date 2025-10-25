@@ -1,0 +1,173 @@
+// Example Zenoh configuration file for using the redb storage backend
+//
+// This file demonstrates how to configure the redb backend as a plugin
+// in a Zenoh router.
+//
+// Usage:
+//   zenohd -c zenoh-redb-example.json5
+
+{
+  // Plugin configuration
+  plugins: {
+    // Storage manager plugin configuration
+    storage_manager: {
+
+      // Volume definitions - each volume represents a backend instance
+      volumes: {
+        // Define a "redb" volume using the redb backend
+        redb: {
+          // The backend will use the redb plugin
+          // Backend-specific configuration can be added here if needed
+        }
+      },
+
+      // Storage definitions - each storage is an instance within a volume
+      storages: {
+
+        // Example 1: Simple demo storage
+        demo: {
+          // Key expression this storage subscribes to
+          key_expr: "demo/example/**",
+
+          // Strip this prefix from keys before storing
+          // e.g., "demo/example/sensor/temp" will be stored as "sensor/temp"
+          strip_prefix: "demo/example",
+
+          // Volume configuration
+          volume: {
+            // Reference to the volume defined above
+            id: "redb",
+
+            // Directory name for this storage (relative to backend root)
+            // The database will be created as: <root>/demo_storage.redb
+            dir: "demo_storage",
+
+            // Create the database if it doesn't exist
+            create_db: true,
+
+            // Enable fsync for durability (default: true)
+            fsync: true,
+          }
+        },
+
+        // Example 2: High-performance storage with custom settings
+        sensor_data: {
+          key_expr: "sensors/**",
+
+          volume: {
+            id: "redb",
+            dir: "sensor_data",
+            create_db: true,
+
+            // Disable fsync for better write performance (less durable)
+            fsync: false,
+
+            // Set cache size to 100MB for better read performance
+            cache_size: 104857600,
+          }
+        },
+
+        // Example 3: Read-only storage
+        static_config: {
+          key_expr: "config/**",
+
+          volume: {
+            id: "redb",
+            dir: "config_data",
+
+            // Open in read-only mode - no writes allowed
+            read_only: true,
+
+            // Don't try to create (must already exist)
+            create_db: false,
+          }
+        },
+
+        // Example 4: Time-series data storage
+        timeseries: {
+          key_expr: "metrics/**",
+          strip_prefix: "metrics",
+
+          volume: {
+            id: "redb",
+            db_file: "timeseries_metrics.redb",
+            create_db: true,
+
+            // Large cache for time-series queries
+            cache_size: 209715200,  // 200MB
+
+            // Enable fsync for important metrics
+            fsync: true,
+          }
+        },
+      }
+    },
+
+    // Optional: REST plugin for testing storage via HTTP
+    rest: {
+      http_port: 8000
+    }
+  }
+}
+
+// Environment Variables:
+//
+// ZENOH_BACKEND_REDB_ROOT - Override the default root directory for all redb databases
+//                           Default: ~/.zenoh/zenoh_backend_redb
+//
+// Example:
+//   export ZENOH_BACKEND_REDB_ROOT=/var/data/zenoh/redb
+//   zenohd -c zenoh-redb-example.json5
+
+// Configuration Properties Reference:
+//
+// Volume-level (per storage):
+//   - id (required): "redb" - References the redb volume
+//   - dir (optional): Directory name for the database (relative to root)
+//   - db_file (optional): Alternative to 'dir', specifies full filename
+//   - create_db (optional, default: true): Create database if missing
+//   - read_only (optional, default: false): Open in read-only mode
+//   - cache_size (optional): Cache size in bytes
+//   - fsync (optional, default: true): Enable fsync for durability
+//
+// Storage-level:
+//   - key_expr (required): Key expression pattern to subscribe to
+//   - strip_prefix (optional): Prefix to strip from keys before storage
+
+// Testing the Configuration:
+//
+// 1. Start the router:
+//    zenohd -c zenoh-redb-example.json5
+//
+// 2. Put a value (using zenoh CLI or REST API):
+//    # Using REST API:
+//    curl -X PUT -d 'Hello, World!' http://localhost:8000/demo/example/greeting
+//
+//    # Using zenoh put:
+//    z_put -k demo/example/greeting -v "Hello, World!"
+//
+// 3. Get the value:
+//    # Using REST API:
+//    curl http://localhost:8000/demo/example/greeting
+//
+//    # Using zenoh get:
+//    z_get -s demo/example/greeting
+//
+// 4. Query with wildcards:
+//    curl http://localhost:8000/demo/example/**
+//    z_get -s 'demo/example/**'
+
+// Performance Tuning:
+//
+// For write-heavy workloads:
+//   - Set fsync: false (less durable, faster)
+//   - Use reasonable cache_size (50-200MB)
+//
+// For read-heavy workloads:
+//   - Increase cache_size (200MB+)
+//   - Keep fsync: true for safety
+//
+// For embedded/edge devices:
+//   - Lower cache_size (10-50MB)
+//   - Consider fsync: false if acceptable
+//   - Use strip_prefix to save space

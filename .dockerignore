@@ -1,0 +1,59 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Test artifacts
+*.profraw
+*.profdata
+coverage/
+
+# Git
+.git/
+.gitignore
+.github/
+
+# Documentation build
+target/doc/
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+
+# Temporary files
+tmp/
+*.tmp
+*.log
+*.bak
+*.backup
+
+# Example databases
+example_databases/
+zenoh_redb_backend/
+zenoh_redb_storage/
+*.redb
+*.redb-shm
+*.redb-wal
+
+# Documentation source (keep compiled docs)
+*.md
+!README.md
+!LICENSE*
+
+# Test files
+tests/
+
+# Cargo lock for libraries (keep if you want reproducible builds)
+# Cargo.lock
+
+# Environment files
+.env
+.env.local
