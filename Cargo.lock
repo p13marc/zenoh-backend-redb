@@ -3667,7 +3667,7 @@ dependencies = [
 
 [[package]]
 name = "zenoh-backend-redb"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "criterion",
