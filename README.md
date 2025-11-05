@@ -292,18 +292,12 @@ View HTML reports:
 open target/criterion/report/index.html
 ```
 
-Using task runners:
+Using just:
 
 ```bash
-# With just
 just bench              # Run all benchmarks
 just bench-storage      # Storage benchmarks only
 just bench-report       # Open HTML report
-
-# With cargo-make
-cargo make bench
-cargo make bench-storage
-cargo make bench-report
 ```
 
 For detailed benchmarking documentation, see [PHASE6_BENCHMARKS.md](PHASE6_BENCHMARKS.md).
