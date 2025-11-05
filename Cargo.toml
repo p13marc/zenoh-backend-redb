@@ -24,11 +24,11 @@ dynamic_plugin = []
 redb = "2.1"
 
 # Zenoh dependencies
-zenoh = { version = "1.6.1", git = "https://github.com/eclipse-zenoh/zenoh.git", rev = "1bd82eeef7d9b2df0d96dbbaf947ac75c90571aa", features = ["plugins", "unstable", "internal"] }
-zenoh-plugin-trait = { version = "1.6.1", git = "https://github.com/eclipse-zenoh/zenoh.git", rev = "1bd82eeef7d9b2df0d96dbbaf947ac75c90571aa" }
-zenoh_backend_traits = { version = "1.6.1", git = "https://github.com/eclipse-zenoh/zenoh.git", rev = "1bd82eeef7d9b2df0d96dbbaf947ac75c90571aa", default-features = false }
-zenoh-util = { version = "1.6.1", git = "https://github.com/eclipse-zenoh/zenoh.git", rev = "1bd82eeef7d9b2df0d96dbbaf947ac75c90571aa" }
-zenoh-ext = { version = "1.6.1", git = "https://github.com/eclipse-zenoh/zenoh.git", rev = "1bd82eeef7d9b2df0d96dbbaf947ac75c90571aa" }
+zenoh = { version = "1.6.2", features = ["plugins", "unstable", "internal"] }
+zenoh-plugin-trait = { version = "1.6.2" }
+zenoh_backend_traits = { version = "1.6.2" }
+zenoh-util = { version = "1.6.2" }
+zenoh-ext = { version = "1.6.2", features = ["unstable"] }
 
 # Async support
 async-trait = "0.1"
@@ -37,9 +37,6 @@ tokio = { version = "1.35", features = ["sync", "rt-multi-thread"] }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-
-# Performance
-smallvec = "1.11"
 
 # Error handling
 thiserror = "1.0"
