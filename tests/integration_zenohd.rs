@@ -40,9 +40,6 @@ impl ZenohdProcess {
         // Create zenohd configuration with our backend
         let config = format!(
             r#"{{
-    connect: {{
-        endpoints: ["tcp/127.0.0.1:{}"]
-    }},
     listen: {{
         endpoints: ["tcp/127.0.0.1:{}"]
     }},
@@ -72,7 +69,6 @@ impl ZenohdProcess {
         }}
     }}
 }}"#,
-            port,
             port,
             plugin_path.display(),
             db_path.display()
@@ -300,9 +296,6 @@ async fn test_zenohd_storage_persistence() {
 
     let config_content = format!(
         r#"{{
-    connect: {{
-        endpoints: ["tcp/127.0.0.1:7448"]
-    }},
     listen: {{
         endpoints: ["tcp/127.0.0.1:7448"]
     }},
