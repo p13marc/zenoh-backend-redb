@@ -459,23 +459,13 @@ impl RedbStorage {
 
         let write_txn = self.db.begin_write()?;
         {
-            // Clear both tables
-            let mut payloads_table = write_txn.open_table(PAYLOADS_TABLE)?;
-            let mut data_info_table = write_txn.open_table(DATA_INFO_TABLE)?;
+            // Delete and recreate both tables - much more efficient than removing keys one by one
+            write_txn.delete_table(PAYLOADS_TABLE)?;
+            write_txn.delete_table(DATA_INFO_TABLE)?;
 
-            // Collect all keys first to avoid mutation during iteration
-            let keys: Vec<Vec<u8>> = data_info_table
-                .iter()?
-                .map(|item| {
-                    let (key_bytes, _) = item?;
-                    Ok(key_bytes.value().to_vec())
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            for key in keys {
-                payloads_table.remove(key.as_slice())?;
-                data_info_table.remove(key.as_slice())?;
-            }
+            // Recreate the tables
+            write_txn.open_table(PAYLOADS_TABLE)?;
+            write_txn.open_table(DATA_INFO_TABLE)?;
         }
         write_txn.commit()?;
 
