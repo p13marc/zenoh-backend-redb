@@ -221,7 +221,7 @@ impl Volume for RedbVolume {
         let storage_name = config.name.clone();
 
         // Create the storage directly (not using backend.create_storage to avoid double management)
-        let redb_storage = RedbStorage::new(&db_path, storage_name.clone(), storage_config.clone())
+        let redb_storage = RedbStorage::new(&db_path, storage_config.clone(), storage_name.clone())
             .map_err(|e| zerror!("Failed to create redb storage: {}", e))?;
 
         info!("Created redb storage '{}' at {:?}", storage_name, db_path);
@@ -271,14 +271,8 @@ impl Storage for RedbStoragePlugin {
         // Convert ZBytes to Vec<u8>
         let payload_bytes = payload.to_bytes().to_vec();
 
-        // Convert Zenoh timestamp to Unix timestamp (seconds)
-        let unix_timestamp = timestamp.get_time().as_u64();
-
-        // Convert encoding to string
-        let encoding_str = encoding.to_string();
-
-        // Create stored value
-        let value = StoredValue::new(payload_bytes, unix_timestamp, encoding_str);
+        // Create stored value with native Zenoh timestamp (preserves both time and ID)
+        let value = StoredValue::new(payload_bytes, timestamp, encoding);
 
         // Store in database
         storage
@@ -336,13 +330,8 @@ impl Storage for RedbStoragePlugin {
             Some(stored_value) => {
                 // Convert back to Zenoh types
                 let payload = ZBytes::from(stored_value.payload);
-                let encoding = Encoding::from(stored_value.encoding);
-
-                // Convert Unix timestamp back to Zenoh Timestamp
-                let timestamp = Timestamp::new(
-                    zenoh::time::NTP64(stored_value.timestamp),
-                    zenoh::time::TimestampId::rand(),
-                );
+                let encoding = stored_value.encoding.clone();
+                let timestamp = stored_value.timestamp;
 
                 Ok(vec![StoredData {
                     payload,
@@ -378,11 +367,8 @@ impl Storage for RedbStoragePlugin {
                 }
             };
 
-            // Convert Unix timestamp to Zenoh Timestamp
-            let timestamp = Timestamp::new(
-                zenoh::time::NTP64(stored_value.timestamp),
-                zenoh::time::TimestampId::rand(),
-            );
+            // Use the stored timestamp directly (preserves both time and ID)
+            let timestamp = stored_value.timestamp;
 
             result.push((key_expr, timestamp));
         }
@@ -471,7 +457,7 @@ mod tests {
             .with_create_db(true);
 
         let redb_storage =
-            RedbStorage::new(&db_path, "test".to_string(), storage_config.clone()).unwrap();
+            RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
         let storage_plugin = RedbStoragePlugin {
             config: StorageConfig {
@@ -502,7 +488,7 @@ mod tests {
             .with_create_db(true);
 
         let redb_storage =
-            RedbStorage::new(&db_path, "test".to_string(), storage_config.clone()).unwrap();
+            RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
         let storage_plugin = RedbStoragePlugin {
             config: StorageConfig {
@@ -536,7 +522,7 @@ mod tests {
             .with_create_db(true);
 
         let redb_storage =
-            RedbStorage::new(&db_path, "test".to_string(), storage_config.clone()).unwrap();
+            RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
         let mut storage_plugin = RedbStoragePlugin {
             config: StorageConfig {
@@ -583,7 +569,7 @@ mod tests {
             .with_create_db(true);
 
         let redb_storage =
-            RedbStorage::new(&db_path, "test".to_string(), storage_config.clone()).unwrap();
+            RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
         let mut storage_plugin = RedbStoragePlugin {
             config: StorageConfig {
@@ -629,7 +615,7 @@ mod tests {
             .with_create_db(true);
 
         let redb_storage =
-            RedbStorage::new(&db_path, "test".to_string(), storage_config.clone()).unwrap();
+            RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
         let mut storage_plugin = RedbStoragePlugin {
             config: StorageConfig {
@@ -678,7 +664,7 @@ mod tests {
             .with_db_path(db_path.clone())
             .with_create_db(true);
 
-        let redb_storage = RedbStorage::new(&db_path, "test".to_string(), storage_config).unwrap();
+        let redb_storage = RedbStorage::new(&db_path, storage_config, "test".to_string()).unwrap();
 
         let key = OwnedKeyExpr::new("test/key1").unwrap();
         let payload = ZBytes::from("test_value");
@@ -689,11 +675,7 @@ mod tests {
         redb_storage
             .put(
                 &key.to_string(),
-                StoredValue::new(
-                    payload.to_bytes().to_vec(),
-                    timestamp.get_time().as_u64(),
-                    encoding.to_string(),
-                ),
+                StoredValue::new(payload.to_bytes().to_vec(), timestamp, encoding.clone()),
             )
             .unwrap();
 
@@ -705,7 +687,7 @@ mod tests {
             .with_create_db(false)
             .with_read_only(true);
 
-        let ro_storage = RedbStorage::new(&db_path, "test".to_string(), ro_config.clone()).unwrap();
+        let ro_storage = RedbStorage::new(&db_path, ro_config.clone(), "test".to_string()).unwrap();
 
         let mut storage_plugin = RedbStoragePlugin {
             config: StorageConfig {
@@ -740,7 +722,7 @@ mod tests {
             .with_db_path(db_path.clone())
             .with_create_db(true);
 
-        let redb_storage = RedbStorage::new(&db_path, "test".to_string(), storage_config).unwrap();
+        let redb_storage = RedbStorage::new(&db_path, storage_config, "test".to_string()).unwrap();
 
         let key = OwnedKeyExpr::new("test/key1").unwrap();
         let payload = ZBytes::from("test_value");
@@ -751,11 +733,7 @@ mod tests {
         redb_storage
             .put(
                 &key.to_string(),
-                StoredValue::new(
-                    payload.to_bytes().to_vec(),
-                    timestamp.get_time().as_u64(),
-                    encoding.to_string(),
-                ),
+                StoredValue::new(payload.to_bytes().to_vec(), timestamp, encoding),
             )
             .unwrap();
 
@@ -767,7 +745,7 @@ mod tests {
             .with_create_db(false)
             .with_read_only(true);
 
-        let ro_storage = RedbStorage::new(&db_path, "test".to_string(), ro_config.clone()).unwrap();
+        let ro_storage = RedbStorage::new(&db_path, ro_config.clone(), "test".to_string()).unwrap();
 
         let mut storage_plugin = RedbStoragePlugin {
             config: StorageConfig {
@@ -799,7 +777,7 @@ mod tests {
             .with_create_db(true);
 
         let redb_storage =
-            RedbStorage::new(&db_path, "test".to_string(), storage_config.clone()).unwrap();
+            RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
         let mut storage_plugin = RedbStoragePlugin {
             config: StorageConfig {

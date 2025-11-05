@@ -2,6 +2,12 @@
 //!
 //! This test verifies that the plugin works correctly when loaded by zenohd,
 //! testing the full end-to-end flow of Zenoh with the redb storage backend.
+//!
+//! **Note:** These tests spawn zenohd instances on different ports but should be run
+//! serially to avoid potential port conflicts or resource contention:
+//! ```bash
+//! cargo test --test integration_zenohd -- --test-threads=1
+//! ```
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -12,12 +18,13 @@ struct ZenohdProcess {
     child: Child,
     #[allow(dead_code)]
     temp_dir: TempDir,
+    #[allow(dead_code)]
     config_path: std::path::PathBuf,
 }
 
 impl ZenohdProcess {
     /// Spawn zenohd with a configuration that loads our redb backend
-    fn spawn() -> Result<Self, Box<dyn std::error::Error>> {
+    fn spawn(port: u16) -> Result<Self, Box<dyn std::error::Error>> {
         let temp_dir = TempDir::new()?;
         let config_path = temp_dir.path().join("zenoh-config.json5");
         let db_path = temp_dir.path().join("test_storage");
@@ -33,6 +40,12 @@ impl ZenohdProcess {
         // Create zenohd configuration with our backend
         let config = format!(
             r#"{{
+    connect: {{
+        endpoints: ["tcp/127.0.0.1:{}"]
+    }},
+    listen: {{
+        endpoints: ["tcp/127.0.0.1:{}"]
+    }},
     plugins: {{
         storage_manager: {{
             volumes: {{
@@ -59,6 +72,8 @@ impl ZenohdProcess {
         }}
     }}
 }}"#,
+            port,
+            port,
             plugin_path.display(),
             db_path.display()
         );
@@ -115,8 +130,8 @@ impl Drop for ZenohdProcess {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn test_zenohd_with_redb_plugin() {
-    // Spawn zenohd with our plugin
-    let mut zenohd = ZenohdProcess::spawn().expect("Failed to spawn zenohd");
+    // Spawn zenohd with our plugin on port 7447
+    let mut zenohd = ZenohdProcess::spawn(7447).expect("Failed to spawn zenohd");
 
     // Verify zenohd is running
     assert!(zenohd.is_running(), "zenohd should be running");
@@ -285,6 +300,12 @@ async fn test_zenohd_storage_persistence() {
 
     let config_content = format!(
         r#"{{
+    connect: {{
+        endpoints: ["tcp/127.0.0.1:7448"]
+    }},
+    listen: {{
+        endpoints: ["tcp/127.0.0.1:7448"]
+    }},
     plugins: {{
         storage_manager: {{
             volumes: {{

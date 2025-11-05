@@ -3,6 +3,8 @@
 //! This example demonstrates how to create a backend, create a storage,
 //! and perform basic CRUD operations.
 
+use zenoh::bytes::Encoding;
+use zenoh::time::{NTP64, Timestamp, TimestampId};
 use zenoh_backend_redb::{RedbBackend, RedbBackendConfig, RedbStorageConfig, StoredValue};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -41,15 +43,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     for (key, value, encoding) in &entries {
-        let stored_value = StoredValue::new(
-            value.as_bytes().to_vec(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs(),
-            encoding.to_string(),
-        );
+        let time_u64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let timestamp = Timestamp::new(NTP64(time_u64), TimestampId::rand());
+        let enc = match *encoding {
+            "application/json" => Encoding::APPLICATION_JSON,
+            "text/plain" => Encoding::TEXT_PLAIN,
+            _ => Encoding::ZENOH_BYTES,
+        };
+        let stored_value = StoredValue::new(value.as_bytes().to_vec(), timestamp, enc);
         storage.put(key, stored_value)?;
-        println!("   ✓ Stored: {} = {}", key, value);
     }
     println!();
 
@@ -94,13 +98,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     // 8. Update a value
+    // 8. Update an existing value
     println!("8. Updating value...");
+    let time_u64 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let timestamp = Timestamp::new(NTP64(time_u64), TimestampId::rand());
     let updated_value = StoredValue::new(
         "24.8".as_bytes().to_vec(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs(),
-        "application/json".to_string(),
+        timestamp,
+        Encoding::APPLICATION_JSON,
     );
     storage.put("demo/sensor/temperature", updated_value)?;
     if let Some(value) = storage.get("demo/sensor/temperature")? {
@@ -110,10 +117,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 9. Delete a value
     println!("9. Deleting value...");
-    let deleted = storage.delete("demo/device/status")?;
-    if deleted {
-        println!("   ✓ Deleted 'demo/device/status'\n");
-    }
+    storage.delete("demo/device/status")?;
+    println!("   ✓ Deleted 'demo/device/status'\n");
 
     // 10. Count remaining entries
     println!("10. Counting entries...");

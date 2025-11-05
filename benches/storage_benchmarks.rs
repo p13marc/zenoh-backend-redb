@@ -1,4 +1,6 @@
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use zenoh::bytes::Encoding;
+use zenoh::time::{NTP64, Timestamp, TimestampId};
 use tempfile::TempDir;
 use zenoh_backend_redb::{RedbBackend, RedbBackendConfig, RedbStorageConfig, StoredValue};
 
@@ -15,7 +17,7 @@ fn create_test_backend() -> (RedbBackend, TempDir) {
 /// Helper to create a stored value with a given size
 fn create_value(size: usize, timestamp: u64) -> StoredValue {
     let payload = vec![0u8; size];
-    StoredValue::new(payload, timestamp, "application/octet-stream".to_string())
+    StoredValue::new(payload, Timestamp::new(NTP64(timestamp), TimestampId::rand()), Encoding::ZENOH_BYTES)
 }
 
 /// Benchmark single PUT operations with varying payload sizes
@@ -441,60 +443,6 @@ fn bench_key_operations(c: &mut Criterion) {
     });
 }
 
-/// Benchmark get() vs get_ref() for zero-copy performance comparison
-fn bench_get_comparison(c: &mut Criterion) {
-    let mut group = c.benchmark_group("get_comparison");
-
-    for size in [100, 1_000, 10_000, 100_000, 1_000_000].iter() {
-        group.throughput(Throughput::Bytes(*size as u64));
-
-        // Benchmark regular get() (clones payload)
-        group.bench_with_input(BenchmarkId::new("get_clone", size), size, |b, &size| {
-            let (backend, _temp_dir) = create_test_backend();
-            let storage = backend
-                .create_storage("bench_storage".to_string(), None)
-                .unwrap();
-
-            // Pre-populate with data
-            for i in 0..10 {
-                let key = format!("test/key/{}", i);
-                let value = create_value(size, i);
-                storage.put(&key, value).unwrap();
-            }
-
-            let mut counter = 0;
-            b.iter(|| {
-                let key = format!("test/key/{}", counter % 10);
-                counter += 1;
-                black_box(storage.get(&key).unwrap());
-            });
-        });
-
-        // Benchmark get_ref() (zero-copy guard)
-        group.bench_with_input(BenchmarkId::new("get_ref", size), size, |b, &size| {
-            let (backend, _temp_dir) = create_test_backend();
-            let storage = backend
-                .create_storage("bench_storage".to_string(), None)
-                .unwrap();
-
-            // Pre-populate with data
-            for i in 0..10 {
-                let key = format!("test/key/{}", i);
-                let value = create_value(size, i);
-                storage.put(&key, value).unwrap();
-            }
-
-            let mut counter = 0;
-            b.iter(|| {
-                let key = format!("test/key/{}", counter % 10);
-                counter += 1;
-                black_box(storage.get_ref(&key).unwrap());
-            });
-        });
-    }
-    group.finish();
-}
-
 /// Benchmark bulk get_many operations vs individual gets
 fn bench_get_many_vs_individual(c: &mut Criterion) {
     let mut group = c.benchmark_group("get_many_comparison");
@@ -517,7 +465,7 @@ fn bench_get_many_vs_individual(c: &mut Criterion) {
         // Benchmark get_many
         group.bench_with_input(BenchmarkId::new("get_many", count), count, |b, _| {
             b.iter(|| {
-                black_box(storage.get_many(&key_refs).unwrap());
+                black_box(storage.get_many(key_refs.clone()).unwrap());
             });
         });
 
@@ -562,7 +510,7 @@ fn bench_delete_many_vs_individual(c: &mut Criterion) {
                     },
                     |(storage, keys, _temp_dir)| {
                         let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-                        black_box(storage.delete_many(&key_refs).unwrap());
+                        black_box(storage.delete_many(key_refs.clone()).unwrap());
                     },
                     criterion::BatchSize::SmallInput,
                 );
@@ -620,7 +568,6 @@ criterion_group!(
     bench_fsync_impact,
     bench_prefix_stripping,
     bench_key_operations,
-    bench_get_comparison,
     bench_get_many_vs_individual,
     bench_delete_many_vs_individual,
 );

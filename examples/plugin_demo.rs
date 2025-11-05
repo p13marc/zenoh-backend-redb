@@ -6,7 +6,9 @@
 //! Note: This example shows the plugin structure but requires a full Zenoh runtime
 //! to work properly. For standalone usage, see basic_usage.rs instead.
 
-use zenoh_backend_redb::{RedbBackend, RedbBackendConfig, RedbStorageConfig};
+use zenoh::bytes::Encoding;
+use zenoh::time::{NTP64, Timestamp, TimestampId};
+use zenoh_backend_redb::{RedbBackend, RedbBackendConfig, RedbStorageConfig, StoredValue};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -69,19 +71,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Sensor data operations
     println!("   Sensor Storage:");
-    let timestamp = std::time::SystemTime::now()
+    let time_u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_secs();
-
-    use zenoh_backend_redb::StoredValue;
+    let timestamp = Timestamp::new(NTP64(time_u64), TimestampId::rand());
 
     sensor_storage.put(
         "sensor/temperature/room1",
-        StoredValue::new(b"23.5".to_vec(), timestamp, "application/json".to_string()),
+        StoredValue::new(b"23.5".to_vec(), timestamp, Encoding::APPLICATION_JSON),
     )?;
     sensor_storage.put(
         "sensor/humidity/room1",
-        StoredValue::new(b"65".to_vec(), timestamp, "application/json".to_string()),
+        StoredValue::new(b"65".to_vec(), timestamp, Encoding::APPLICATION_JSON),
     )?;
     println!("     ✓ Stored sensor readings");
 
@@ -89,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   Config Storage:");
     config_storage.put(
         "config/app/timeout",
-        StoredValue::new(b"30".to_vec(), timestamp, "text/plain".to_string()),
+        StoredValue::new(b"30".to_vec(), timestamp, Encoding::TEXT_PLAIN),
     )?;
     println!("     ✓ Stored configuration\n");
 
@@ -97,12 +98,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   Metrics Storage:");
     for i in 0..5 {
         let metric_value = format!("{}", 100 + i);
+        let ts = Timestamp::new(NTP64(time_u64 + i), TimestampId::rand());
         metrics_storage.put(
             &format!("metrics/cpu/usage/{}", i),
             StoredValue::new(
                 metric_value.as_bytes().to_vec(),
-                timestamp + i,
-                "application/json".to_string(),
+                ts,
+                Encoding::APPLICATION_JSON,
             ),
         )?;
     }

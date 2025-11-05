@@ -3,6 +3,8 @@
 use std::sync::Arc;
 use tempfile::TempDir;
 use zenoh_backend_redb::{RedbBackend, RedbBackendConfig, RedbStorageConfig, StoredValue};
+use zenoh::bytes::Encoding;
+use zenoh::time::{NTP64, Timestamp, TimestampId};
 
 /// Helper function to create a test backend with temporary storage.
 fn create_test_backend() -> (RedbBackend, TempDir) {
@@ -14,6 +16,14 @@ fn create_test_backend() -> (RedbBackend, TempDir) {
     let backend = RedbBackend::new(config).expect("Failed to create backend");
     (backend, temp_dir)
 }
+
+/// Helper to create a test value with proper types
+fn test_value(payload: Vec<u8>, time: u64) -> StoredValue {
+    let timestamp = Timestamp::new(NTP64(time), TimestampId::rand());
+    let encoding = Encoding::TEXT_PLAIN;
+    StoredValue::new(payload, timestamp, encoding)
+}
+
 
 #[test]
 fn test_backend_initialization() {
@@ -180,7 +190,7 @@ fn test_storage_replacement() {
         .unwrap();
 
     // Store some data
-    let value = StoredValue::new(b"data1".to_vec(), 1, "text/plain".to_string());
+    let value = test_value(b"data1".to_vec(), 1);
     storage1.put("key1", value).unwrap();
 
     // Drop storage1 to release the database file
@@ -268,11 +278,7 @@ fn test_concurrent_storage_access() {
         let handle = thread::spawn(move || {
             let storage = backend_clone.get_storage("concurrent").unwrap();
             let key = format!("key_{}", i);
-            let value = StoredValue::new(
-                format!("value_{}", i).into_bytes(),
-                i as u64,
-                "text/plain".to_string(),
-            );
+            let value = test_value(format!("value_{}", i).into_bytes(), i as u64);
             storage.put(&key, value).unwrap();
         });
         handles.push(handle);
@@ -302,11 +308,11 @@ fn test_storage_isolation() {
         .unwrap();
 
     // Put data in storage1
-    let value1 = StoredValue::new(b"data1".to_vec(), 1, "text/plain".to_string());
+    let value1 = test_value(b"data1".to_vec(), 1);
     storage1.put("key1", value1).unwrap();
 
     // Put data in storage2
-    let value2 = StoredValue::new(b"data2".to_vec(), 2, "text/plain".to_string());
+    let value2 = test_value(b"data2".to_vec(), 2);
     storage2.put("key2", value2).unwrap();
 
     // Each storage should only have its own data
@@ -347,7 +353,7 @@ fn test_storage_with_read_only_config() {
     let storage1 = backend
         .create_storage("writable".to_string(), None)
         .unwrap();
-    let value = StoredValue::new(b"data".to_vec(), 1, "text/plain".to_string());
+    let value = test_value(b"data".to_vec(), 1);
     storage1.put("key1", value).unwrap();
 
     // Now try to create a read-only storage pointing to same DB

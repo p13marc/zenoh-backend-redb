@@ -3,6 +3,9 @@
 use std::collections::HashSet;
 use tempfile::TempDir;
 use zenoh_backend_redb::{RedbBackend, RedbBackendConfig, RedbStorageConfig, StoredValue};
+use zenoh::bytes::Encoding;
+use zenoh::time::{NTP64, Timestamp, TimestampId};
+
 
 /// Helper function to create a test backend and storage.
 fn create_test_storage() -> (RedbBackend, TempDir) {
@@ -18,6 +21,13 @@ fn create_test_storage() -> (RedbBackend, TempDir) {
 
     (backend, temp_dir)
 }
+/// Helper to create a test value with proper types
+fn test_value(payload: Vec<u8>, time: u64) -> StoredValue {
+    let timestamp = Timestamp::new(NTP64(time), TimestampId::rand());
+    let encoding = Encoding::TEXT_PLAIN;
+    StoredValue::new(payload, timestamp, encoding)
+}
+
 
 #[test]
 fn test_basic_put_get_delete() {
@@ -25,7 +35,7 @@ fn test_basic_put_get_delete() {
     let storage = backend.get_storage("test_storage").unwrap();
 
     // Put a value
-    let value = StoredValue::new(b"test_value".to_vec(), 12345, "text/plain".to_string());
+    let value = test_value(b"test_value".to_vec(), 12345);
     storage.put("test_key", value.clone()).unwrap();
 
     // Get the value
@@ -34,11 +44,11 @@ fn test_basic_put_get_delete() {
     let retrieved = retrieved.unwrap();
     assert_eq!(retrieved.payload, value.payload);
     assert_eq!(retrieved.timestamp, value.timestamp);
-    assert_eq!(retrieved.encoding, value.encoding);
+    assert_eq!(retrieved.encoding.id(), value.encoding.id());
 
     // Delete the value
-    let deleted = storage.delete("test_key").unwrap();
-    assert!(deleted);
+    storage.delete("test_key").unwrap();
+    // deleted
 
     // Verify it's gone
     let retrieved = storage.get("test_key").unwrap();
@@ -51,17 +61,17 @@ fn test_put_overwrite() {
     let storage = backend.get_storage("test_storage").unwrap();
 
     // Put initial value
-    let value1 = StoredValue::new(b"value1".to_vec(), 100, "text/plain".to_string());
+    let value1 = test_value(b"value1".to_vec(), 100);
     storage.put("key", value1).unwrap();
 
     // Overwrite with new value
-    let value2 = StoredValue::new(b"value2".to_vec(), 200, "text/plain".to_string());
+    let value2 = test_value(b"value2".to_vec(), 200);
     storage.put("key", value2.clone()).unwrap();
 
     // Should get the new value
     let retrieved = storage.get("key").unwrap().unwrap();
     assert_eq!(retrieved.payload, value2.payload);
-    assert_eq!(retrieved.timestamp, 200);
+    assert_eq!(retrieved.timestamp.get_time().as_u64(), 200);
 }
 
 #[test]
@@ -70,8 +80,8 @@ fn test_delete_nonexistent() {
     let storage = backend.get_storage("test_storage").unwrap();
 
     // Delete non-existent key should return false
-    let deleted = storage.delete("nonexistent").unwrap();
-    assert!(!deleted);
+    storage.delete("nonexistent").unwrap();  // returns ()
+    // Delete was called (no error)
 }
 
 #[test]
@@ -92,11 +102,7 @@ fn test_multiple_keys() {
     // Put multiple keys
     for i in 0..100 {
         let key = format!("key_{}", i);
-        let value = StoredValue::new(
-            format!("value_{}", i).into_bytes(),
-            i as u64,
-            "text/plain".to_string(),
-        );
+        let value = test_value(format!("value_{}", i).into_bytes(), i as u64);
         storage.put(&key, value).unwrap();
     }
 
@@ -123,11 +129,7 @@ fn test_get_all() {
     // Put some data
     for i in 0..10 {
         let key = format!("key_{}", i);
-        let value = StoredValue::new(
-            format!("value_{}", i).into_bytes(),
-            i as u64,
-            "text/plain".to_string(),
-        );
+        let value = test_value(format!("value_{}", i).into_bytes(), i as u64);
         storage.put(&key, value).unwrap();
     }
 
@@ -152,25 +154,25 @@ fn test_get_by_prefix() {
     storage
         .put(
             "sensors/temp/1",
-            StoredValue::new(b"20".to_vec(), 1, "text/plain".to_string()),
+            test_value(b"20".to_vec(), 1),
         )
         .unwrap();
     storage
         .put(
             "sensors/temp/2",
-            StoredValue::new(b"21".to_vec(), 2, "text/plain".to_string()),
+            test_value(b"21".to_vec(), 2),
         )
         .unwrap();
     storage
         .put(
             "sensors/humidity/1",
-            StoredValue::new(b"50".to_vec(), 3, "text/plain".to_string()),
+            test_value(b"50".to_vec(), 3),
         )
         .unwrap();
     storage
         .put(
             "config/timeout",
-            StoredValue::new(b"30".to_vec(), 4, "text/plain".to_string()),
+            test_value(b"30".to_vec(), 4),
         )
         .unwrap();
 
@@ -193,7 +195,7 @@ fn test_get_by_prefix_no_matches() {
     storage
         .put(
             "key1",
-            StoredValue::new(b"value1".to_vec(), 1, "text/plain".to_string()),
+            test_value(b"value1".to_vec(), 1),
         )
         .unwrap();
 
@@ -210,25 +212,25 @@ fn test_wildcard_single_segment() {
     storage
         .put(
             "a/b/c",
-            StoredValue::new(b"1".to_vec(), 1, "text/plain".to_string()),
+            test_value(b"1".to_vec(), 1),
         )
         .unwrap();
     storage
         .put(
             "a/x/c",
-            StoredValue::new(b"2".to_vec(), 2, "text/plain".to_string()),
+            test_value(b"2".to_vec(), 2),
         )
         .unwrap();
     storage
         .put(
             "a/y/c",
-            StoredValue::new(b"3".to_vec(), 3, "text/plain".to_string()),
+            test_value(b"3".to_vec(), 3),
         )
         .unwrap();
     storage
         .put(
             "a/b/d",
-            StoredValue::new(b"4".to_vec(), 4, "text/plain".to_string()),
+            test_value(b"4".to_vec(), 4),
         )
         .unwrap();
 
@@ -252,31 +254,31 @@ fn test_wildcard_multi_segment() {
     storage
         .put(
             "a/c",
-            StoredValue::new(b"1".to_vec(), 1, "text/plain".to_string()),
+            test_value(b"1".to_vec(), 1),
         )
         .unwrap();
     storage
         .put(
             "a/b/c",
-            StoredValue::new(b"2".to_vec(), 2, "text/plain".to_string()),
+            test_value(b"2".to_vec(), 2),
         )
         .unwrap();
     storage
         .put(
             "a/b/x/c",
-            StoredValue::new(b"3".to_vec(), 3, "text/plain".to_string()),
+            test_value(b"3".to_vec(), 3),
         )
         .unwrap();
     storage
         .put(
             "a/b/x/y/c",
-            StoredValue::new(b"4".to_vec(), 4, "text/plain".to_string()),
+            test_value(b"4".to_vec(), 4),
         )
         .unwrap();
     storage
         .put(
             "x/y/z",
-            StoredValue::new(b"5".to_vec(), 5, "text/plain".to_string()),
+            test_value(b"5".to_vec(), 5),
         )
         .unwrap();
 
@@ -310,11 +312,7 @@ fn test_wildcard_complex_patterns() {
         storage
             .put(
                 key,
-                StoredValue::new(
-                    format!("value_{}", i).into_bytes(),
-                    i as u64,
-                    "text/plain".to_string(),
-                ),
+                test_value(format!("value_{}", i).into_bytes(), i as u64)
             )
             .unwrap();
     }
@@ -344,11 +342,7 @@ fn test_clear_storage() {
     // Put some data
     for i in 0..50 {
         let key = format!("key_{}", i);
-        let value = StoredValue::new(
-            format!("value_{}", i).into_bytes(),
-            i as u64,
-            "text/plain".to_string(),
-        );
+        let value = test_value(format!("value_{}", i).into_bytes(), i as u64);
         storage.put(&key, value).unwrap();
     }
 
@@ -370,11 +364,7 @@ fn test_large_payloads() {
 
     // Create a large payload (1 MB)
     let large_data = vec![0u8; 1024 * 1024];
-    let value = StoredValue::new(
-        large_data.clone(),
-        1,
-        "application/octet-stream".to_string(),
-    );
+    let value = test_value(large_data.clone(), 1 as u64);
 
     // Store it
     storage.put("large_key", value).unwrap();
@@ -404,11 +394,7 @@ fn test_special_characters_in_keys() {
     ];
 
     for key in &special_keys {
-        let value = StoredValue::new(
-            format!("value for {}", key).into_bytes(),
-            1,
-            "text/plain".to_string(),
-        );
+        let value = test_value(format!("value for {}", key).into_bytes(), 1 as u64);
         storage.put(key, value).unwrap();
     }
 
@@ -418,7 +404,7 @@ fn test_special_characters_in_keys() {
         assert!(retrieved.is_some(), "Failed to retrieve key: {}", key);
     }
 
-    assert_eq!(storage.count().unwrap(), special_keys.len() as u64);
+    assert_eq!(storage.count().unwrap(), special_keys.len());
 }
 
 #[test]
@@ -427,7 +413,7 @@ fn test_empty_payload() {
     let storage = backend.get_storage("test_storage").unwrap();
 
     // Store empty payload
-    let value = StoredValue::new(vec![], 1, "text/plain".to_string());
+    let value = test_value(vec![], 1);
     storage.put("empty_key", value).unwrap();
 
     // Retrieve it
@@ -452,7 +438,9 @@ fn test_different_encodings() {
 
     for (i, encoding) in encodings.iter().enumerate() {
         let key = format!("key_{}", i);
-        let value = StoredValue::new(b"data".to_vec(), i as u64, encoding.to_string());
+        let timestamp = Timestamp::new(NTP64(i as u64), TimestampId::rand());
+        let enc = Encoding::from(*encoding);
+        let value = StoredValue::new(b"data".to_vec(), timestamp, enc);
         storage.put(&key, value).unwrap();
     }
 
@@ -460,7 +448,7 @@ fn test_different_encodings() {
     for (i, encoding) in encodings.iter().enumerate() {
         let key = format!("key_{}", i);
         let retrieved = storage.get(&key).unwrap().unwrap();
-        assert_eq!(retrieved.encoding, *encoding);
+        assert_eq!(retrieved.encoding.to_string().as_str(), *encoding);
     }
 }
 
@@ -473,7 +461,7 @@ fn test_timestamp_preservation() {
 
     for (i, &ts) in timestamps.iter().enumerate() {
         let key = format!("key_{}", i);
-        let value = StoredValue::new(b"data".to_vec(), ts, "text/plain".to_string());
+        let value = test_value(b"data".to_vec(), ts);
         storage.put(&key, value).unwrap();
     }
 
@@ -481,7 +469,7 @@ fn test_timestamp_preservation() {
     for (i, &ts) in timestamps.iter().enumerate() {
         let key = format!("key_{}", i);
         let retrieved = storage.get(&key).unwrap().unwrap();
-        assert_eq!(retrieved.timestamp, ts);
+        assert_eq!(retrieved.timestamp.get_time().as_u64(), ts);
     }
 }
 
@@ -507,11 +495,7 @@ fn test_data_persistence() {
         // Add some data
         for i in 0..10 {
             let key = format!("key_{}", i);
-            let value = StoredValue::new(
-                format!("value_{}", i).into_bytes(),
-                i as u64,
-                "text/plain".to_string(),
-            );
+            let value = test_value(format!("value_{}", i).into_bytes(), i as u64);
             storage.put(&key, value).unwrap();
         }
 
@@ -561,11 +545,7 @@ fn test_concurrent_reads() {
     // Populate with data
     for i in 0..100 {
         let key = format!("key_{}", i);
-        let value = StoredValue::new(
-            format!("value_{}", i).into_bytes(),
-            i as u64,
-            "text/plain".to_string(),
-        );
+        let value = test_value(format!("value_{}", i).into_bytes(), i as u64);
         storage.put(&key, value).unwrap();
     }
 
@@ -610,11 +590,7 @@ fn test_concurrent_writes() {
         let handle = thread::spawn(move || {
             for i in 0..10 {
                 let key = format!("thread_{}_key_{}", thread_id, i);
-                let value = StoredValue::new(
-                    format!("thread_{}_value_{}", thread_id, i).into_bytes(),
-                    (thread_id * 10 + i) as u64,
-                    "text/plain".to_string(),
-                );
+                let value = test_value(format!("thread_{}_value_{}", thread_id, i).into_bytes(), (thread_id * 10 + i) as u64);
                 storage_clone.put(&key, value).unwrap();
             }
         });
@@ -648,7 +624,7 @@ fn test_storage_with_prefix_stripping() {
         .unwrap();
 
     // Store with full key
-    let value = StoredValue::new(b"test".to_vec(), 1, "text/plain".to_string());
+    let value = test_value(b"test".to_vec(), 1);
     storage.put("demo/app/sensor/temp", value).unwrap();
 
     // Should be able to retrieve with full key
@@ -665,11 +641,7 @@ fn test_batch_operations() {
     let batch_size = 1000;
     for i in 0..batch_size {
         let key = format!("batch_key_{}", i);
-        let value = StoredValue::new(
-            format!("batch_value_{}", i).into_bytes(),
-            i,
-            "text/plain".to_string(),
-        );
+        let value = test_value(format!("batch_value_{}", i).into_bytes(), i as u64);
         storage.put(&key, value).unwrap();
     }
 
@@ -684,3 +656,4 @@ fn test_batch_operations() {
     storage.clear().unwrap();
     assert_eq!(storage.count().unwrap(), 0);
 }
+

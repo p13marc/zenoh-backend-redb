@@ -50,7 +50,7 @@ impl RedbBackend {
         debug!("Storage '{}' will use database at: {:?}", name, db_path);
 
         // Create the storage
-        let storage = RedbStorage::new(db_path, name.clone(), storage_config)?;
+        let storage = RedbStorage::new(db_path, storage_config, name.clone())?;
         let storage_arc = Arc::new(storage);
 
         // Register the storage

@@ -1,4 +1,6 @@
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use zenoh::bytes::Encoding;
+use zenoh::time::{NTP64, Timestamp, TimestampId};
 use tempfile::TempDir;
 use zenoh_backend_redb::{RedbBackend, RedbBackendConfig, RedbStorageConfig, StoredValue};
 
@@ -15,7 +17,7 @@ fn create_test_backend() -> (RedbBackend, TempDir) {
 /// Helper to create a stored value
 fn create_value(size: usize, timestamp: u64) -> StoredValue {
     let payload = vec![0u8; size];
-    StoredValue::new(payload, timestamp, "application/octet-stream".to_string())
+    StoredValue::new(payload, Timestamp::new(NTP64(timestamp), TimestampId::rand()), Encoding::ZENOH_BYTES)
 }
 
 /// Benchmark backend creation

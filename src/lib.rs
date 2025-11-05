@@ -65,6 +65,8 @@ pub const BACKEND_NAME: &str = "redb";
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use zenoh::bytes::Encoding;
+    use zenoh::time::{NTP64, Timestamp, TimestampId};
 
     #[test]
     fn test_basic_workflow() {
@@ -81,7 +83,9 @@ mod tests {
             .unwrap();
 
         // Store a value
-        let value = StoredValue::new(b"hello world".to_vec(), 12345, "text/plain".to_string());
+        let timestamp = Timestamp::new(NTP64(12345), TimestampId::rand());
+        let encoding = Encoding::ZENOH_BYTES;
+        let value = StoredValue::new(b"hello world".to_vec(), timestamp, encoding);
         storage.put("test/key", value.clone()).unwrap();
 
         // Retrieve the value
@@ -90,8 +94,7 @@ mod tests {
         assert_eq!(retrieved.unwrap().payload, value.payload);
 
         // Delete the value
-        let deleted = storage.delete("test/key").unwrap();
-        assert!(deleted);
+        storage.delete("test/key").unwrap();
 
         // Verify it's gone
         let retrieved = storage.get("test/key").unwrap();
