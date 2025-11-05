@@ -1,7 +1,7 @@
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use tempfile::TempDir;
 use zenoh::bytes::Encoding;
 use zenoh::time::{NTP64, Timestamp, TimestampId};
-use tempfile::TempDir;
 use zenoh_backend_redb::{RedbBackend, RedbBackendConfig, RedbStorageConfig, StoredValue};
 
 /// Helper to create a temporary backend for benchmarks
@@ -17,7 +17,11 @@ fn create_test_backend() -> (RedbBackend, TempDir) {
 /// Helper to create a stored value with a given size
 fn create_value(size: usize, timestamp: u64) -> StoredValue {
     let payload = vec![0u8; size];
-    StoredValue::new(payload, Timestamp::new(NTP64(timestamp), TimestampId::rand()), Encoding::ZENOH_BYTES)
+    StoredValue::new(
+        payload,
+        Timestamp::new(NTP64(timestamp), TimestampId::rand()),
+        Encoding::ZENOH_BYTES,
+    )
 }
 
 /// Benchmark single PUT operations with varying payload sizes
@@ -120,65 +124,6 @@ fn bench_batch_put(c: &mut Criterion) {
                         let value = create_value(1000, i as u64);
                         storage.put(&key, black_box(value)).unwrap();
                     }
-                });
-            },
-        );
-    }
-    group.finish();
-}
-
-/// Benchmark batch PUT operations vs individual PUTs
-fn bench_batch_put_comparison(c: &mut Criterion) {
-    let mut group = c.benchmark_group("batch_put_comparison");
-
-    for batch_size in [10, 100, 1_000].iter() {
-        group.throughput(Throughput::Elements(*batch_size as u64));
-
-        // Benchmark individual puts
-        group.bench_with_input(
-            BenchmarkId::new("individual", batch_size),
-            batch_size,
-            |b, &batch_size| {
-                let (backend, _temp_dir) = create_test_backend();
-                let storage = backend
-                    .create_storage("bench_storage".to_string(), None)
-                    .unwrap();
-
-                b.iter(|| {
-                    for i in 0..batch_size {
-                        let key = format!("test/batch/{}", i);
-                        let value = create_value(1000, i as u64);
-                        storage.put(&key, black_box(value)).unwrap();
-                    }
-                });
-            },
-        );
-
-        // Benchmark batch put
-        group.bench_with_input(
-            BenchmarkId::new("batch", batch_size),
-            batch_size,
-            |b, &batch_size| {
-                let (backend, _temp_dir) = create_test_backend();
-                let storage = backend
-                    .create_storage("bench_storage".to_string(), None)
-                    .unwrap();
-
-                b.iter(|| {
-                    let entries: Vec<_> = (0..batch_size)
-                        .map(|i| {
-                            let key = format!("test/batch/{}", i);
-                            let value = create_value(1000, i as u64);
-                            (key, value)
-                        })
-                        .collect();
-
-                    let entries_ref: Vec<_> = entries
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), v.clone()))
-                        .collect();
-
-                    storage.put_batch(black_box(entries_ref)).unwrap();
                 });
             },
         );
@@ -443,123 +388,12 @@ fn bench_key_operations(c: &mut Criterion) {
     });
 }
 
-/// Benchmark bulk get_many operations vs individual gets
-fn bench_get_many_vs_individual(c: &mut Criterion) {
-    let mut group = c.benchmark_group("get_many_comparison");
-
-    for count in [10, 50, 100, 500].iter() {
-        // Setup: Create storage with keys
-        let (backend, _temp_dir) = create_test_backend();
-        let storage = backend
-            .create_storage("bench_storage".to_string(), None)
-            .unwrap();
-
-        let keys: Vec<String> = (0..*count).map(|i| format!("test/key/{}", i)).collect();
-        for key in &keys {
-            let value = create_value(1000, 100);
-            storage.put(key, value).unwrap();
-        }
-
-        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-
-        // Benchmark get_many
-        group.bench_with_input(BenchmarkId::new("get_many", count), count, |b, _| {
-            b.iter(|| {
-                black_box(storage.get_many(key_refs.clone()).unwrap());
-            });
-        });
-
-        // Benchmark individual gets
-        group.bench_with_input(BenchmarkId::new("individual_gets", count), count, |b, _| {
-            b.iter(|| {
-                for key in &key_refs {
-                    black_box(storage.get(key).unwrap());
-                }
-            });
-        });
-    }
-    group.finish();
-}
-
-/// Benchmark bulk delete_many operations vs individual deletes
-fn bench_delete_many_vs_individual(c: &mut Criterion) {
-    let mut group = c.benchmark_group("delete_many_comparison");
-
-    for count in [10, 50, 100, 500].iter() {
-        // Benchmark delete_many
-        group.bench_with_input(
-            BenchmarkId::new("delete_many", count),
-            count,
-            |b, &count| {
-                b.iter_batched(
-                    || {
-                        // Setup: Create fresh storage with keys
-                        let (backend, temp_dir) = create_test_backend();
-                        let storage = backend
-                            .create_storage("bench_storage".to_string(), None)
-                            .unwrap();
-
-                        let keys: Vec<String> =
-                            (0..count).map(|i| format!("test/key/{}", i)).collect();
-                        for key in &keys {
-                            let value = create_value(1000, 100);
-                            storage.put(key, value).unwrap();
-                        }
-
-                        (storage, keys, temp_dir)
-                    },
-                    |(storage, keys, _temp_dir)| {
-                        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-                        black_box(storage.delete_many(key_refs.clone()).unwrap());
-                    },
-                    criterion::BatchSize::SmallInput,
-                );
-            },
-        );
-
-        // Benchmark individual deletes
-        group.bench_with_input(
-            BenchmarkId::new("individual_deletes", count),
-            count,
-            |b, &count| {
-                b.iter_batched(
-                    || {
-                        // Setup: Create fresh storage with keys
-                        let (backend, temp_dir) = create_test_backend();
-                        let storage = backend
-                            .create_storage("bench_storage".to_string(), None)
-                            .unwrap();
-
-                        let keys: Vec<String> =
-                            (0..count).map(|i| format!("test/key/{}", i)).collect();
-                        for key in &keys {
-                            let value = create_value(1000, 100);
-                            storage.put(key, value).unwrap();
-                        }
-
-                        (storage, keys, temp_dir)
-                    },
-                    |(storage, keys, _temp_dir)| {
-                        let key_refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
-                        for key in &key_refs {
-                            black_box(storage.delete(key).unwrap());
-                        }
-                    },
-                    criterion::BatchSize::SmallInput,
-                );
-            },
-        );
-    }
-    group.finish();
-}
-
 criterion_group!(
     storage_benches,
     bench_put_operations,
     bench_get_operations,
     bench_delete_operations,
     bench_batch_put,
-    bench_batch_put_comparison,
     bench_prefix_queries,
     bench_wildcard_single_segment,
     bench_wildcard_multi_segment,
@@ -568,8 +402,6 @@ criterion_group!(
     bench_fsync_impact,
     bench_prefix_stripping,
     bench_key_operations,
-    bench_get_many_vs_individual,
-    bench_delete_many_vs_individual,
 );
 
 criterion_main!(storage_benches);

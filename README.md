@@ -19,7 +19,6 @@ This backend provides persistent storage for Zenoh using redb, a pure Rust embed
 - 📖 **Read-Only Mode** - Optional read-only storage instances
 - 🔑 **Prefix Stripping** - Efficient key storage with optional prefix removal
 - 💾 **Embedded** - No separate database server required
-- 🚀 **Optimized Operations** - Bulk `get_many()` and `delete_many()` for improved throughput
 - 📊 **Pre-allocated Buffers** - Thread-local and pre-sized allocations minimize overhead
 
 ## Installation
@@ -320,21 +319,12 @@ For detailed benchmarking documentation, see [PHASE6_BENCHMARKS.md](PHASE6_BENCH
 
 ### Optimization Tips
 
-1. **Use batch operations for bulk writes** (2.4-3.2x faster):
-   ```rust
-   // Instead of multiple put() calls
-   let entries: Vec<_> = data.iter()
-       .map(|item| (item.key.as_str(), item.value.clone()))
-       .collect();
-   storage.put_batch(entries)?;  // Much faster!
-   ```
-
-2. **Adjust cache size** for your workload:
+1. **Adjust cache size** for your workload:
    ```rust
    config.with_cache_size(100 * 1024 * 1024) // 100 MB
    ```
 
-3. **Disable fsync** for non-critical data:
+2. **Disable fsync** for non-critical data:
    ```rust
    config.with_fsync(false)
    ```

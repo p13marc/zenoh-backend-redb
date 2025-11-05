@@ -238,50 +238,6 @@ impl RedbStorage {
         })
     }
 
-    /// Store multiple key-value pairs in a single transaction (batch operation).
-    /// This is significantly faster than calling put() multiple times.
-    pub fn put_batch(&self, entries: Vec<(&str, StoredValue)>) -> Result<()> {
-        if self.config.read_only {
-            return Err(RedbBackendError::other("Storage is read-only"));
-        }
-
-        if entries.is_empty() {
-            return Ok(());
-        }
-
-        trace!("Batch putting {} entries", entries.len());
-
-        // Pre-allocate buffers to reuse across entries
-        let mut key_buffer = Vec::with_capacity(256);
-
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut payloads_table = write_txn.open_table(PAYLOADS_TABLE)?;
-            let mut data_info_table = write_txn.open_table(DATA_INFO_TABLE)?;
-
-            for (key, value) in entries {
-                // Encode key into reusable buffer
-                key_buffer.clear();
-                self.encode_key_into(key, &mut key_buffer)?;
-
-                // Encode data_info
-                let data_info_bytes = encode_data_info(
-                    value.encoding.clone(),
-                    &value.timestamp,
-                    false, // not deleted
-                )?;
-
-                // Insert into both tables
-                payloads_table.insert(key_buffer.as_slice(), value.payload.as_slice())?;
-                data_info_table.insert(key_buffer.as_slice(), data_info_bytes.as_slice())?;
-            }
-        }
-        write_txn.commit()?;
-
-        debug!("Batch stored entries");
-        Ok(())
-    }
-
     /// Retrieve a value by its exact key.
     pub fn get(&self, key: &str) -> Result<Option<StoredValue>> {
         trace!("Getting key: {}", key);
@@ -338,56 +294,6 @@ impl RedbStorage {
         })
     }
 
-    /// Retrieve multiple values by their exact keys efficiently.
-    /// Returns a vector of (key, Option<StoredValue>) tuples in the same order as the input keys.
-    pub fn get_many(&self, keys: Vec<&str>) -> Result<Vec<(String, Option<StoredValue>)>> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        trace!("Getting {} keys", keys.len());
-
-        let mut results = Vec::with_capacity(keys.len());
-        let mut key_buffer = Vec::with_capacity(256);
-
-        let read_txn = self.db.begin_read()?;
-        let payloads_table = read_txn.open_table(PAYLOADS_TABLE)?;
-        let data_info_table = read_txn.open_table(DATA_INFO_TABLE)?;
-
-        for key in keys {
-            key_buffer.clear();
-            self.encode_key_into(key, &mut key_buffer)?;
-
-            let payload_result = payloads_table.get(key_buffer.as_slice())?;
-            let data_info_result = data_info_table.get(key_buffer.as_slice())?;
-
-            let stored_value = match (payload_result, data_info_result) {
-                (Some(payload_guard), Some(info_guard)) => {
-                    let payload_bytes = payload_guard.value();
-                    let info_bytes = info_guard.value();
-
-                    let (encoding, timestamp, deleted) = decode_data_info(info_bytes)?;
-
-                    if deleted {
-                        None
-                    } else {
-                        Some(StoredValue::new(
-                            payload_bytes.to_vec(),
-                            timestamp,
-                            encoding,
-                        ))
-                    }
-                }
-                _ => None,
-            };
-
-            results.push((key.to_string(), stored_value));
-        }
-
-        debug!("Retrieved {} keys", results.len());
-        Ok(results)
-    }
-
     /// Delete a key-value pair.
     pub fn delete(&self, key: &str) -> Result<()> {
         if self.config.read_only {
@@ -415,46 +321,6 @@ impl RedbStorage {
             debug!("Deleted key: {}", key);
             Ok(())
         })
-    }
-
-    /// Delete multiple keys in a single transaction.
-    /// Returns the number of keys actually deleted.
-    pub fn delete_many(&self, keys: Vec<&str>) -> Result<usize> {
-        if self.config.read_only {
-            return Err(RedbBackendError::other("Storage is read-only"));
-        }
-
-        if keys.is_empty() {
-            return Ok(0);
-        }
-
-        trace!("Batch deleting {} keys", keys.len());
-
-        let mut key_buffer = Vec::with_capacity(256);
-        let mut deleted_count = 0;
-
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut payloads_table = write_txn.open_table(PAYLOADS_TABLE)?;
-            let mut data_info_table = write_txn.open_table(DATA_INFO_TABLE)?;
-
-            for key in keys {
-                key_buffer.clear();
-                self.encode_key_into(key, &mut key_buffer)?;
-
-                // Try to remove from both tables
-                let payload_removed = payloads_table.remove(key_buffer.as_slice())?.is_some();
-                let data_info_removed = data_info_table.remove(key_buffer.as_slice())?.is_some();
-
-                if payload_removed || data_info_removed {
-                    deleted_count += 1;
-                }
-            }
-        }
-        write_txn.commit()?;
-
-        debug!("Deleted {} keys", deleted_count);
-        Ok(deleted_count)
     }
 
     /// Retrieve all key-value pairs from the storage.
