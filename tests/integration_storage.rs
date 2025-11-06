@@ -2,10 +2,9 @@
 
 use std::collections::HashSet;
 use tempfile::TempDir;
-use zenoh_backend_redb::{RedbBackend, RedbBackendConfig, RedbStorageConfig, StoredValue};
 use zenoh::bytes::Encoding;
 use zenoh::time::{NTP64, Timestamp, TimestampId};
-
+use zenoh_backend_redb::{RedbBackend, RedbBackendConfig, RedbStorageConfig, StoredValue};
 
 /// Helper function to create a test backend and storage.
 fn create_test_storage() -> (RedbBackend, TempDir) {
@@ -27,7 +26,6 @@ fn test_value(payload: Vec<u8>, time: u64) -> StoredValue {
     let encoding = Encoding::TEXT_PLAIN;
     StoredValue::new(payload, timestamp, encoding)
 }
-
 
 #[test]
 fn test_basic_put_get_delete() {
@@ -80,7 +78,7 @@ fn test_delete_nonexistent() {
     let storage = backend.get_storage("test_storage").unwrap();
 
     // Delete non-existent key should return false
-    storage.delete("nonexistent").unwrap();  // returns ()
+    storage.delete("nonexistent").unwrap(); // returns ()
     // Delete was called (no error)
 }
 
@@ -152,28 +150,16 @@ fn test_get_by_prefix() {
 
     // Put data with different prefixes
     storage
-        .put(
-            "sensors/temp/1",
-            test_value(b"20".to_vec(), 1),
-        )
+        .put("sensors/temp/1", test_value(b"20".to_vec(), 1))
         .unwrap();
     storage
-        .put(
-            "sensors/temp/2",
-            test_value(b"21".to_vec(), 2),
-        )
+        .put("sensors/temp/2", test_value(b"21".to_vec(), 2))
         .unwrap();
     storage
-        .put(
-            "sensors/humidity/1",
-            test_value(b"50".to_vec(), 3),
-        )
+        .put("sensors/humidity/1", test_value(b"50".to_vec(), 3))
         .unwrap();
     storage
-        .put(
-            "config/timeout",
-            test_value(b"30".to_vec(), 4),
-        )
+        .put("config/timeout", test_value(b"30".to_vec(), 4))
         .unwrap();
 
     // Query by prefix
@@ -193,10 +179,7 @@ fn test_get_by_prefix_no_matches() {
     let storage = backend.get_storage("test_storage").unwrap();
 
     storage
-        .put(
-            "key1",
-            test_value(b"value1".to_vec(), 1),
-        )
+        .put("key1", test_value(b"value1".to_vec(), 1))
         .unwrap();
 
     let results = storage.get_by_prefix("nonexistent/").unwrap();
@@ -209,30 +192,10 @@ fn test_wildcard_single_segment() {
     let storage = backend.get_storage("test_storage").unwrap();
 
     // Put data
-    storage
-        .put(
-            "a/b/c",
-            test_value(b"1".to_vec(), 1),
-        )
-        .unwrap();
-    storage
-        .put(
-            "a/x/c",
-            test_value(b"2".to_vec(), 2),
-        )
-        .unwrap();
-    storage
-        .put(
-            "a/y/c",
-            test_value(b"3".to_vec(), 3),
-        )
-        .unwrap();
-    storage
-        .put(
-            "a/b/d",
-            test_value(b"4".to_vec(), 4),
-        )
-        .unwrap();
+    storage.put("a/b/c", test_value(b"1".to_vec(), 1)).unwrap();
+    storage.put("a/x/c", test_value(b"2".to_vec(), 2)).unwrap();
+    storage.put("a/y/c", test_value(b"3".to_vec(), 3)).unwrap();
+    storage.put("a/b/d", test_value(b"4".to_vec(), 4)).unwrap();
 
     // Query with single wildcard
     let results = storage.get_by_wildcard("a/*/c").unwrap();
@@ -251,36 +214,15 @@ fn test_wildcard_multi_segment() {
     let storage = backend.get_storage("test_storage").unwrap();
 
     // Put data
+    storage.put("a/c", test_value(b"1".to_vec(), 1)).unwrap();
+    storage.put("a/b/c", test_value(b"2".to_vec(), 2)).unwrap();
     storage
-        .put(
-            "a/c",
-            test_value(b"1".to_vec(), 1),
-        )
+        .put("a/b/x/c", test_value(b"3".to_vec(), 3))
         .unwrap();
     storage
-        .put(
-            "a/b/c",
-            test_value(b"2".to_vec(), 2),
-        )
+        .put("a/b/x/y/c", test_value(b"4".to_vec(), 4))
         .unwrap();
-    storage
-        .put(
-            "a/b/x/c",
-            test_value(b"3".to_vec(), 3),
-        )
-        .unwrap();
-    storage
-        .put(
-            "a/b/x/y/c",
-            test_value(b"4".to_vec(), 4),
-        )
-        .unwrap();
-    storage
-        .put(
-            "x/y/z",
-            test_value(b"5".to_vec(), 5),
-        )
-        .unwrap();
+    storage.put("x/y/z", test_value(b"5".to_vec(), 5)).unwrap();
 
     // Query with multi-segment wildcard
     let results = storage.get_by_wildcard("a/**/c").unwrap();
@@ -312,7 +254,7 @@ fn test_wildcard_complex_patterns() {
         storage
             .put(
                 key,
-                test_value(format!("value_{}", i).into_bytes(), i as u64)
+                test_value(format!("value_{}", i).into_bytes(), i as u64),
             )
             .unwrap();
     }
@@ -364,7 +306,7 @@ fn test_large_payloads() {
 
     // Create a large payload (1 MB)
     let large_data = vec![0u8; 1024 * 1024];
-    let value = test_value(large_data.clone(), 1 as u64);
+    let value = test_value(large_data.clone(), 1_u64);
 
     // Store it
     storage.put("large_key", value).unwrap();
@@ -394,7 +336,7 @@ fn test_special_characters_in_keys() {
     ];
 
     for key in &special_keys {
-        let value = test_value(format!("value for {}", key).into_bytes(), 1 as u64);
+        let value = test_value(format!("value for {}", key).into_bytes(), 1_u64);
         storage.put(key, value).unwrap();
     }
 
@@ -590,7 +532,10 @@ fn test_concurrent_writes() {
         let handle = thread::spawn(move || {
             for i in 0..10 {
                 let key = format!("thread_{}_key_{}", thread_id, i);
-                let value = test_value(format!("thread_{}_value_{}", thread_id, i).into_bytes(), (thread_id * 10 + i) as u64);
+                let value = test_value(
+                    format!("thread_{}_value_{}", thread_id, i).into_bytes(),
+                    (thread_id * 10 + i) as u64,
+                );
                 storage_clone.put(&key, value).unwrap();
             }
         });
@@ -650,10 +595,9 @@ fn test_batch_operations() {
 
     // Batch retrieve via get_all
     let all = storage.get_all().unwrap();
-    assert_eq!(all.len(), batch_size as usize);
+    assert_eq!(all.len(), batch_size);
 
     // Batch delete (via clear)
     storage.clear().unwrap();
     assert_eq!(storage.count().unwrap(), 0);
 }
-

@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 use tempfile::TempDir;
-use zenoh_backend_redb::{RedbBackend, RedbBackendConfig, RedbStorageConfig, StoredValue};
 use zenoh::bytes::Encoding;
 use zenoh::time::{NTP64, Timestamp, TimestampId};
+use zenoh_backend_redb::{RedbBackend, RedbBackendConfig, RedbStorageConfig, StoredValue};
 
 /// Helper function to create a test backend with temporary storage.
 fn create_test_backend() -> (RedbBackend, TempDir) {
@@ -23,7 +23,6 @@ fn test_value(payload: Vec<u8>, time: u64) -> StoredValue {
     let encoding = Encoding::TEXT_PLAIN;
     StoredValue::new(payload, timestamp, encoding)
 }
-
 
 #[test]
 fn test_backend_initialization() {

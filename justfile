@@ -34,13 +34,13 @@ build:
 build-release:
     cargo build --release --all-features
 
-# Run all tests
+# Run all tests (excluding zenohd integration tests)
 test:
-    cargo test --all-features --verbose
+    cargo test --all-features --verbose -- --skip test_zenohd --skip test_plugin_library_exists
 
-# Run tests with nextest
+# Run tests with nextest (excluding zenohd integration tests)
 nextest:
-    cargo nextest run --all-features
+    cargo nextest run --all-features -E 'not test(test_zenohd) and not test(test_plugin_library_exists)'
 
 # Run specific test
 test-one TEST:
@@ -120,8 +120,16 @@ clean-all: clean
 # Run all pre-commit checks
 pre-commit: check test doc audit
 
-# Simulate CI pipeline locally
+# Simulate CI pipeline locally (full checks)
 ci: check test doc audit deny
+
+# Run CI checks locally (matches GitHub Actions)
+ci-local:
+    ./ci-local.sh
+
+# Run CI using act (Docker-based GitHub Actions simulation)
+ci-act:
+    ./bin/act push -j ci
 
 # Run comprehensive quality checks
 quality: check test coverage doc audit udeps machete deny outdated
@@ -248,8 +256,16 @@ stats:
     cargo metadata --format-version 1 --no-deps | jq '.packages | length'
 
 # Verify all checks pass (use before committing)
-verify: fmt check test doc
+verify: fmt check test
     @echo "✅ All verifications passed!"
+
+# Run zenohd integration tests (requires plugin build and zenohd installed)
+test-zenohd:
+    #!/usr/bin/env bash
+    echo "Building plugin..."
+    cargo build --release --features plugin
+    echo "Running zenohd integration tests..."
+    cargo test --test integration_zenohd -- --test-threads=1 --nocapture
 
 # Build Docker image
 docker-build:
@@ -306,9 +322,12 @@ help:
     @echo "  install-plugin - Install plugin locally"
     @echo ""
     @echo "CI/CD:"
-    @echo "  ci             - Simulate CI pipeline"
+    @echo "  ci             - Simulate CI pipeline (full)"
+    @echo "  ci-local       - Run CI checks (matches GitHub)"
+    @echo "  ci-act         - Run CI with act (Docker)"
     @echo "  pre-commit     - Pre-commit checks"
     @echo "  verify         - Verify before commit"
+    @echo "  test-zenohd    - Run zenohd integration tests"
     @echo "  release-prep   - Prepare for release"
     @echo ""
     @echo "Docker:"

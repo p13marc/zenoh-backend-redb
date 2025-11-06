@@ -674,7 +674,7 @@ mod tests {
         // Put some data first
         redb_storage
             .put(
-                &key.to_string(),
+                key.as_ref(),
                 StoredValue::new(payload.to_bytes().to_vec(), timestamp, encoding.clone()),
             )
             .unwrap();
@@ -732,7 +732,7 @@ mod tests {
         // Put some data first
         redb_storage
             .put(
-                &key.to_string(),
+                key.as_ref(),
                 StoredValue::new(payload.to_bytes().to_vec(), timestamp, encoding),
             )
             .unwrap();
