@@ -48,9 +48,6 @@ zenoh_redb_storage/
 !README.md
 !LICENSE*
 
-# Test files
-tests/
-
 # Cargo lock for libraries (keep if you want reproducible builds)
 # Cargo.lock
 

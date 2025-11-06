@@ -270,6 +270,34 @@ Strip prefix saves storage space by removing the common prefix from stored keys:
 | Setup complexity | ✅ Simple | ⚠️ Moderate | ⚠️ Moderate |
 | Best for | Edge/Embedded | High-throughput | Read-heavy |
 
+## Testing
+
+Run tests (excludes zenohd integration tests):
+
+```bash
+just test
+```
+
+### zenohd Integration Tests
+
+The zenohd tests require the plugin and zenohd to be compiled with the **exact same Zenoh version**. Use Podman to ensure compatibility:
+
+```bash
+# Podman method (recommended)
+just docker-test-zenohd
+
+# Or with podman-remote directly
+podman-remote build --build-arg ZENOH_VERSION=1.6.2 --target test -t zenoh-backend-redb:test .
+podman-remote run --rm zenoh-backend-redb:test cargo test --test integration_zenohd -- --test-threads=1 --nocapture
+
+# Local method (requires zenohd 1.6.2 installed)
+just test-zenohd
+```
+
+**Note**: The first build takes 10-15 minutes as it compiles zenohd from source. Subsequent builds are cached and much faster.
+
+The Dockerfile builds both zenohd and the plugin from source with matching versions.
+
 ## License
 
 This project is licensed under either of:

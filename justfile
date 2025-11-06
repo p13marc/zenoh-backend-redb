@@ -267,18 +267,55 @@ test-zenohd:
     echo "Running zenohd integration tests..."
     cargo test --test integration_zenohd -- --test-threads=1 --nocapture
 
-# Build Docker image
+# Run zenohd integration tests with Podman (ensures matching Zenoh versions)
+docker-test-zenohd:
+    #!/usr/bin/env bash
+    echo "========================================"
+    echo "Building test image with zenohd and plugin..."
+    echo "Note: First build takes 10-15 minutes (compiling zenohd from source)"
+    echo "========================================"
+    podman-remote build --build-arg ZENOH_VERSION=1.6.2 --target test -t zenoh-backend-redb:test .
+    echo ""
+    echo "========================================"
+    echo "Running zenohd integration tests..."
+    echo "========================================"
+    podman-remote run --rm -e RUST_BACKTRACE=1 -e RUST_LOG=info zenoh-backend-redb:test cargo test --test integration_zenohd -- --test-threads=1 --nocapture
+
+# Run zenohd integration tests without cache (clean rebuild)
+docker-test-zenohd-no-cache:
+    #!/usr/bin/env bash
+    echo "========================================"
+    echo "Building test image WITHOUT CACHE..."
+    echo "Note: This will take 20-40 minutes (full rebuild)"
+    echo "========================================"
+    podman-remote build --no-cache --build-arg ZENOH_VERSION=1.6.2 --target test -t zenoh-backend-redb:test .
+    echo ""
+    echo "========================================"
+    echo "Running zenohd integration tests..."
+    echo "========================================"
+    podman-remote run --rm -e RUST_BACKTRACE=1 -e RUST_LOG=info zenoh-backend-redb:test cargo test --test integration_zenohd -- --test-threads=1 --nocapture
+
+# Run zenohd integration tests with Podman using fast build (pre-built Zenoh image)
+docker-test-zenohd-fast:
+    #!/usr/bin/env
+
+# Build Podman image
 docker-build:
-    docker build -t zenoh-backend-redb:latest .
+    podman-remote build --target runtime -t zenoh-backend-redb:latest .
 
-# Run Docker container
+# Run Podman container
 docker-run:
-    docker run -d -p 7447:7447 -p 8000:8000 -v zenoh-redb-data:/var/lib/zenoh/redb zenoh-backend-redb:latest
+    podman-remote run -d --name zenoh-redb -p 7447:7447 -p 8000:8000 -v zenoh-redb-data:/var/lib/zenoh/redb zenoh-backend-redb:latest
 
-# Stop and remove Docker container
+# Stop and remove Podman container
+docker-stop:
+    podman-remote stop zenoh-redb || true
+    podman-remote rm zenoh-redb || true
+
+# Clean Podman images and volumes
 docker-clean:
-    docker stop $(docker ps -q --filter ancestor=zenoh-backend-redb:latest) || true
-    docker rm $(docker ps -aq --filter ancestor=zenoh-backend-redb:latest) || true
+    podman-remote rmi zenoh-backend-redb:test zenoh-backend-redb:latest || true
+    podman-remote volume rm zenoh-redb-data || true
 
 # Show help
 help:
@@ -322,18 +359,21 @@ help:
     @echo "  install-plugin - Install plugin locally"
     @echo ""
     @echo "CI/CD:"
-    @echo "  ci             - Simulate CI pipeline (full)"
-    @echo "  ci-local       - Run CI checks (matches GitHub)"
-    @echo "  ci-act         - Run CI with act (Docker)"
-    @echo "  pre-commit     - Pre-commit checks"
-    @echo "  verify         - Verify before commit"
-    @echo "  test-zenohd    - Run zenohd integration tests"
-    @echo "  release-prep   - Prepare for release"
+    @echo "  ci                  - Simulate CI pipeline (full)"
+    @echo "  ci-local            - Run CI checks (matches GitHub)"
+    @echo "  ci-act              - Run CI with act (Docker)"
+    @echo "  pre-commit          - Pre-commit checks"
+    @echo "  verify              - Verify before commit"
+    @echo "  test-zenohd              - Run zenohd integration tests (local)"
+    @echo "  docker-test-zenohd       - Run zenohd tests in Docker (recommended)"
+    @echo "  docker-test-zenohd-no-cache - Run zenohd tests without cache (clean rebuild)"
+    @echo "  release-prep             - Prepare for release"
     @echo ""
-    @echo "Docker:"
-    @echo "  docker-build   - Build Docker image"
-    @echo "  docker-run     - Run Docker container"
-    @echo "  docker-clean   - Stop and remove container"
+    @echo "Podman:"
+    @echo "  docker-build   - Build Podman image"
+    @echo "  docker-run     - Run Podman container"
+    @echo "  docker-stop    - Stop and remove container"
+    @echo "  docker-clean   - Clean images and volumes"
     @echo ""
     @echo "Utilities:"
     @echo "  clean          - Clean build artifacts"
