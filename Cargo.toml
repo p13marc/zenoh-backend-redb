@@ -24,11 +24,11 @@ dynamic_plugin = []
 redb = "2.1"
 
 # Zenoh dependencies
-zenoh = { version = "1.6.2", features = ["plugins", "unstable", "internal"] }
-zenoh-plugin-trait = { version = "1.6.2" }
-zenoh_backend_traits = { version = "1.6.2" }
-zenoh-util = { version = "1.6.2" }
-zenoh-ext = { version = "1.6.2", features = ["unstable"] }
+zenoh = { version = "1.7.1", features = ["plugins", "unstable", "internal"] }
+zenoh-plugin-trait = "1.7.1"
+zenoh_backend_traits = "1.7.1"
+zenoh-util = "1.7.1"
+zenoh-ext = { version = "1.7.1", features = ["unstable"] }
 
 # Async support
 async-trait = "0.1"
