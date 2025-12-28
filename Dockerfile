@@ -32,32 +32,26 @@ RUN cp target/release/zenohd /usr/local/bin/zenohd && \
     cp target/release/libzenoh_plugin_rest.so /usr/local/lib/ && \
     cp target/release/libzenoh_plugin_storage_manager.so /usr/local/lib/
 
-# Now build our plugin
-WORKDIR /build/plugin
+# Now build our plugin INSIDE the zenoh workspace to match version metadata
+WORKDIR /build/zenoh-src
 
-# Copy manifests first for better caching
-COPY Cargo.toml Cargo.lock ./
+# Copy our plugin as a workspace member
+RUN mkdir -p zenoh-backend-redb
+COPY Cargo.toml zenoh-backend-redb/
+COPY Cargo.lock zenoh-backend-redb/
+COPY src zenoh-backend-redb/src
+COPY examples zenoh-backend-redb/examples
+COPY config zenoh-backend-redb/config
+COPY benches zenoh-backend-redb/benches
+COPY tests zenoh-backend-redb/tests
 
-# Create a dummy src to cache dependencies
-RUN mkdir -p src && echo "fn main() {}" > src/lib.rs
-RUN cargo build --release --features plugin || true
-RUN rm -rf src
-
-# Copy actual source code
-COPY src ./src
-COPY examples ./examples
-COPY config ./config
-COPY benches ./benches
-
-# Build the actual plugin
+# Build the plugin from within zenoh workspace (this picks up the correct git version)
+WORKDIR /build/zenoh-src/zenoh-backend-redb
 RUN cargo build --release --features plugin
 
 # Verify plugin was built correctly
 RUN test -f target/release/libzenoh_backend_redb.so || \
     (echo "ERROR: Plugin library not found!" && exit 1)
-
-# Copy tests for integration testing
-COPY tests ./tests
 
 # Build test binaries
 RUN cargo test --no-run --test integration_zenohd
@@ -83,14 +77,15 @@ RUN mkdir -p /var/lib/zenoh/redb \
 COPY --from=builder /usr/local/bin/zenohd /usr/local/bin/zenohd
 
 # Copy zenoh plugins (rest and storage-manager) from builder to /usr/local/lib
+# Copy zenoh plugins to /usr/local/lib where zenohd searches
 COPY --from=builder /build/zenoh-src/target/release/libzenoh_plugin_rest.so /usr/local/lib/
 COPY --from=builder /build/zenoh-src/target/release/libzenoh_plugin_storage_manager.so /usr/local/lib/
 
 # Copy our redb plugin library from builder
-COPY --from=builder /build/plugin/target/release/libzenoh_backend_redb.so /usr/local/lib/
+COPY --from=builder /build/zenoh-src/zenoh-backend-redb/target/release/libzenoh_backend_redb.so /usr/local/lib/
 
 # Copy example configuration
-COPY --from=builder /build/plugin/config/zenoh-redb-example.json5 /etc/zenoh/zenoh.json5
+COPY --from=builder /build/zenoh-src/zenoh-backend-redb/config/zenoh-redb-example.json5 /etc/zenoh/zenoh.json5
 
 # Set environment variables
 ENV ZENOH_BACKEND_REDB_ROOT=/var/lib/zenoh/redb
@@ -146,7 +141,7 @@ COPY --from=builder /build/zenoh-src/target/release/libzenoh_plugin_storage_mana
 
 # Copy plugin source and build artifacts
 WORKDIR /app
-COPY --from=builder /build/plugin ./
+COPY --from=builder /build/zenoh-src/zenoh-backend-redb ./
 
 # Ensure zenohd is in PATH and executable
 RUN chmod +x /usr/local/bin/zenohd && zenohd --version

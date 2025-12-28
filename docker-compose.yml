@@ -1,0 +1,39 @@
+# Compose file for zenoh-backend-redb integration testing
+# Note: For local development, use podman-remote directly (see justfile)
+# This file is primarily used by CI/CD with Docker
+
+services:
+  # Test runner - builds zenohd and plugin with matching versions
+  test:
+    build:
+      context: .
+      target: test
+      args:
+        ZENOH_VERSION: "1.6.2"
+    image: zenoh-backend-redb:test
+    environment:
+      - RUST_BACKTRACE=1
+      - RUST_LOG=info
+    command: cargo test --test integration_zenohd -- --test-threads=1 --nocapture
+
+  # Production zenohd with plugin
+  zenohd:
+    build:
+      context: .
+      target: runtime
+      args:
+        ZENOH_VERSION: "1.6.2"
+    image: zenoh-backend-redb:runtime
+    ports:
+      - "7447:7447"
+      - "8000:8000"
+    volumes:
+      - redb-data:/var/lib/zenoh/redb
+      - ./config:/etc/zenoh:ro
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    restart: unless-stopped
+
+volumes:
+  redb-data:
