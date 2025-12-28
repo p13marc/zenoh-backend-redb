@@ -377,13 +377,12 @@ impl RedbStorage {
             if key.starts_with(prefix) {
                 let (encoding, timestamp, deleted) = decode_data_info(info_bytes.value())?;
 
-                if !deleted
-                    && let Some(payload_guard) = payloads_table.get(key_bytes.value())? {
-                        let payload_bytes = payload_guard.value();
-                        let stored_value =
-                            StoredValue::new(payload_bytes.to_vec(), timestamp, encoding);
-                        results.push((key, stored_value));
-                    }
+                if !deleted && let Some(payload_guard) = payloads_table.get(key_bytes.value())? {
+                    let payload_bytes = payload_guard.value();
+                    let stored_value =
+                        StoredValue::new(payload_bytes.to_vec(), timestamp, encoding);
+                    results.push((key, stored_value));
+                }
             }
         }
 
@@ -412,13 +411,12 @@ impl RedbStorage {
             if Self::matches_wildcard(&key, pattern) {
                 let (encoding, timestamp, deleted) = decode_data_info(info_bytes.value())?;
 
-                if !deleted
-                    && let Some(payload_guard) = payloads_table.get(key_bytes.value())? {
-                        let payload_bytes = payload_guard.value();
-                        let stored_value =
-                            StoredValue::new(payload_bytes.to_vec(), timestamp, encoding);
-                        results.push((key, stored_value));
-                    }
+                if !deleted && let Some(payload_guard) = payloads_table.get(key_bytes.value())? {
+                    let payload_bytes = payload_guard.value();
+                    let stored_value =
+                        StoredValue::new(payload_bytes.to_vec(), timestamp, encoding);
+                    results.push((key, stored_value));
+                }
             }
         }
 
