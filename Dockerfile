@@ -116,9 +116,9 @@ CMD ["zenohd", "-c", "/etc/zenoh/zenoh.json5"]
 # Labels
 LABEL org.opencontainers.image.title="Zenoh Backend redb"
 LABEL org.opencontainers.image.description="Zenoh storage backend using redb embedded database"
-LABEL org.opencontainers.image.url="https://github.com/yourusername/zenoh-backend-redb"
-LABEL org.opencontainers.image.source="https://github.com/yourusername/zenoh-backend-redb"
-LABEL org.opencontainers.image.version="0.2.0"
+LABEL org.opencontainers.image.url="https://github.com/p13marc/zenoh-backend-redb"
+LABEL org.opencontainers.image.source="https://github.com/p13marc/zenoh-backend-redb"
+LABEL org.opencontainers.image.version="0.3.0"
 LABEL org.opencontainers.image.licenses="Apache-2.0 OR MIT"
 
 # Test stage - includes everything needed to run integration tests
