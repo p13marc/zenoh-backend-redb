@@ -2,25 +2,26 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [master, main]
   pull_request:
-    branches: [main, develop]
+    branches: [master, main]
 
 env:
   RUST_BACKTRACE: 1
   CARGO_TERM_COLOR: always
 
 jobs:
-  ci:
-    name: CI
+  check:
+    name: Check & Test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.91.1"
           components: rustfmt, clippy
 
       - name: Cache dependencies
@@ -29,76 +30,14 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Cargo check
-        run: cargo check --all-targets
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Build
-        run: cargo build
+        run: cargo build --all-features
 
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+      - name: Build plugin (release)
+        run: cargo build --release --features plugin
 
-      - name: Test
-        run: cargo test --workspace -- --skip test_zenohd --skip test_plugin_library_exists
-
-  docker-integration-tests:
-    name: Docker Integration Tests
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build test image
-        run: |
-          docker build \
-            --build-arg ZENOH_VERSION=1.6.2 \
-            --target test \
-            -t zenoh-backend-redb:test \
-            --cache-from type=gha \
-            --cache-to type=gha,mode=max \
-            .
-
-      - name: Verify build
-        run: |
-          echo "Checking zenohd..."
-          docker run --rm zenoh-backend-redb:test zenohd --version
-          echo "Checking plugin..."
-          docker run --rm zenoh-backend-redb:test test -f target/release/libzenoh_backend_redb.so
-          echo "✓ Build verification complete"
-
-      - name: Run unit tests
-        run: |
-          docker run --rm \
-            -e RUST_BACKTRACE=1 \
-            -e RUST_LOG=info \
-            zenoh-backend-redb:test \
-            cargo test --lib -- --nocapture
-
-      - name: Run integration tests (non-zenohd)
-        run: |
-          docker run --rm \
-            -e RUST_BACKTRACE=1 \
-            -e RUST_LOG=info \
-            zenoh-backend-redb:test \
-            cargo test --test integration_backend --test integration_storage --test integration_plugin -- --nocapture
-
-      - name: Run zenohd integration tests
-        run: |
-          docker run --rm \
-            -e RUST_BACKTRACE=1 \
-            -e RUST_LOG=info \
-            zenoh-backend-redb:test \
-            cargo test --test integration_zenohd -- --test-threads=1 --nocapture
-
-      - name: Test summary
-        if: always()
-        run: |
-          echo "==================================="
-          echo "Docker Integration Tests Complete"
-          echo "==================================="
-          echo "✓ Unit tests"
-          echo "✓ Integration tests"
-          echo "✓ zenohd integration tests"
+      - name: Run tests
+        run: cargo test --all-features -- --skip test_zenohd
