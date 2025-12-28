@@ -6,10 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a Zenoh storage backend using [redb](https://www.redb.org/) as the underlying database engine. It implements the `zenoh_backend_traits` interfaces to provide persistent storage for Zenoh's storage manager plugin. The backend is pure Rust with no C dependencies, ACID-compliant, and supports zero-copy reads.
 
+**Current Zenoh version: 1.7.0** (pinned with `=1.7.0` in Cargo.toml)
+
 ## Build Commands
 
 ```bash
-# Build everything (uses Rust 1.85.0 via rust-toolchain.toml)
+# Build everything (uses Rust 1.91.1 via rust-toolchain.toml)
 cargo build --all-features
 
 # Build release plugin (creates libzenoh_backend_redb.so)
@@ -25,23 +27,32 @@ just install-plugin
 # Run all tests (excludes zenohd integration tests)
 just test
 # Or directly:
-cargo test --all-features -- --skip test_zenohd --skip test_plugin_library_exists
+cargo test --all-features -- --skip test_zenohd
 
 # Run a specific test
 just test-one TEST_NAME
-# Or:
-cargo test --all-features TEST_NAME
 
-# Run zenohd integration tests (requires matching zenohd version)
+# Run zenohd integration tests
 # RECOMMENDED: Use Podman to ensure version compatibility
 just docker-test-zenohd
 
-# Local zenohd tests (requires zenohd 1.7.1 installed)
+# Local zenohd tests (requires zenohd 1.7.0 + storage_manager plugin installed)
 just test-zenohd
 
 # Run benchmarks
 just bench
 ```
+
+### Integration Test Requirements
+
+The zenohd integration tests require:
+1. **zenohd** installed and in PATH (version 1.7.0)
+2. **libzenoh_plugin_storage_manager.so** in `~/.zenoh/lib/`
+3. **libzenoh_backend_redb.so** in `~/.zenoh/lib/`
+
+All three must be built with the **same Rust version** (1.91.1) and **same Zenoh version** (1.7.0).
+
+Tests will skip gracefully with a message if plugins are missing or incompatible.
 
 ## Linting and Quality
 
@@ -58,7 +69,7 @@ just quality
 # Pre-commit verification
 just verify
 
-# Security audit (ignores known upstream Zenoh vulnerabilities)
+# Security audit
 just audit
 
 # Check licenses
@@ -96,13 +107,13 @@ The `matches_wildcard()` function in storage.rs supports Zenoh key expression wi
 
 The crate builds as both `rlib` (library) and `cdylib` (dynamic plugin). The `plugin` feature enables `zenoh_plugin_trait::declare_plugin!` for dynamic loading by zenohd.
 
-**Critical**: The plugin must be compiled with the exact same Rust version and Zenoh dependency version as zenohd. ABI incompatibility causes SIGSEGV crashes.
+**Critical**: The plugin must be compiled with the exact same Rust version and Zenoh dependency version as zenohd. ABI incompatibility causes SIGSEGV crashes. Feature sets must also match - this is why `zenoh_backend_traits` uses `default-features = false`.
 
 ### Plugin Hierarchy
 
-1. **RedbBackendPlugin** → implements `Plugin`, creates RedbVolume
-2. **RedbVolume** → implements `Volume`, creates RedbStoragePlugin instances
-3. **RedbStoragePlugin** → implements `Storage`, wraps RedbStorage with async mutex
+1. **RedbBackendPlugin** -> implements `Plugin`, creates RedbVolume
+2. **RedbVolume** -> implements `Volume`, creates RedbStoragePlugin instances
+3. **RedbStoragePlugin** -> implements `Storage`, wraps RedbStorage with async mutex
 
 ## Configuration
 
@@ -113,9 +124,7 @@ Backend is configured through Zenoh's storage_manager plugin:
   plugins: {
     storage_manager: {
       volumes: {
-        redb: {
-          base_dir: "./zenoh_redb_storage"
-        }
+        redb: {}
       },
       storages: {
         demo: {
@@ -123,7 +132,8 @@ Backend is configured through Zenoh's storage_manager plugin:
           strip_prefix: "demo/example",
           volume: {
             id: "redb",
-            db_file: "demo_storage",
+            dir: "demo_storage",
+            create_db: true,
             fsync: true
           }
         }
@@ -137,8 +147,8 @@ Backend is configured through Zenoh's storage_manager plugin:
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| `db_file` | string | required | Database filename |
-| `dir` | string | - | Alternative to db_file, directory name |
+| `dir` | string | required | Database directory name (creates `<name>.redb`) |
+| `db_file` | string | - | Alternative to dir, explicit filename |
 | `create_db` | bool | true | Create database if missing |
 | `read_only` | bool | false | Read-only mode |
 | `cache_size` | number | redb default | Cache size in bytes |
@@ -147,3 +157,12 @@ Backend is configured through Zenoh's storage_manager plugin:
 ## Environment Variables
 
 - `ZENOH_BACKEND_REDB_ROOT`: Override default storage directory (default: `~/.zenoh/zenoh_backend_redb`)
+
+## Version Compatibility
+
+When updating Zenoh versions:
+1. Update all zenoh dependencies in `Cargo.toml` (use `=X.Y.Z` for exact version)
+2. Update `rust-toolchain.toml` to match zenohd's Rust version
+3. Rebuild storage_manager plugin from same Zenoh version
+4. Rebuild and reinstall redb plugin
+5. Run `just test-zenohd` to verify compatibility

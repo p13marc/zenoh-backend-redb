@@ -2,7 +2,7 @@
 # Builds both zenohd and the plugin with the same Zenoh version and compiler
 
 # Build stage - compile zenohd and plugin from source
-FROM rust:1.85.0-slim as builder
+FROM rust:1.91.1-slim as builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -18,7 +18,7 @@ WORKDIR /build
 
 # First, build zenohd from source with the matching version
 # This ensures zenohd and plugin use the exact same Zenoh version
-ARG ZENOH_VERSION=1.6.2
+ARG ZENOH_VERSION=1.7.0
 RUN git clone --depth 1 --branch ${ZENOH_VERSION} https://github.com/eclipse-zenoh/zenoh.git zenoh-src
 
 WORKDIR /build/zenoh-src
@@ -122,7 +122,7 @@ LABEL org.opencontainers.image.version="0.2.0"
 LABEL org.opencontainers.image.licenses="Apache-2.0 OR MIT"
 
 # Test stage - includes everything needed to run integration tests
-FROM rust:1.85.0-slim as test
+FROM rust:1.91.1-slim as test
 
 # Install runtime and test dependencies
 RUN apt-get update && apt-get install -y \

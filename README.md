@@ -9,17 +9,19 @@ A [Zenoh](https://zenoh.io) storage backend using [redb](https://www.redb.org/) 
 
 This backend provides persistent storage for Zenoh using redb, a pure Rust embedded key-value database with ACID compliance and zero-copy reads. It's particularly well-suited for edge computing, IoT devices, and applications requiring a lightweight, dependency-free storage solution.
 
+**Compatible with Zenoh 1.7.0**
+
 ### Features
 
-- 🦀 **Pure Rust** - No C dependencies, fully memory-safe
-- ⚡ **High Performance** - Zero-copy reads with MVCC support, thread-local buffers, bulk operations
-- 🔒 **ACID Compliant** - Reliable data storage with transaction support
-- 🌐 **Wildcard Queries** - Supports Zenoh wildcard patterns (`*` and `**`)
-- 🎛️ **Flexible Configuration** - Per-storage configuration options
-- 📖 **Read-Only Mode** - Optional read-only storage instances
-- 🔑 **Prefix Stripping** - Efficient key storage with optional prefix removal
-- 💾 **Embedded** - No separate database server required
-- 📊 **Pre-allocated Buffers** - Thread-local and pre-sized allocations minimize overhead
+- **Pure Rust** - No C dependencies, fully memory-safe
+- **High Performance** - Zero-copy reads with MVCC support, thread-local buffers
+- **ACID Compliant** - Reliable data storage with transaction support
+- **Wildcard Queries** - Supports Zenoh wildcard patterns (`*` and `**`)
+- **Flexible Configuration** - Per-storage configuration options
+- **Read-Only Mode** - Optional read-only storage instances
+- **Prefix Stripping** - Efficient key storage with optional prefix removal
+- **Embedded** - No separate database server required
+- **Persistent** - Data survives zenohd restarts
 
 ## Installation
 
@@ -29,7 +31,7 @@ This backend provides persistent storage for Zenoh using redb, a pure Rust embed
 cargo build --release --features plugin
 ```
 
-2. **Install the plugin** in your Zenoh plugin directory (typically `~/.zenoh/lib/`):
+2. **Install the plugin** in your Zenoh plugin directory:
 
 ```bash
 cp target/release/libzenoh_backend_redb.so ~/.zenoh/lib/
@@ -44,11 +46,7 @@ cp target/release/libzenoh_backend_redb.so ~/.zenoh/lib/
   plugins: {
     storage_manager: {
       volumes: {
-        redb: {
-          // Backend-level configuration
-          base_dir: "./zenoh_redb_storage",
-          create_dir: true
-        }
+        redb: {}
       },
       storages: {
         demo: {
@@ -56,7 +54,7 @@ cp target/release/libzenoh_backend_redb.so ~/.zenoh/lib/
           strip_prefix: "demo/example",
           volume: {
             id: "redb",
-            db_file: "demo_storage",
+            dir: "demo_storage",
             create_db: true,
             fsync: true
           }
@@ -75,31 +73,22 @@ zenohd -c zenoh.json5
 
 ## Configuration
 
-### Backend Configuration
-
-The backend manages the overall storage infrastructure:
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `base_dir` | String | `"./zenoh_redb_backend"` | Base directory for database files |
-| `create_dir` | Boolean | `true` | Create directory if it doesn't exist |
-| `default_storage_config` | Object | `{}` | Default configuration for storages |
-
 ### Storage Configuration
 
 Each storage instance can be individually configured:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `db_file` | String | Storage name | Database filename (without path) |
-| `db_path` | String | - | Full path to database (overrides `base_dir` and `db_file`) |
+| `dir` | String | required | Database directory name (creates `<name>.redb`) |
+| `db_file` | String | - | Alternative to `dir`, explicit database filename |
 | `cache_size` | Number | redb default | Cache size in bytes |
 | `fsync` | Boolean | `true` | Enable fsync for durability |
-| `key_expr` | String | - | Key expression prefix filter |
-| `strip_prefix` | Boolean | `false` | Strip key_expr prefix from stored keys |
-| `table_name` | String | `"zenoh_kv"` | Table name within the database |
 | `create_db` | Boolean | `true` | Create database if it doesn't exist |
 | `read_only` | Boolean | `false` | Read-only mode |
+
+### Environment Variables
+
+- `ZENOH_BACKEND_REDB_ROOT`: Override default storage directory (default: `~/.zenoh/zenoh_backend_redb`)
 
 ## Usage Examples
 
@@ -110,16 +99,14 @@ Each storage instance can be individually configured:
   plugins: {
     storage_manager: {
       volumes: {
-        redb: {
-          base_dir: "./my_data"
-        }
+        redb: {}
       },
       storages: {
         sensor_data: {
           key_expr: "sensor/**",
           volume: {
             id: "redb",
-            db_file: "sensors",
+            dir: "sensors",
             fsync: true
           }
         }
@@ -136,24 +123,21 @@ Each storage instance can be individually configured:
   plugins: {
     storage_manager: {
       volumes: {
-        redb: {
-          base_dir: "./zenoh_data"
-        }
+        redb: {}
       },
       storages: {
         sensors: {
           key_expr: "sensor/**",
           volume: {
             id: "redb",
-            db_file: "sensor_db"
+            dir: "sensor_db"
           }
         },
         config: {
           key_expr: "config/**",
           volume: {
             id: "redb",
-            db_file: "config_db",
-            read_only: false
+            dir: "config_db"
           }
         }
       }
@@ -170,13 +154,16 @@ Strip prefix saves storage space by removing the common prefix from stored keys:
 {
   plugins: {
     storage_manager: {
+      volumes: {
+        redb: {}
+      },
       storages: {
         demo: {
           key_expr: "demo/example/**",
-          strip_prefix: "demo/example",  // Keys stored without this prefix
+          strip_prefix: "demo/example",
           volume: {
             id: "redb",
-            db_file: "demo_storage"
+            dir: "demo_storage"
           }
         }
       }
@@ -191,13 +178,16 @@ Strip prefix saves storage space by removing the common prefix from stored keys:
 {
   plugins: {
     storage_manager: {
+      volumes: {
+        redb: {}
+      },
       storages: {
         archive: {
           key_expr: "archive/**",
           volume: {
             id: "redb",
-            db_file: "archive_db",
-            read_only: true  // Prevents modifications
+            dir: "archive_db",
+            read_only: true
           }
         }
       }
@@ -212,12 +202,15 @@ Strip prefix saves storage space by removing the common prefix from stored keys:
 {
   plugins: {
     storage_manager: {
+      volumes: {
+        redb: {}
+      },
       storages: {
         large_data: {
           key_expr: "large/**",
           volume: {
             id: "redb",
-            db_file: "large_db",
+            dir: "large_db",
             cache_size: 104857600  // 100 MB cache
           }
         }
@@ -245,8 +238,8 @@ Strip prefix saves storage space by removing the common prefix from stored keys:
 ┌─────────────────────────────────────┐
 │      RedbStorage                    │
 │  - CRUD operations                  │
-│  - Wildcard matching                │
-│  - Key encoding/decoding            │
+│  - Wildcard matching (* and **)     │
+│  - Dual-table design                │
 └────────────┬────────────────────────┘
              │
              ↓
@@ -262,17 +255,17 @@ Strip prefix saves storage space by removing the common prefix from stored keys:
 
 | Feature | redb | RocksDB | LMDB |
 |---------|------|---------|------|
-| Pure Rust | ✅ Yes | ❌ No (C++) | ❌ No (C) |
-| ACID | ✅ Yes | ✅ Yes | ✅ Yes |
-| Zero-copy reads | ✅ Yes | ❌ No | ✅ Yes |
-| Concurrent writes | ⚠️ MVCC | ✅ Yes | ❌ Limited |
-| Memory-mapped | ✅ Yes | ❌ No | ✅ Yes |
-| Setup complexity | ✅ Simple | ⚠️ Moderate | ⚠️ Moderate |
+| Pure Rust | Yes | No (C++) | No (C) |
+| ACID | Yes | Yes | Yes |
+| Zero-copy reads | Yes | No | Yes |
+| Concurrent writes | MVCC | Yes | Limited |
+| Memory-mapped | Yes | No | Yes |
+| Setup complexity | Simple | Moderate | Moderate |
 | Best for | Edge/Embedded | High-throughput | Read-heavy |
 
 ## Testing
 
-Run tests (excludes zenohd integration tests):
+Run unit and integration tests (excludes zenohd tests):
 
 ```bash
 just test
@@ -280,23 +273,39 @@ just test
 
 ### zenohd Integration Tests
 
-The zenohd tests require the plugin and zenohd to be compiled with the **exact same Zenoh version**. Use Podman to ensure compatibility:
+The zenohd integration tests verify the full plugin lifecycle:
+- Plugin loading in zenohd
+- PUT/GET/DELETE operations
+- Wildcard queries (`*` and `**`)
+- Data persistence across zenohd restarts
+
+**Requirements:** The tests require zenohd and the storage_manager plugin to be built with the **exact same Zenoh version and Rust compiler** as the redb plugin.
 
 ```bash
-# Podman method (recommended)
+# Recommended: Use Podman for version-matched testing
 just docker-test-zenohd
 
-# Or with podman-remote directly
-podman-remote build --build-arg ZENOH_VERSION=1.6.2 --target test -t zenoh-backend-redb:test .
-podman-remote run --rm zenoh-backend-redb:test cargo test --test integration_zenohd -- --test-threads=1 --nocapture
-
-# Local method (requires zenohd 1.6.2 installed)
+# Local testing (requires matching zenohd 1.7.0 + plugins in ~/.zenoh/lib/)
 just test-zenohd
 ```
 
-**Note**: The first build takes 10-15 minutes as it compiles zenohd from source. Subsequent builds are cached and much faster.
+The Docker method builds zenohd and all plugins from source with matching versions, ensuring compatibility.
 
-The Dockerfile builds both zenohd and the plugin from source with matching versions.
+## Development
+
+```bash
+# Install development tools
+just install-tools
+
+# Format and lint
+just check
+
+# Run all quality checks
+just quality
+
+# Pre-commit verification
+just verify
+```
 
 ## License
 
@@ -314,12 +323,6 @@ at your option.
 - [redb Documentation](https://docs.rs/redb/)
 - [Zenoh GitHub](https://github.com/eclipse-zenoh/zenoh)
 - [redb GitHub](https://github.com/cberner/redb)
-
-## Acknowledgments
-
-- Built on top of [Zenoh](https://zenoh.io) by Eclipse Foundation
-- Uses [redb](https://www.redb.org/) by Christopher Berner
-- Inspired by other Zenoh backends (RocksDB, Filesystem)
 
 ## Status
 
