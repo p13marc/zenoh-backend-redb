@@ -13,17 +13,24 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Toolchain is pinned by rust-toolchain.toml (1.91.1); rustup honors it.
+  # rust-toolchain.toml (1.91.1) governs the version; the dtolnay action just
+  # provides rustup + a default toolchain (the act image ships no Rust).
   fmt:
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - run: cargo fmt --all --check
 
   clippy:
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: https://github.com/Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
@@ -31,6 +38,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
       - uses: https://github.com/Swatinem/rust-cache@v2
       - run: cargo build --all-features --locked
       - run: cargo build --release --features plugin --locked
@@ -40,7 +48,11 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
-      - uses: https://github.com/EmbarkStudios/cargo-deny-action@v2
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
+      - uses: https://github.com/taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
 
   docs:
     runs-on: ubuntu-24.04
@@ -48,5 +60,6 @@ jobs:
       RUSTDOCFLAGS: -D warnings
     steps:
       - uses: https://data.forgejo.org/actions/checkout@v6
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
       - uses: https://github.com/Swatinem/rust-cache@v2
       - run: cargo doc --all-features --no-deps --locked
