@@ -11,6 +11,10 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # shared compiler cache: sccache (mounted from the runner VM) -> garage S3
+  # on vm-runner-01; S3 endpoint+credentials come from the runner's env_file
+  RUSTC_WRAPPER: /srv/cache/bin/sccache
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   # rust-toolchain.toml (1.91.1) governs the version; the dtolnay action just
@@ -32,6 +36,8 @@ jobs:
         with:
           components: clippy
       - uses: https://github.com/Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
   test:
@@ -40,6 +46,8 @@ jobs:
       - uses: https://data.forgejo.org/actions/checkout@v6
       - uses: https://github.com/dtolnay/rust-toolchain@stable
       - uses: https://github.com/Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
       - run: cargo build --all-features --locked
       - run: cargo build --release --features plugin --locked
       - run: cargo test --all-features --locked -- --skip test_zenohd
@@ -62,4 +70,6 @@ jobs:
       - uses: https://data.forgejo.org/actions/checkout@v6
       - uses: https://github.com/dtolnay/rust-toolchain@stable
       - uses: https://github.com/Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
       - run: cargo doc --all-features --no-deps --locked
