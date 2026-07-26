@@ -2,7 +2,7 @@
 # Builds both zenohd and the plugin with the same Zenoh version and compiler
 
 # Build stage - compile zenohd and plugin from source
-FROM rust:1.91.1-slim as builder
+FROM rust:1.97-slim as builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -122,7 +122,7 @@ LABEL org.opencontainers.image.version="0.3.0"
 LABEL org.opencontainers.image.licenses="Apache-2.0 OR MIT"
 
 # Test stage - includes everything needed to run integration tests
-FROM rust:1.91.1-slim as test
+FROM rust:1.97-slim as test
 
 # Install runtime and test dependencies
 RUN apt-get update && apt-get install -y \
