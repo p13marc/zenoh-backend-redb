@@ -4,20 +4,22 @@
 //! Zenoh's plugin system, implementing the required traits for Volume and Storage.
 
 use crate::backend::RedbBackend;
-use crate::config::{RedbBackendConfig, RedbStorageConfig};
+use crate::config::{HistoryMode, RedbBackendConfig, RedbStorageConfig};
 
-use crate::storage::{RedbStorage, StoredValue};
+use crate::storage::{RedbStorage, StoredValue, WriteOutcome};
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tracing::{debug, info, warn};
 use zenoh::{
     Result as ZResult,
     bytes::{Encoding, ZBytes},
     internal::{bail, zenoh_home, zerror},
     key_expr::OwnedKeyExpr,
+    query::Parameters,
     time::Timestamp,
     try_init_log_from_env,
 };
@@ -27,6 +29,7 @@ use zenoh_backend_traits::{
 };
 use zenoh_plugin_trait::{Plugin, plugin_long_version, plugin_version};
 use zenoh_util::ffi::JsonValue;
+use zenoh_util::time_range::{TimeExpr, TimeRange};
 
 /// The environment variable used to configure the root directory for all redb storages.
 pub const SCOPE_ENV_VAR: &str = "ZENOH_BACKEND_REDB_ROOT";
@@ -42,8 +45,40 @@ pub const PROP_STORAGE_READ_ONLY: &str = "read_only";
 pub const PROP_STORAGE_CACHE_SIZE: &str = "cache_size";
 pub const PROP_STORAGE_FSYNC: &str = "fsync";
 
+// Volume configuration properties
+pub const PROP_VOLUME_HISTORY: &str = "history";
+
 // Special key for None (when the prefix being stripped exactly matches the key)
 pub const NONE_KEY: &str = "@@none_key@@";
+
+/// The selector parameter Zenoh reserves for a time range.
+pub const PARAM_TIME: &str = "_time";
+
+/// Pull a resolved [`TimeRange`] out of a selector's query parameters.
+///
+/// Returns `Ok(None)` when no `_time` was given, which is the common case and must
+/// stay cheap. A malformed `_time` is an error rather than a silent full-history
+/// reply: answering the wrong window is worse than refusing.
+fn parse_time_range(parameters: &str) -> ZResult<Option<TimeRange<SystemTime>>> {
+    if parameters.is_empty() {
+        return Ok(None);
+    }
+
+    let Some(spec) = Parameters::from(parameters)
+        .get(PARAM_TIME)
+        .map(str::to_owned)
+    else {
+        return Ok(None);
+    };
+
+    let range: TimeRange<TimeExpr> = spec
+        .parse()
+        .map_err(|e| zerror!("Invalid `{}={}` in selector: {:?}", PARAM_TIME, spec, e))?;
+
+    // Resolve `now(...)` against a single instant, so both bounds of one query
+    // agree on when "now" was.
+    Ok(Some(range.resolve_at(SystemTime::now())))
+}
 
 /// The redb backend plugin.
 pub struct RedbBackendPlugin {}
@@ -59,9 +94,34 @@ impl Plugin for RedbBackendPlugin {
     const PLUGIN_VERSION: &'static str = plugin_version!();
     const PLUGIN_LONG_VERSION: &'static str = plugin_long_version!();
 
-    fn start(_name: &str, _config: &Self::StartArgs) -> ZResult<Self::Instance> {
+    fn start(name: &str, config: &Self::StartArgs) -> ZResult<Self::Instance> {
         try_init_log_from_env();
         info!("redb backend {}", Self::PLUGIN_LONG_VERSION);
+
+        // History is a *volume*-level choice; see `HistoryMode` for why it cannot be
+        // per-storage. One plugin serves both: declare a second volume that names
+        // this backend and sets `history: "all"`.
+        let rest: serde_json::Map<String, serde_json::Value> = (&config.rest).into();
+        let history = match rest.get(PROP_VOLUME_HISTORY) {
+            None => HistoryMode::Latest,
+            Some(serde_json::Value::String(mode)) => HistoryMode::parse(mode).ok_or_else(|| {
+                zerror!(
+                    "Volume '{}': `{}` must be \"latest\" or \"all\", got \"{}\"",
+                    name,
+                    PROP_VOLUME_HISTORY,
+                    mode
+                )
+            })?,
+            Some(other) => {
+                bail!(
+                    "Volume '{}': `{}` must be a string, got {}",
+                    name,
+                    PROP_VOLUME_HISTORY,
+                    other
+                )
+            }
+        };
+        info!("redb volume '{}' history mode: {}", name, history.as_str());
 
         // Determine root directory
         let root = if let Some(dir) = std::env::var_os(SCOPE_ENV_VAR) {
@@ -85,6 +145,7 @@ impl Plugin for RedbBackendPlugin {
         let mut properties = HashMap::new();
         properties.insert("root".to_string(), root.to_string_lossy().to_string());
         properties.insert("version".to_string(), Self::PLUGIN_VERSION.to_string());
+        properties.insert("history".to_string(), history.as_str().to_string());
 
         let admin_status: serde_json::Value = properties
             .into_iter()
@@ -94,6 +155,7 @@ impl Plugin for RedbBackendPlugin {
         Ok(Box::new(RedbVolume {
             admin_status,
             backend: Arc::new(backend),
+            history,
         }))
     }
 }
@@ -102,6 +164,8 @@ impl Plugin for RedbBackendPlugin {
 pub struct RedbVolume {
     admin_status: serde_json::Value,
     backend: Arc<RedbBackend>,
+    /// The history mode every storage on this volume inherits.
+    history: HistoryMode,
 }
 
 #[async_trait]
@@ -110,10 +174,22 @@ impl Volume for RedbVolume {
         (&self.admin_status).into()
     }
 
+    /// Report what this volume can do.
+    ///
+    /// The storage manager makes two decisions from this that a storage cannot
+    /// override, which is why the mode is configured per volume:
+    ///
+    /// * a storage declaring `replication` refuses to start unless this says
+    ///   `History::Latest`;
+    /// * in `Latest` mode the manager drops outdated samples before they reach the
+    ///   backend, and in `All` mode it forwards every sample.
     fn get_capability(&self) -> Capability {
         Capability {
             persistence: Persistence::Durable,
-            history: History::Latest,
+            history: match self.history {
+                HistoryMode::Latest => History::Latest,
+                HistoryMode::All => History::All,
+            },
         }
     }
 
@@ -217,6 +293,7 @@ impl Volume for RedbVolume {
         if let Some(size) = cache_size {
             storage_config = storage_config.with_cache_size(size);
         }
+        storage_config = storage_config.with_history(self.history);
 
         // Get storage name from config
         let storage_name = config.name.clone();
@@ -265,7 +342,7 @@ impl Storage for RedbStoragePlugin {
 
         let capability = json!({
             "persistence": "durable",
-            "history": "latest",
+            "history": self.storage_config.history.as_str(),
         });
 
         let stats = match self.storage.stats() {
@@ -290,6 +367,7 @@ impl Storage for RedbStoragePlugin {
                     "metadata_bytes": stats.metadata_bytes,
                     "fragmented_bytes": stats.fragmented_bytes,
                     "key_count": stats.key_count,
+                    "sample_count": stats.sample_count,
                     "live_keys": stats.live_keys,
                     "tombstones": stats.tombstones,
                     "oldest_timestamp": stats.oldest_timestamp.map(|t| t.to_string()),
@@ -341,44 +419,28 @@ impl Storage for RedbStoragePlugin {
 
         debug!("Storing key: {} with timestamp: {}", key_str, timestamp);
 
-        // Last-writer-wins, decided here rather than trusted from upstream.
-        //
-        // The storage manager does filter outdated samples before calling us, but it
-        // does so against an in-memory cache seeded from `get_all_entries` at startup
-        // (`storages_mgt/service.rs`, `guard_cache_if_latest`). That cache is
-        // per-process and per-storage; replay, alignment and a restarted manager can
-        // all deliver an older sample to a key we already hold a newer value for.
-        // Without this check the older payload silently wins and the newer data is
-        // gone, which is exactly the class of bug a durable storage must not have.
-        let existing = storage
-            .timestamp_of(&key_str)
-            .map_err(|e| zerror!("Failed to read timestamp for key '{}': {}", key_str, e))?;
-
-        if let Some(stored) = existing
-            && timestamp <= stored
-        {
-            debug!(
-                "Ignoring outdated PUT for {}: incoming {} <= stored {}",
-                key_str, timestamp, stored
-            );
-            return Ok(StorageInsertionResult::Outdated);
-        }
-
         // Convert ZBytes to Vec<u8>
         let payload_bytes = payload.to_bytes().to_vec();
 
         // Create stored value with native Zenoh timestamp (preserves both time and ID)
         let value = StoredValue::new(payload_bytes, timestamp, encoding);
 
-        // Store in database
-        storage
+        // Last-writer-wins is decided inside the write transaction, not trusted from
+        // upstream. The storage manager does filter outdated samples before calling
+        // us, but against an in-memory cache seeded from `get_all_entries` at startup
+        // (`storages_mgt/service.rs`, `guard_cache_if_latest`) — per-process and
+        // per-storage, so replay, alignment and a restarted manager all bypass it.
+        let outcome = storage
             .put(&key_str, value)
             .map_err(|e| zerror!("Failed to put key '{}': {}", key_str, e))?;
 
-        Ok(if existing.is_some() {
-            StorageInsertionResult::Replaced
-        } else {
-            StorageInsertionResult::Inserted
+        Ok(match outcome {
+            WriteOutcome::Inserted => StorageInsertionResult::Inserted,
+            WriteOutcome::Replaced => StorageInsertionResult::Replaced,
+            WriteOutcome::Outdated => {
+                debug!("Ignored outdated PUT for {} at {}", key_str, timestamp);
+                StorageInsertionResult::Outdated
+            }
         })
     }
 
@@ -402,33 +464,31 @@ impl Storage for RedbStoragePlugin {
 
         debug!("Deleting key: {} with timestamp: {}", key_str, timestamp);
 
-        // Same last-writer-wins rule as `put`: a DELETE that predates the value we
-        // hold must not remove it.
-        if let Some(stored) = storage
-            .timestamp_of(&key_str)
-            .map_err(|e| zerror!("Failed to read timestamp for key '{}': {}", key_str, e))?
-            && timestamp < stored
-        {
-            debug!(
-                "Ignoring outdated DELETE for {}: incoming {} < stored {}",
-                key_str, timestamp, stored
-            );
-            return Ok(StorageInsertionResult::Outdated);
-        }
-
-        storage
-            .delete(&key_str)
-            .map_err(|e| zerror!("Failed to delete key '{}': {}", key_str, e))?;
-
+        // Last-writer-wins is decided inside the write transaction, the same way
+        // `put` decides it — a DELETE that predates the value we hold must not
+        // remove it. In `all` mode the tombstone is still appended to the history
+        // either way, because "this key was deleted at t" is a fact about t
+        // regardless of what arrived afterwards.
+        //
         // Deleting an absent key is not an error: the storage manager replays
         // deletions during alignment and expects them to be idempotent.
-        Ok(StorageInsertionResult::Deleted)
+        let outcome = storage
+            .delete(&key_str, timestamp)
+            .map_err(|e| zerror!("Failed to delete key '{}': {}", key_str, e))?;
+
+        Ok(match outcome {
+            WriteOutcome::Outdated => {
+                debug!("Ignored outdated DELETE for {} at {}", key_str, timestamp);
+                StorageInsertionResult::Outdated
+            }
+            _ => StorageInsertionResult::Deleted,
+        })
     }
 
     async fn get(
         &mut self,
         key: Option<OwnedKeyExpr>,
-        _parameters: &str,
+        parameters: &str,
     ) -> ZResult<Vec<StoredData>> {
         let storage = &self.storage;
 
@@ -438,6 +498,36 @@ impl Storage for RedbStoragePlugin {
         };
 
         debug!("Getting key: {}", key_str);
+
+        // A `_time`-ranged GET is the whole point of `history: "all"`. The selector's
+        // query parameters reach a backend verbatim, and Zenoh ships the parser, so
+        // both documented syntaxes work: `[start..end]` and `[start;duration]`, with
+        // `now(-1h)`-style relative expressions.
+        if let Some(range) = parse_time_range(parameters)? {
+            if self.storage_config.history != HistoryMode::All {
+                // Answering a time range from a latest-only storage would silently
+                // return one sample and look like "there was no other data".
+                warn!(
+                    "Ignoring `_time` on storage '{}': its volume is history: \"latest\", \
+                     which keeps one value per key. Configure a volume with \
+                     history: \"all\" to serve time ranges.",
+                    self.config.name
+                );
+            } else {
+                let samples = storage
+                    .get_range(&key_str, &range)
+                    .map_err(|e| zerror!("Failed to range-get key '{}': {}", key_str, e))?;
+
+                return Ok(samples
+                    .into_iter()
+                    .map(|v| StoredData {
+                        payload: ZBytes::from(v.payload),
+                        encoding: v.encoding,
+                        timestamp: v.timestamp,
+                    })
+                    .collect());
+            }
+        }
 
         match storage
             .get(&key_str)
@@ -553,6 +643,7 @@ mod tests {
             .collect();
 
         let volume = RedbVolume {
+            history: HistoryMode::Latest,
             admin_status,
             backend: Arc::new(backend),
         };
@@ -677,6 +768,99 @@ mod tests {
         let data = result.unwrap();
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].payload.to_bytes(), payload.to_bytes());
+    }
+
+    /// A `_time`-ranged GET against an `all`-mode storage returns the window; the
+    /// same GET without `_time` returns only the latest. That pair is the contract
+    /// `History::All` exists to provide.
+    #[tokio::test]
+    async fn test_time_ranged_get_returns_the_window() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("history.redb");
+
+        let storage_config = RedbStorageConfig::new()
+            .with_db_path(db_path.clone())
+            .with_create_db(true)
+            .with_history(HistoryMode::All);
+
+        let redb_storage =
+            RedbStorage::new(&db_path, storage_config.clone(), "history".to_string()).unwrap();
+
+        let mut plugin = RedbStoragePlugin {
+            config: StorageConfig {
+                name: "history".to_string(),
+                key_expr: "test/**".parse().unwrap(),
+                strip_prefix: None,
+                volume_cfg: serde_json::Value::Object(Default::default()).into(),
+                volume_id: "redb-history".to_string(),
+                complete: false,
+                garbage_collection_config: Default::default(),
+                replication: None,
+            },
+            storage: Arc::new(redb_storage),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            storage_config,
+        };
+
+        let key = OwnedKeyExpr::new("test/cpu").unwrap();
+        let id = zenoh::time::TimestampId::rand();
+
+        // Five samples, one per second, ending "now" so that a relative `_time`
+        // expression has something to find.
+        let now = SystemTime::now();
+        for i in 0..5u64 {
+            let at = now - std::time::Duration::from_secs(10 - i);
+            let ntp = NTP64::from(at.duration_since(std::time::UNIX_EPOCH).unwrap());
+            plugin
+                .put(
+                    Some(key.clone()),
+                    ZBytes::from(format!("sample{i}")),
+                    Encoding::ZENOH_STRING,
+                    Timestamp::new(ntp, id),
+                )
+                .await
+                .unwrap();
+        }
+
+        // No `_time`: the latest value only.
+        let latest = plugin.get(Some(key.clone()), "").await.unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].payload.to_bytes().as_ref(), b"sample4");
+
+        // With `_time`: the whole window, oldest first.
+        let windowed = plugin
+            .get(Some(key.clone()), "_time=[now(-3600s)..now()]")
+            .await
+            .unwrap();
+        assert_eq!(windowed.len(), 5, "every sample in the window");
+        assert_eq!(windowed[0].payload.to_bytes().as_ref(), b"sample0");
+        assert_eq!(windowed[4].payload.to_bytes().as_ref(), b"sample4");
+
+        // A window that predates every sample returns nothing, rather than
+        // falling back to the latest value.
+        let empty = plugin
+            .get(Some(key.clone()), "_time=[now(-7200s)..now(-3600s)]")
+            .await
+            .unwrap();
+        assert!(empty.is_empty());
+
+        // Other selector parameters must not be mistaken for a time range.
+        let unrelated = plugin.get(Some(key), "foo=bar").await.unwrap();
+        assert_eq!(unrelated.len(), 1);
+    }
+
+    /// A malformed `_time` must be an error, not a silent full-history reply:
+    /// answering the wrong window is worse than refusing.
+    #[test]
+    fn test_malformed_time_range_is_rejected() {
+        assert!(parse_time_range("_time=nonsense").is_err());
+        assert!(parse_time_range("").unwrap().is_none());
+        assert!(parse_time_range("foo=bar").unwrap().is_none());
+        assert!(
+            parse_time_range("_time=[now(-1h)..now()]")
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// The admin space must report what the storage costs, not just its config.

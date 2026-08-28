@@ -3,7 +3,7 @@
 //! This implementation separates payload and metadata (data_info) into different tables,
 //! similar to the RocksDB backend design using column families.
 
-use crate::config::RedbStorageConfig;
+use crate::config::{HistoryMode, RedbStorageConfig};
 use crate::error::{RedbBackendError, Result};
 use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
@@ -11,12 +11,14 @@ use redb::{
 use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tracing::{debug, info, trace, warn};
 use zenoh::bytes::{Encoding, ZBytes};
 use zenoh::internal::buffers::ZSlice;
 use zenoh::key_expr::keyexpr;
 use zenoh::time::{NTP64, Timestamp, TimestampId};
 use zenoh_ext::{z_deserialize, z_serialize};
+use zenoh_util::time_range::TimeRange;
 
 // Thread-local buffers for zero-allocation PUT/GET operations
 thread_local! {
@@ -33,6 +35,96 @@ const PAYLOADS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("payl
 /// Key: Zenoh key expression as bytes
 /// Value: Serialized DataInfo (timestamp, encoding, deleted flag)
 const DATA_INFO_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("data_info");
+
+/// What a write did, so the plugin layer can report the right
+/// `StorageInsertionResult` without re-reading the key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteOutcome {
+    /// The key held nothing before.
+    Inserted,
+    /// An existing value was superseded.
+    Replaced,
+    /// The sample predates what is stored and was not applied. Only possible in
+    /// [`HistoryMode::Latest`]; an `all`-mode storage keeps every sample.
+    Outdated,
+}
+
+/// Table of historical payloads, keyed by `(key, timestamp)`.
+/// Only written in [`HistoryMode::All`].
+const HISTORY_PAYLOADS_TABLE: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("history_payloads");
+
+/// Table of historical metadata, keyed by `(key, timestamp)`.
+/// Only written in [`HistoryMode::All`].
+const HISTORY_INFO_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("history_info");
+
+/// Separator between a key and its timestamp in the history tables.
+///
+/// A Zenoh key expression is UTF-8 and can never contain a NUL byte, and NUL sorts
+/// below every byte a key *can* hold. Those two facts give the layout the
+/// properties it needs: one key's samples are contiguous, and `a/b`'s samples all
+/// sort before `a/b/c`'s instead of interleaving with them. Concatenating the
+/// timestamp onto an unframed key would have neither.
+const KEY_TIME_SEPARATOR: u8 = 0;
+
+/// Bytes a timestamp occupies in a composite key: 8 for the NTP64, 16 for the id.
+const TIMESTAMP_LEN: usize = 8 + 16;
+
+/// `key || 0x00 || ntp64_be || timestamp_id`.
+///
+/// The NTP64 is big-endian so that redb's lexicographic ordering *is* chronological
+/// ordering, which is what makes a time window one range scan. The id follows as a
+/// tiebreaker so two sources writing at the same instant do not collide.
+fn encode_history_key(key: &str, timestamp: &Timestamp) -> Vec<u8> {
+    let mut out = Vec::with_capacity(key.len() + 1 + TIMESTAMP_LEN);
+    out.extend_from_slice(key.as_bytes());
+    out.push(KEY_TIME_SEPARATOR);
+    out.extend_from_slice(&timestamp.get_time().as_u64().to_be_bytes());
+    out.extend_from_slice(&timestamp.get_id().to_le_bytes());
+    out
+}
+
+/// The half-open byte range covering every sample of `key`.
+///
+/// The upper bound is `key || 0x01`: every composite key for `key` starts
+/// `key || 0x00`, and nothing else in the table can fall between the two.
+fn history_key_bounds(key: &str) -> (Vec<u8>, Vec<u8>) {
+    let mut start = Vec::with_capacity(key.len() + 1);
+    start.extend_from_slice(key.as_bytes());
+    start.push(KEY_TIME_SEPARATOR);
+
+    let mut end = Vec::with_capacity(key.len() + 1);
+    end.extend_from_slice(key.as_bytes());
+    end.push(KEY_TIME_SEPARATOR + 1);
+
+    (start, end)
+}
+
+/// Inverse of [`encode_history_key`].
+fn decode_history_key(bytes: &[u8]) -> Result<(String, Timestamp)> {
+    if bytes.len() < TIMESTAMP_LEN + 1 {
+        return Err(RedbBackendError::key_encoding(format!(
+            "history key too short: {} bytes",
+            bytes.len()
+        )));
+    }
+    let split = bytes.len() - TIMESTAMP_LEN;
+    if bytes[split - 1] != KEY_TIME_SEPARATOR {
+        return Err(RedbBackendError::key_encoding(
+            "history key is missing its separator".to_string(),
+        ));
+    }
+
+    let key = String::from_utf8(bytes[..split - 1].to_vec())
+        .map_err(|e| RedbBackendError::key_encoding(format!("Invalid UTF-8 in key: {e}")))?;
+
+    let mut ntp = [0u8; 8];
+    ntp.copy_from_slice(&bytes[split..split + 8]);
+    let id = TimestampId::try_from(&bytes[split + 8..])
+        .map_err(|e| RedbBackendError::key_encoding(format!("Invalid timestamp id: {e:?}")))?;
+
+    Ok((key, Timestamp::new(NTP64(u64::from_be_bytes(ntp)), id)))
+}
 
 /// A point-in-time report of what a storage costs.
 ///
@@ -53,8 +145,12 @@ pub struct StorageStats {
     /// Bytes lost to fragmentation. The gap between this plus the two above and
     /// `on_disk_bytes` is what a compaction could reclaim.
     pub fragmented_bytes: u64,
-    /// Rows in the metadata table, tombstones included.
+    /// Rows in the metadata table, tombstones included. One per key.
     pub key_count: u64,
+    /// Individual samples retained. Zero in [`HistoryMode::Latest`], where a key
+    /// *is* its only sample; in [`HistoryMode::All`] this is the number that
+    /// actually grows, and the one retention bounds.
+    pub sample_count: u64,
     /// Keys with a live value.
     pub live_keys: u64,
     /// Keys holding a deletion tombstone.
@@ -292,6 +388,11 @@ impl RedbStorage {
             // Create both tables if they don't exist
             write_txn.open_table(PAYLOADS_TABLE)?;
             write_txn.open_table(DATA_INFO_TABLE)?;
+            // Created unconditionally, in both modes. Opening a table is cheap, and
+            // creating them up front means switching a volume to `history: "all"`
+            // does not need a migration step on a database that already exists.
+            write_txn.open_table(HISTORY_PAYLOADS_TABLE)?;
+            write_txn.open_table(HISTORY_INFO_TABLE)?;
         }
         write_txn.commit()?;
 
@@ -315,44 +416,82 @@ impl RedbStorage {
     }
 
     /// Store a key-value pair with metadata.
-    pub fn put(&self, key: &str, value: StoredValue) -> Result<()> {
+    /// Store a key-value pair with metadata.
+    ///
+    /// Last-writer-wins is decided here, inside the write transaction, so that a
+    /// concurrent writer cannot read the same "existing" timestamp and have both
+    /// conclude they are the newer one.
+    ///
+    /// In [`HistoryMode::All`] every sample is appended regardless of order — that
+    /// is the point of the mode — and only the latest-value index is guarded by the
+    /// timestamp comparison.
+    pub fn put(&self, key: &str, value: StoredValue) -> Result<WriteOutcome> {
         if self.config.read_only {
             return Err(RedbBackendError::other("Storage is read-only"));
         }
 
         trace!("Putting key: {}", key);
 
-        // Use thread-local buffers to avoid allocations
         KEY_BUFFER.with(|key_buf| {
-            VALUE_BUFFER.with(|_val_buf| {
-                let mut key_buf = key_buf.borrow_mut();
+            let mut key_buf = key_buf.borrow_mut();
+            key_buf.clear();
+            self.encode_key_into(key, &mut key_buf)?;
 
-                // Encode key into reusable buffer
-                key_buf.clear();
-                self.encode_key_into(key, &mut key_buf)?;
+            let data_info_bytes = encode_data_info(
+                value.encoding.clone(),
+                &value.timestamp,
+                false, // not deleted
+            )?;
 
-                // Encode data_info
-                let data_info_bytes = encode_data_info(
-                    value.encoding.clone(),
-                    &value.timestamp,
-                    false, // not deleted
-                )?;
+            let write_txn = self.begin_write()?;
+            let outcome;
+            {
+                let mut payloads_table = write_txn.open_table(PAYLOADS_TABLE)?;
+                let mut data_info_table = write_txn.open_table(DATA_INFO_TABLE)?;
 
-                let write_txn = self.begin_write()?;
-                {
-                    // Store payload
-                    let mut payloads_table = write_txn.open_table(PAYLOADS_TABLE)?;
+                let existing = match data_info_table.get(key_buf.as_slice())? {
+                    Some(guard) => Some(decode_data_info(guard.value())?.1),
+                    None => None,
+                };
+                let is_newer = existing.is_none_or(|stored| value.timestamp > stored);
+
+                if self.config.history == HistoryMode::All {
+                    // Append the sample under its own (key, timestamp). Ordering
+                    // does not gate this: a late-arriving sample is still a fact
+                    // about the instant it carries.
+                    let history_key = encode_history_key(key, &value.timestamp);
+                    write_txn
+                        .open_table(HISTORY_PAYLOADS_TABLE)?
+                        .insert(history_key.as_slice(), value.payload.as_slice())?;
+                    write_txn
+                        .open_table(HISTORY_INFO_TABLE)?
+                        .insert(history_key.as_slice(), data_info_bytes.as_slice())?;
+                } else if !is_newer {
+                    // Latest-only: an older sample has nowhere to go.
+                    drop(payloads_table);
+                    drop(data_info_table);
+                    write_txn.abort()?;
+                    debug!("Ignoring outdated put for key: {}", key);
+                    return Ok(WriteOutcome::Outdated);
+                }
+
+                if is_newer {
                     payloads_table.insert(key_buf.as_slice(), value.payload.as_slice())?;
-
-                    // Store data_info
-                    let mut data_info_table = write_txn.open_table(DATA_INFO_TABLE)?;
                     data_info_table.insert(key_buf.as_slice(), data_info_bytes.as_slice())?;
                 }
-                write_txn.commit()?;
 
-                debug!("Stored key: {}", key);
-                Ok(())
-            })
+                outcome = if is_newer && existing.is_some() {
+                    WriteOutcome::Replaced
+                } else {
+                    // Either the key was new, or this is an `all`-mode append that
+                    // did not disturb the latest value. Both added a sample.
+                    WriteOutcome::Inserted
+                };
+            }
+            write_txn.commit()?;
+
+            debug!("Stored key: {}", key);
+            Ok(outcome)
         })
     }
 
@@ -413,7 +552,7 @@ impl RedbStorage {
     }
 
     /// Delete a key-value pair.
-    pub fn delete(&self, key: &str) -> Result<()> {
+    pub fn delete(&self, key: &str, timestamp: Timestamp) -> Result<WriteOutcome> {
         if self.config.read_only {
             return Err(RedbBackendError::other("Storage is read-only"));
         }
@@ -425,20 +564,122 @@ impl RedbStorage {
             key_buf.clear();
             self.encode_key_into(key, &mut key_buf)?;
 
+            let tombstone = encode_data_info(Encoding::ZENOH_BYTES, &timestamp, true)?;
+
             let write_txn = self.begin_write()?;
+            let outcome;
             {
-                // Delete from both tables
                 let mut payloads_table = write_txn.open_table(PAYLOADS_TABLE)?;
                 let mut data_info_table = write_txn.open_table(DATA_INFO_TABLE)?;
 
-                payloads_table.remove(key_buf.as_slice())?;
-                data_info_table.remove(key_buf.as_slice())?;
+                let existing = match data_info_table.get(key_buf.as_slice())? {
+                    Some(guard) => Some(decode_data_info(guard.value())?.1),
+                    None => None,
+                };
+                // Same last-writer-wins rule as `put`, decided in the same
+                // transaction: a DELETE that predates the stored value must not
+                // remove it.
+                //
+                // `>=`, not `>`: a deletion carrying the same timestamp as the value
+                // it retires is the ordinary case when a producer PUTs and DELETEs
+                // within one timestamp tick, and it must succeed. Only a strictly
+                // older deletion is rejected. (`put` uses the opposite tie-break —
+                // an equal-timestamp PUT is a duplicate, not an update.)
+                let is_newer = existing.is_none_or(|stored| timestamp >= stored);
+
+                if self.config.history == HistoryMode::All {
+                    // A deletion is a fact about an instant, so it is appended
+                    // regardless of order — an out-of-order DELETE still bounds the
+                    // validity of whatever preceded it.
+                    let history_key = encode_history_key(key, &timestamp);
+                    write_txn
+                        .open_table(HISTORY_PAYLOADS_TABLE)?
+                        .insert(history_key.as_slice(), [].as_slice())?;
+                    write_txn
+                        .open_table(HISTORY_INFO_TABLE)?
+                        .insert(history_key.as_slice(), tombstone.as_slice())?;
+                } else if !is_newer {
+                    drop(payloads_table);
+                    drop(data_info_table);
+                    write_txn.abort()?;
+                    debug!("Ignoring outdated delete for key: {}", key);
+                    return Ok(WriteOutcome::Outdated);
+                }
+
+                if is_newer {
+                    payloads_table.remove(key_buf.as_slice())?;
+
+                    if self.config.history == HistoryMode::All {
+                        // Leave a tombstone in the latest index rather than removing
+                        // the row. The storage manager resolves every wildcard query
+                        // through `get_all_entries`, which is built from this table:
+                        // dropping the row would make the key's retained history
+                        // unreachable by any wildcard `_time` selector, even though
+                        // the samples are still on disk.
+                        data_info_table.insert(key_buf.as_slice(), tombstone.as_slice())?;
+                    } else {
+                        data_info_table.remove(key_buf.as_slice())?;
+                    }
+                }
+
+                outcome = if is_newer {
+                    WriteOutcome::Replaced
+                } else {
+                    // All-mode, out of order: the tombstone was recorded but the
+                    // latest value stands.
+                    WriteOutcome::Inserted
+                };
             }
             write_txn.commit()?;
 
             debug!("Deleted key: {}", key);
-            Ok(())
+            Ok(outcome)
         })
+    }
+
+    /// Every sample of `key` whose timestamp falls inside `range`, oldest first.
+    ///
+    /// This is the read that `History::All` exists for. Because the composite key
+    /// is `key || 0x00 || big-endian NTP64`, redb's own ordering is chronological
+    /// ordering, so a time window is one bounded range scan — no secondary index,
+    /// and no rows belonging to other keys are touched.
+    ///
+    /// Tombstones inside the window are **skipped**, not returned: a deletion has
+    /// no value to reply with, and `StoredData` has nowhere to say "this one is a
+    /// deletion".
+    pub fn get_range(&self, key: &str, range: &TimeRange<SystemTime>) -> Result<Vec<StoredValue>> {
+        let read_txn = self.db.begin_read()?;
+        let payloads_table = read_txn.open_table(HISTORY_PAYLOADS_TABLE)?;
+        let info_table = read_txn.open_table(HISTORY_INFO_TABLE)?;
+
+        let (start, end) = history_key_bounds(key);
+        let mut results = Vec::new();
+
+        for item in info_table.range(start.as_slice()..end.as_slice())? {
+            let (key_bytes, info_bytes) = item?;
+            let (_, timestamp) = decode_history_key(key_bytes.value())?;
+
+            // The scan is already bounded to this key; `contains` applies the
+            // bound's inclusivity, which the byte range cannot express.
+            if !range.contains(timestamp.get_time().to_system_time()) {
+                continue;
+            }
+
+            let (encoding, timestamp, deleted) = decode_data_info(info_bytes.value())?;
+            if deleted {
+                continue;
+            }
+
+            if let Some(payload) = payloads_table.get(key_bytes.value())? {
+                results.push(StoredValue::new(
+                    payload.value().to_vec(),
+                    timestamp,
+                    encoding,
+                ));
+            }
+        }
+
+        Ok(results)
     }
 
     /// Retrieve all key-value pairs from the storage.
@@ -507,8 +748,25 @@ impl RedbStorage {
         let payloads_table = read_txn.open_table(PAYLOADS_TABLE)?;
         let data_info_table = read_txn.open_table(DATA_INFO_TABLE)?;
 
-        let payload_stats = payloads_table.stats()?;
-        let info_stats = data_info_table.stats()?;
+        let history_payloads = read_txn.open_table(HISTORY_PAYLOADS_TABLE)?;
+        let history_info = read_txn.open_table(HISTORY_INFO_TABLE)?;
+
+        // All four tables, not just the latest-value pair. An `all`-mode storage
+        // keeps almost everything in the history tables, so counting only the
+        // latest ones would report a few megabytes against a multi-gigabyte file —
+        // and since the docs tell an operator that the gap to `on_disk_bytes` is
+        // what a compaction could reclaim, it would claim nearly the whole file is
+        // reclaimable when almost none of it is.
+        let table_stats = [
+            payloads_table.stats()?,
+            data_info_table.stats()?,
+            history_payloads.stats()?,
+            history_info.stats()?,
+        ];
+        let stored_bytes: u64 = table_stats.iter().map(|s| s.stored_bytes()).sum();
+        let metadata_bytes: u64 = table_stats.iter().map(|s| s.metadata_bytes()).sum();
+        let fragmented_bytes: u64 = table_stats.iter().map(|s| s.fragmented_bytes()).sum();
+
         let cache = self.db.cache_stats();
 
         // Scan the metadata table for the timestamp span and the live/tombstone
@@ -542,10 +800,11 @@ impl RedbStorage {
 
         Ok(StorageStats {
             on_disk_bytes,
-            stored_bytes: payload_stats.stored_bytes() + info_stats.stored_bytes(),
-            metadata_bytes: payload_stats.metadata_bytes() + info_stats.metadata_bytes(),
-            fragmented_bytes: payload_stats.fragmented_bytes() + info_stats.fragmented_bytes(),
+            stored_bytes,
+            metadata_bytes,
+            fragmented_bytes,
             key_count: data_info_table.len()?,
+            sample_count: history_info.len()?,
             live_keys,
             tombstones,
             oldest_timestamp: oldest,
@@ -573,7 +832,13 @@ impl RedbStorage {
         for item in data_info_table.iter()? {
             let (key_bytes, info_bytes) = item?;
             let (_, timestamp, deleted) = decode_data_info(info_bytes.value())?;
-            if !deleted {
+
+            // In `all` mode a tombstoned key is still enumerable. The storage
+            // manager resolves every wildcard query through this list and then GETs
+            // each key, so omitting a deleted key would hide its whole retained
+            // history from `_time` selectors while a direct GET on the exact key
+            // still returned it.
+            if !deleted || self.config.history == HistoryMode::All {
                 results.push((self.decode_key(key_bytes.value())?, timestamp));
             }
         }
@@ -705,13 +970,20 @@ impl RedbStorage {
 
         let write_txn = self.begin_write()?;
         {
-            // Delete and recreate both tables - much more efficient than removing keys one by one
+            // Delete and recreate the tables - much more efficient than removing
+            // keys one by one. The history tables go too: leaving them behind would
+            // make a "cleared" all-mode storage still answer every `_time` query
+            // with the full history it was just told to forget.
             write_txn.delete_table(PAYLOADS_TABLE)?;
             write_txn.delete_table(DATA_INFO_TABLE)?;
+            write_txn.delete_table(HISTORY_PAYLOADS_TABLE)?;
+            write_txn.delete_table(HISTORY_INFO_TABLE)?;
 
-            // Recreate the tables
+            // Recreate them
             write_txn.open_table(PAYLOADS_TABLE)?;
             write_txn.open_table(DATA_INFO_TABLE)?;
+            write_txn.open_table(HISTORY_PAYLOADS_TABLE)?;
+            write_txn.open_table(HISTORY_INFO_TABLE)?;
         }
         write_txn.commit()?;
 
@@ -819,7 +1091,12 @@ mod tests {
         let value = StoredValue::new(b"data".to_vec(), timestamp, Encoding::ZENOH_BYTES);
         storage.put("test/key", value).unwrap();
 
-        storage.delete("test/key").unwrap();
+        storage
+            .delete(
+                "test/key",
+                Timestamp::new(NTP64(999999999), TimestampId::rand()),
+            )
+            .unwrap();
         assert!(storage.get("test/key").unwrap().is_none());
     }
 
@@ -890,6 +1167,358 @@ mod tests {
             "v1/h-aaaabbbbcccc/@rpc/sysinfo/processes",
             "v1/*/*/sysinfo/**"
         ));
+    }
+
+    fn history_storage() -> (RedbStorage, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("history.redb");
+        let config = RedbStorageConfig::default().with_history(HistoryMode::All);
+        let storage = RedbStorage::new(db_path, config, "history".to_string()).unwrap();
+        (storage, temp_dir)
+    }
+
+    fn at(secs: u64, id: TimestampId) -> Timestamp {
+        Timestamp::new(NTP64::from(std::time::Duration::from_secs(secs)), id)
+    }
+
+    fn full_range() -> TimeRange<SystemTime> {
+        TimeRange {
+            start: zenoh_util::time_range::TimeBound::Unbounded,
+            end: zenoh_util::time_range::TimeBound::Unbounded,
+        }
+    }
+
+    /// Clearing an `all`-mode storage must forget the history too, not just the
+    /// latest values — otherwise a cleared storage still answers every `_time`
+    /// query with everything it was told to forget.
+    #[test]
+    fn clear_forgets_the_history_as_well() {
+        let (storage, _temp) = history_storage();
+        let id = TimestampId::rand();
+
+        for secs in [100, 200, 300] {
+            storage
+                .put(
+                    "k",
+                    StoredValue::new(b"x".to_vec(), at(secs, id), Encoding::ZENOH_BYTES),
+                )
+                .unwrap();
+        }
+        assert_eq!(storage.get_range("k", &full_range()).unwrap().len(), 3);
+
+        storage.clear().unwrap();
+
+        assert!(storage.get("k").unwrap().is_none());
+        assert!(
+            storage.get_range("k", &full_range()).unwrap().is_empty(),
+            "a cleared storage must not still serve its history"
+        );
+    }
+
+    /// An out-of-order DELETE must not erase a newer value, in either mode.
+    ///
+    /// In `all` mode the storage manager does *not* pre-filter outdated samples —
+    /// it only does that for latest-value volumes — so a replayed or aligned
+    /// deletion reaches the backend as the normal case, not the exception.
+    #[test]
+    fn an_out_of_order_delete_does_not_erase_a_newer_value() {
+        let (storage, _temp) = history_storage();
+        let id = TimestampId::rand();
+
+        storage
+            .put(
+                "k",
+                StoredValue::new(b"newer".to_vec(), at(200, id), Encoding::ZENOH_BYTES),
+            )
+            .unwrap();
+
+        let outcome = storage.delete("k", at(100, id)).unwrap();
+
+        assert_eq!(
+            storage.get("k").unwrap().map(|v| v.payload),
+            Some(b"newer".to_vec()),
+            "a DELETE older than the stored value must not remove it"
+        );
+        assert_eq!(
+            outcome,
+            WriteOutcome::Inserted,
+            "the tombstone was recorded"
+        );
+
+        // ...but it *is* recorded in the history, because it is a fact about t=100.
+        // The value written at t=200 is still the only thing with a payload.
+        let samples = storage.get_range("k", &full_range()).unwrap();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].payload, b"newer");
+
+        // A newer DELETE does remove it.
+        assert_eq!(
+            storage.delete("k", at(300, id)).unwrap(),
+            WriteOutcome::Replaced
+        );
+        assert!(storage.get("k").unwrap().is_none());
+    }
+
+    /// A deleted key must stay enumerable in `all` mode, or its retained history
+    /// becomes unreachable through every wildcard selector.
+    ///
+    /// The storage manager resolves wildcard queries by listing entries and then
+    /// GETting each key. Dropping a tombstoned key from that list would hide its
+    /// whole history from `_time` selectors while a direct GET on the exact key
+    /// still answered — the same query returning different data depending on how
+    /// it was spelled.
+    #[test]
+    fn a_deleted_key_stays_enumerable_in_all_mode() {
+        let (history, _t1) = history_storage();
+        let (latest, _t2) = create_test_storage();
+        let id = TimestampId::rand();
+
+        for storage in [&history, &latest] {
+            storage
+                .put(
+                    "k",
+                    StoredValue::new(b"v".to_vec(), at(100, id), Encoding::ZENOH_BYTES),
+                )
+                .unwrap();
+            storage.delete("k", at(200, id)).unwrap();
+        }
+
+        assert_eq!(
+            history.get_all_timestamps().unwrap().len(),
+            1,
+            "an all-mode storage must still list a tombstoned key so its history is reachable"
+        );
+        assert_eq!(
+            latest.get_all_timestamps().unwrap().len(),
+            0,
+            "a latest-mode storage has nothing left to reach, so it must not list it"
+        );
+
+        // Either way, the key itself reads as absent.
+        assert!(history.get("k").unwrap().is_none());
+        assert!(latest.get("k").unwrap().is_none());
+    }
+
+    /// Statistics must account for the history tables, which are where an
+    /// `all`-mode storage keeps essentially everything.
+    #[test]
+    fn stats_count_history_not_just_the_latest_values() {
+        let (storage, _temp) = history_storage();
+        let id = TimestampId::rand();
+
+        for secs in 0..20u64 {
+            storage
+                .put(
+                    "k",
+                    StoredValue::new(vec![0u8; 1024], at(100 + secs, id), Encoding::ZENOH_BYTES),
+                )
+                .unwrap();
+        }
+
+        let stats = storage.stats().unwrap();
+
+        assert_eq!(stats.key_count, 1, "one key");
+        assert_eq!(stats.sample_count, 20, "twenty samples under it");
+        assert!(
+            stats.stored_bytes >= 20 * 1024,
+            "stored_bytes must cover the history, not just the latest value: {}",
+            stats.stored_bytes
+        );
+    }
+
+    /// A composite key must survive a round trip exactly — the timestamp is the
+    /// addressing, so a lossy encode silently reorders history.
+    #[test]
+    fn history_key_round_trips() {
+        let id = TimestampId::rand();
+        let ts = Timestamp::new(NTP64(0x1234_5678_9abc_def0), id);
+
+        let encoded = encode_history_key("v1/h-aaaa/telemetry/cpu", &ts);
+        let (key, decoded) = decode_history_key(&encoded).unwrap();
+
+        assert_eq!(key, "v1/h-aaaa/telemetry/cpu");
+        assert_eq!(decoded, ts);
+    }
+
+    /// Byte order must make redb's ordering chronological, and the NUL separator
+    /// must stop one key's rows from interleaving with a longer key's.
+    ///
+    /// `a/b` and `a/b/c` are the case that breaks a naive unframed encoding: `/`
+    /// (0x2f) sorts above NUL, so without the separator `a/b`'s timestamp bytes
+    /// could be read as part of `a/b/c`.
+    #[test]
+    fn history_keys_sort_chronologically_and_group_by_key() {
+        let id = TimestampId::rand();
+
+        let earlier = encode_history_key("a/b", &at(100, id));
+        let later = encode_history_key("a/b", &at(200, id));
+        assert!(
+            earlier < later,
+            "later timestamps must sort after earlier ones"
+        );
+
+        let nested = encode_history_key("a/b/c", &at(1, id));
+        assert!(
+            later < nested,
+            "every row of `a/b` must sort before any row of `a/b/c`"
+        );
+
+        // And the bounds cover exactly one key's rows.
+        let (start, end) = history_key_bounds("a/b");
+        assert!(start.as_slice() <= earlier.as_slice() && earlier.as_slice() < end.as_slice());
+        assert!(start.as_slice() <= later.as_slice() && later.as_slice() < end.as_slice());
+        assert!(
+            nested.as_slice() >= end.as_slice(),
+            "`a/b/c` must fall outside `a/b`'s bounds"
+        );
+    }
+
+    /// `all` mode keeps every sample; `latest` mode keeps one.
+    #[test]
+    fn all_mode_keeps_every_sample_latest_mode_keeps_one() {
+        let id = TimestampId::rand();
+
+        let (history, _t1) = history_storage();
+        let (latest, _t2) = create_test_storage();
+
+        for (i, storage) in [&history, &latest].into_iter().enumerate() {
+            for secs in [100, 200, 300] {
+                let value = StoredValue::new(
+                    format!("sample-{secs}").into_bytes(),
+                    at(secs, id),
+                    Encoding::ZENOH_BYTES,
+                );
+                storage.put("k", value).unwrap();
+            }
+            let _ = i;
+        }
+
+        let samples = history.get_range("k", &full_range()).unwrap();
+        assert_eq!(samples.len(), 3, "all mode must keep every sample");
+        // Oldest first, which is what a range query is expected to return.
+        assert_eq!(samples[0].payload, b"sample-100");
+        assert_eq!(samples[2].payload, b"sample-300");
+
+        // Both modes agree on the latest value.
+        assert_eq!(history.get("k").unwrap().unwrap().payload, b"sample-300");
+        assert_eq!(latest.get("k").unwrap().unwrap().payload, b"sample-300");
+        assert_eq!(latest.get_range("k", &full_range()).unwrap().len(), 0);
+    }
+
+    /// A late-arriving sample is still a fact about the instant it carries: `all`
+    /// mode must store it without letting it disturb the latest value.
+    #[test]
+    fn an_out_of_order_sample_lands_in_history_but_not_in_latest() {
+        let (storage, _temp) = history_storage();
+        let id = TimestampId::rand();
+
+        storage
+            .put(
+                "k",
+                StoredValue::new(b"newer".to_vec(), at(200, id), Encoding::ZENOH_BYTES),
+            )
+            .unwrap();
+        let outcome = storage
+            .put(
+                "k",
+                StoredValue::new(b"older".to_vec(), at(100, id), Encoding::ZENOH_BYTES),
+            )
+            .unwrap();
+
+        assert_eq!(outcome, WriteOutcome::Inserted, "the sample was stored");
+        assert_eq!(
+            storage.get("k").unwrap().unwrap().payload,
+            b"newer",
+            "an older sample must not become the latest value"
+        );
+        assert_eq!(storage.get_range("k", &full_range()).unwrap().len(), 2);
+    }
+
+    /// A time window must return only what falls inside it, and must not reach
+    /// into a neighbouring key's samples.
+    #[test]
+    fn a_time_window_returns_only_that_window() {
+        let (storage, _temp) = history_storage();
+        let id = TimestampId::rand();
+
+        for secs in [100, 200, 300, 400] {
+            storage
+                .put(
+                    "k",
+                    StoredValue::new(
+                        format!("{secs}").into_bytes(),
+                        at(secs, id),
+                        Encoding::ZENOH_BYTES,
+                    ),
+                )
+                .unwrap();
+            // A second key whose samples must never appear in `k`'s answers.
+            storage
+                .put(
+                    "k2",
+                    StoredValue::new(b"other".to_vec(), at(secs, id), Encoding::ZENOH_BYTES),
+                )
+                .unwrap();
+        }
+
+        use zenoh_util::time_range::TimeBound;
+        let window = TimeRange {
+            start: TimeBound::Inclusive(at(200, id).get_time().to_system_time()),
+            end: TimeBound::Inclusive(at(300, id).get_time().to_system_time()),
+        };
+
+        let samples = storage.get_range("k", &window).unwrap();
+        let payloads: Vec<_> = samples
+            .iter()
+            .map(|s| String::from_utf8(s.payload.clone()).unwrap())
+            .collect();
+        assert_eq!(payloads, vec!["200", "300"]);
+
+        // Exclusive bounds must actually exclude.
+        let exclusive = TimeRange {
+            start: TimeBound::Exclusive(at(200, id).get_time().to_system_time()),
+            end: TimeBound::Exclusive(at(400, id).get_time().to_system_time()),
+        };
+        let payloads: Vec<_> = storage
+            .get_range("k", &exclusive)
+            .unwrap()
+            .iter()
+            .map(|s| String::from_utf8(s.payload.clone()).unwrap())
+            .collect();
+        assert_eq!(payloads, vec!["300"]);
+    }
+
+    /// A deletion is a fact about a point in time. It must be recorded in the
+    /// history, and it must not be replied to as if it were a value.
+    #[test]
+    fn a_deletion_is_recorded_but_never_replied() {
+        let (storage, _temp) = history_storage();
+        let id = TimestampId::rand();
+
+        storage
+            .put(
+                "k",
+                StoredValue::new(b"live".to_vec(), at(100, id), Encoding::ZENOH_BYTES),
+            )
+            .unwrap();
+        storage.delete("k", at(200, id)).unwrap();
+        storage
+            .put(
+                "k",
+                StoredValue::new(b"again".to_vec(), at(300, id), Encoding::ZENOH_BYTES),
+            )
+            .unwrap();
+
+        let payloads: Vec<_> = storage
+            .get_range("k", &full_range())
+            .unwrap()
+            .iter()
+            .map(|s| String::from_utf8(s.payload.clone()).unwrap())
+            .collect();
+
+        // The tombstone at t=200 is stored (it bounds the "live" value's validity)
+        // but has no value to reply with, so it is skipped.
+        assert_eq!(payloads, vec!["live", "again"]);
     }
 
     #[test]
@@ -1065,7 +1694,12 @@ mod tests {
 
         assert_eq!(storage.count().unwrap(), 3);
 
-        storage.delete("key2").unwrap();
+        storage
+            .delete(
+                "key2",
+                Timestamp::new(NTP64(999999999), TimestampId::rand()),
+            )
+            .unwrap();
         assert_eq!(storage.count().unwrap(), 2);
     }
 

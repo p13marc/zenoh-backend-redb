@@ -45,7 +45,9 @@ fn test_basic_put_get_delete() {
     assert_eq!(retrieved.encoding.id(), value.encoding.id());
 
     // Delete the value
-    storage.delete("test_key").unwrap();
+    storage
+        .delete("test_key", test_value(vec![], 99999).timestamp)
+        .unwrap();
     // deleted
 
     // Verify it's gone
@@ -78,7 +80,9 @@ fn test_delete_nonexistent() {
     let storage = backend.get_storage("test_storage").unwrap();
 
     // Delete non-existent key should return false
-    storage.delete("nonexistent").unwrap(); // returns ()
+    storage
+        .delete("nonexistent", test_value(vec![], 999).timestamp)
+        .unwrap(); // returns ()
     // Delete was called (no error)
 }
 

@@ -20,6 +20,57 @@ pub struct RedbBackendConfig {
     pub default_storage_config: RedbStorageConfig,
 }
 
+/// How much of a key's history a storage keeps.
+///
+/// This is a **volume**-level choice, not a per-storage one, because Zenoh asks the
+/// *volume* for its capability (`Volume::get_capability`) and makes two decisions
+/// from the answer that a storage cannot opt out of:
+///
+/// * A storage that declares `replication` fails to start unless its volume reports
+///   `History::Latest` (`storages_mgt/mod.rs` in zenoh 1.10 `bail!`s on it).
+/// * In `Latest` mode the storage manager drops outdated samples before they reach
+///   the backend; in `All` mode it passes every sample straight through.
+///
+/// So a volume reporting `All` cannot host any replicated storage. Declare one
+/// volume per mode rather than trying to mix them:
+///
+/// ```json5
+/// volumes: {
+///   redb: {},                                              // durable · latest
+///   "redb-history": { backend: "redb", history: "all" },   // durable · all
+/// }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HistoryMode {
+    /// One value per key. The last writer wins and older samples are discarded.
+    #[default]
+    Latest,
+    /// Every sample is kept, addressed by `(key, timestamp)`, and a `_time`-ranged
+    /// GET returns the window.
+    All,
+}
+
+impl HistoryMode {
+    /// Parse the `history` volume property.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "latest" => Some(Self::Latest),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    /// The string this mode is written as in a config, and reported as on the admin
+    /// space.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Latest => "latest",
+            Self::All => "all",
+        }
+    }
+}
+
 /// Configuration for a single redb storage instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedbStorageConfig {
@@ -67,6 +118,11 @@ pub struct RedbStorageConfig {
     /// Read-only mode. If true, the storage will not accept writes.
     #[serde(default)]
     pub read_only: bool,
+
+    /// How much history to keep. Inherited from the volume this storage belongs to;
+    /// see [`HistoryMode`] for why it is a volume-level choice.
+    #[serde(default)]
+    pub history: HistoryMode,
 }
 
 impl Default for RedbBackendConfig {
@@ -125,6 +181,12 @@ impl RedbStorageConfig {
     /// Set the cache size in bytes.
     pub fn with_cache_size(mut self, cache_size: usize) -> Self {
         self.cache_size = cache_size;
+        self
+    }
+
+    /// Set how much history this storage keeps.
+    pub fn with_history(mut self, history: HistoryMode) -> Self {
+        self.history = history;
         self
     }
 
@@ -202,6 +264,7 @@ impl Default for RedbStorageConfig {
             table_name: default_table_name(),
             create_db: true,
             read_only: false,
+            history: HistoryMode::Latest,
         }
     }
 }

@@ -117,7 +117,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 9. Delete a value
     println!("9. Deleting value...");
-    storage.delete("demo/device/status")?;
+    storage.delete("demo/device/status", timestamp)?;
     println!("   ✓ Deleted 'demo/device/status'\n");
 
     // 10. Count remaining entries

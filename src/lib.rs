@@ -94,7 +94,7 @@ mod tests {
         assert_eq!(retrieved.unwrap().payload, value.payload);
 
         // Delete the value
-        storage.delete("test/key").unwrap();
+        storage.delete("test/key", timestamp).unwrap();
 
         // Verify it's gone
         let retrieved = storage.get("test/key").unwrap();

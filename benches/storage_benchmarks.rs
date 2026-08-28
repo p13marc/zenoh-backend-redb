@@ -97,7 +97,11 @@ fn bench_delete_operations(c: &mut Criterion) {
             },
             |key| {
                 // Benchmark: delete the key
-                storage.delete(black_box(&key)).unwrap();
+                // Timestamp 1 beats the setup PUT's timestamp of 0, so the
+                // delete is applied rather than rejected as outdated.
+                storage
+                    .delete(black_box(&key), create_value(0, 1).timestamp)
+                    .unwrap();
             },
             criterion::BatchSize::SmallInput,
         );

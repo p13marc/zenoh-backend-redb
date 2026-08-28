@@ -86,6 +86,12 @@ Each storage instance can be individually configured:
 | `create_db` | Boolean | `true` | Create database if it doesn't exist |
 | `read_only` | Boolean | `false` | Read-only mode |
 
+And one **volume**-level property:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `history` | String | `"latest"` | `"latest"` or `"all"`. See [History](#history-latest-and-all). |
+
 ### Environment Variables
 
 - `ZENOH_BACKEND_REDB_ROOT`: Override default storage directory (default: `~/.zenoh/zenoh_backend_redb`)
@@ -140,6 +146,71 @@ returns, the data is on disk. `fsync: false` maps to `Durability::None` — redb
 the intermediate `Eventual` level, so the trade is sharper than the name suggests:
 commits are **not persisted at all** until some later durable commit lands. Reasonable
 for a cache or a replayable stream; wrong for a system of record.
+
+## History: `latest` and `all`
+
+By default a storage keeps **one value per key** — the last writer wins. That is
+right for state documents, catalogs, and event logs whose records each own a unique
+key. It is wrong for anything whose value is the *sequence*: a metric sampled every
+five seconds has no "latest" worth keeping alone.
+
+Set `history: "all"` on a volume and every sample is kept, addressed by
+`(key, timestamp)`, with a time-ranged GET returning the window.
+
+```json5
+volumes: {
+  redb: {},                                             // durable · latest
+  "redb-history": { backend: "redb", history: "all" },  // durable · all
+},
+storages: {
+  "fleet-latest": {
+    key_expr: "v1/*/state/**",
+    volume: { id: "redb", dir: "latest" },
+  },
+  "fleet-timeseries": {
+    key_expr: "v1/*/telemetry/**",
+    volume: { id: "redb-history", dir: "timeseries" },
+  },
+}
+```
+
+Query a window with Zenoh's `_time` selector parameter — both documented syntaxes
+work, including relative expressions:
+
+```
+v1/h-3fa9c2d41b7e/telemetry/cpu?_time=[now(-1h)..now()]
+v1/h-3fa9c2d41b7e/telemetry/cpu?_time=[2026-08-28T06:00:00Z;1h]
+```
+
+Without `_time` the same key returns only its latest sample.
+
+### Why `history` is a volume property and not a storage one
+
+Zenoh asks the **volume** for its capability, and the storage manager makes two
+decisions from the answer that an individual storage cannot override:
+
+- A storage declaring `replication` **fails to start** unless its volume reports
+  `History::Latest`. Replication works only on latest-value backends.
+- In `latest` mode the manager discards outdated samples before they reach the
+  backend. In `all` mode it forwards every sample, which is what makes the append
+  stream complete.
+
+So a volume reporting `all` cannot host *any* replicated storage. Declaring one
+volume per mode — as above — keeps that choice explicit instead of silently
+stripping replication from every storage that shares the volume. Both volumes are
+served by the same plugin.
+
+### Two things to know before deploying `all`
+
+- **Replication is unavailable** on an `all` volume. Do not configure both.
+- **Retention is not optional.** Zenoh storages have no TTL, and an unbounded
+  telemetry store fills a disk quietly. Size the volume against your sample rate,
+  or prune it on a schedule.
+
+Deletions are recorded in the history as tombstones — a deletion is a fact about a
+point in time, and dropping it would make the history claim the previous value was
+live right up to the next sample. Tombstones are never *replied* to: there is no
+value to return.
 
 ## What a storage reports about itself
 

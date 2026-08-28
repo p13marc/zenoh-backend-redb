@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Breaking**: `RedbStorage::delete` takes the deletion's `Timestamp`. A deletion
+  always has one, and `all`-mode storages need it to place the tombstone.
+- **Breaking**: `RedbStorage::put` returns `WriteOutcome` rather than `()`, so the
+  plugin layer can report `Inserted`/`Replaced`/`Outdated` without a second read.
+  The last-writer-wins decision now happens inside the write transaction, where two
+  concurrent writers cannot both conclude they are newer.
 - **Breaking**: Updated to Zenoh 1.10.0 (pinned `=1.10.0`). A 1.7 plugin cannot load
   into the 1.9/1.10 routers this backend targets; the failure is silent — zenohd
   starts, logs one ERROR line, and serves no storage.
@@ -23,6 +29,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the serde defaults (it previously gave `fsync: false` and `create_db: false`).
 
 ### Added
+- **`History::All`.** A volume configured `history: "all"` keeps every sample rather
+  than one value per key, addressed by `(key, timestamp)`, and answers Zenoh's
+  `_time` selector parameter with the window — both documented syntaxes, including
+  relative `now(-1h)` expressions. Without `_time` the same key returns its latest
+  sample. This makes the crate a pure-Rust, embedded, `durable · all` Zenoh backend.
+  - History is a **volume**-level property because Zenoh asks the volume for its
+    capability and makes two decisions from it a storage cannot override: a storage
+    declaring `replication` refuses to start unless the volume reports
+    `History::Latest`, and in `latest` mode the manager discards outdated samples
+    before they reach the backend. Declare one volume per mode; one plugin serves
+    both.
+  - Deletions are recorded as tombstones in `all` mode and are never replied to.
+    A tombstoned key stays enumerable in `all` mode, so its retained history is
+    still reachable through a wildcard `_time` selector; in `latest` mode, where
+    there is nothing left to reach, it is not.
+  - Admin statistics account for the history tables and report `sample_count`
+    alongside `key_count`.
 - **Storages report their cost on the admin space.** `get_admin_status` now carries
   on-disk bytes (the real file), stored/metadata/fragmented bytes, key count, live
   keys vs tombstones, the timestamp span held, cache size/usage/hit-ratio/evictions,
