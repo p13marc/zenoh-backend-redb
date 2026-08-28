@@ -5,7 +5,9 @@
 
 use crate::config::RedbStorageConfig;
 use crate::error::{RedbBackendError, Result};
-use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{
+    Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+};
 use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
@@ -31,6 +33,56 @@ const PAYLOADS_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("payl
 /// Key: Zenoh key expression as bytes
 /// Value: Serialized DataInfo (timestamp, encoding, deleted flag)
 const DATA_INFO_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("data_info");
+
+/// A point-in-time report of what a storage costs.
+///
+/// Returned by [`RedbStorage::stats`] and rendered onto the Zenoh admin space, where
+/// `zenctl storage list` and the GUI's storage panel can read it. An operator could
+/// previously see that a storage *existed* but not what it was consuming — and three
+/// of the four things that went wrong on the target fleet this year were "something
+/// grew and nobody was watching the number".
+#[derive(Debug, Clone)]
+pub struct StorageStats {
+    /// Size of the database file on disk, from the filesystem. `None` if the path is
+    /// not known or cannot be stat'ed.
+    pub on_disk_bytes: Option<u64>,
+    /// Bytes of keys and values actually inserted, excluding indexing overhead.
+    pub stored_bytes: u64,
+    /// Bytes of btree branch keys and other redb metadata.
+    pub metadata_bytes: u64,
+    /// Bytes lost to fragmentation. The gap between this plus the two above and
+    /// `on_disk_bytes` is what a compaction could reclaim.
+    pub fragmented_bytes: u64,
+    /// Rows in the metadata table, tombstones included.
+    pub key_count: u64,
+    /// Keys with a live value.
+    pub live_keys: u64,
+    /// Keys holding a deletion tombstone.
+    pub tombstones: u64,
+    /// Oldest timestamp held, tombstones included.
+    pub oldest_timestamp: Option<Timestamp>,
+    /// Newest timestamp held, tombstones included.
+    pub newest_timestamp: Option<Timestamp>,
+    /// Configured page-cache budget.
+    pub cache_size_bytes: usize,
+    /// Bytes currently held in the page cache.
+    pub cache_used_bytes: usize,
+    /// Cache reads served from memory.
+    pub cache_read_hits: u64,
+    /// Cache reads that had to go to storage.
+    pub cache_read_misses: u64,
+    /// Evictions caused by the cache being full. A climbing count against a flat
+    /// hit ratio is the signal that `cache_size` is too small for the working set.
+    pub cache_evictions: u64,
+}
+
+impl StorageStats {
+    /// Read-cache hit ratio in `[0, 1]`, or `None` before any read has happened.
+    pub fn cache_hit_ratio(&self) -> Option<f64> {
+        let total = self.cache_read_hits + self.cache_read_misses;
+        (total > 0).then(|| self.cache_read_hits as f64 / total as f64)
+    }
+}
 
 /// Metadata associated with a stored value.
 /// This matches the RocksDB backend's DataInfo structure.
@@ -442,6 +494,68 @@ impl RedbStorage {
             }
             None => Ok(None),
         }
+    }
+
+    /// What this storage costs, for the admin space.
+    ///
+    /// Sizes come from redb and the filesystem, never from adding up key and value
+    /// lengths: the gap between "bytes I stored" and "bytes on disk" is exactly the
+    /// fragmentation and metadata overhead an operator needs to see, and an
+    /// estimate would hide it. `on_disk_bytes` is the real file.
+    pub fn stats(&self) -> Result<StorageStats> {
+        let read_txn = self.db.begin_read()?;
+        let payloads_table = read_txn.open_table(PAYLOADS_TABLE)?;
+        let data_info_table = read_txn.open_table(DATA_INFO_TABLE)?;
+
+        let payload_stats = payloads_table.stats()?;
+        let info_stats = data_info_table.stats()?;
+        let cache = self.db.cache_stats();
+
+        // Scan the metadata table for the timestamp span and the live/tombstone
+        // split. This is the one number that cannot come from redb.
+        let mut live_keys = 0u64;
+        let mut tombstones = 0u64;
+        let mut oldest: Option<Timestamp> = None;
+        let mut newest: Option<Timestamp> = None;
+        for item in data_info_table.iter()? {
+            let (_, info_bytes) = item?;
+            let (_, timestamp, deleted) = decode_data_info(info_bytes.value())?;
+            if deleted {
+                tombstones += 1;
+            } else {
+                live_keys += 1;
+            }
+            if oldest.is_none_or(|o| timestamp < o) {
+                oldest = Some(timestamp);
+            }
+            if newest.is_none_or(|n| timestamp > n) {
+                newest = Some(timestamp);
+            }
+        }
+
+        let on_disk_bytes = self
+            .config
+            .db_path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len());
+
+        Ok(StorageStats {
+            on_disk_bytes,
+            stored_bytes: payload_stats.stored_bytes() + info_stats.stored_bytes(),
+            metadata_bytes: payload_stats.metadata_bytes() + info_stats.metadata_bytes(),
+            fragmented_bytes: payload_stats.fragmented_bytes() + info_stats.fragmented_bytes(),
+            key_count: data_info_table.len()?,
+            live_keys,
+            tombstones,
+            oldest_timestamp: oldest,
+            newest_timestamp: newest,
+            cache_size_bytes: self.config.cache_size,
+            cache_used_bytes: cache.used_bytes(),
+            cache_read_hits: cache.read_hits(),
+            cache_read_misses: cache.read_misses(),
+            cache_evictions: cache.evictions(),
+        })
     }
 
     /// Every live key and its timestamp, without reading a single payload.

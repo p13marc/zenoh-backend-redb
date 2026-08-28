@@ -8,6 +8,7 @@ use crate::config::{RedbBackendConfig, RedbStorageConfig};
 
 use crate::storage::{RedbStorage, StoredValue};
 use async_trait::async_trait;
+use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -228,7 +229,8 @@ impl Volume for RedbVolume {
 
         Ok(Box::new(RedbStoragePlugin {
             config,
-            storage: Arc::new(tokio::sync::Mutex::new(redb_storage)),
+            storage: Arc::new(redb_storage),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
         }))
     }
@@ -237,14 +239,84 @@ impl Volume for RedbVolume {
 /// Storage implementation for redb backend.
 struct RedbStoragePlugin {
     config: StorageConfig,
-    storage: Arc<tokio::sync::Mutex<RedbStorage>>,
+    /// The storage itself. Every `RedbStorage` method takes `&self` and redb does
+    /// its own concurrency control, so reads need no lock — which is what lets the
+    /// *synchronous* `get_admin_status` report live statistics rather than having
+    /// to give up under contention.
+    storage: Arc<RedbStorage>,
+    /// Serialises the read-then-write in `put` and `delete`. Those compare the
+    /// incoming timestamp against the stored one and then act on the result, which
+    /// has to be atomic or two concurrent writers can each decide they are newer.
+    write_lock: Arc<tokio::sync::Mutex<()>>,
     storage_config: RedbStorageConfig,
 }
 
 #[async_trait]
 impl Storage for RedbStoragePlugin {
+    /// Report the storage's configuration *and* what it currently costs.
+    ///
+    /// This is the hook Zenoh gives a backend to describe itself on the admin
+    /// space, and it is already read by `zenctl storage list` and the GUI's storage
+    /// panel. Reporting only the config let an operator see that a storage existed
+    /// but not what it was consuming — and "something grew and nobody was watching
+    /// the number" is the shape of most storage incidents.
     fn get_admin_status(&self) -> JsonValue {
-        self.config.to_json_value().into()
+        let mut status = self.config.to_json_value();
+
+        let capability = json!({
+            "persistence": "durable",
+            "history": "latest",
+        });
+
+        let stats = match self.storage.stats() {
+            Ok(stats) => {
+                let mut cache = json!({
+                    "size_bytes": stats.cache_size_bytes,
+                    "used_bytes": stats.cache_used_bytes,
+                    "read_hits": stats.cache_read_hits,
+                    "read_misses": stats.cache_read_misses,
+                    "evictions": stats.cache_evictions,
+                });
+                // Absent rather than 0.0 before any read: a ratio nobody has
+                // measured yet must not look like a cache that is missing every
+                // time.
+                if let Some(ratio) = stats.cache_hit_ratio() {
+                    cache["hit_ratio"] = json!(ratio);
+                }
+
+                json!({
+                    "on_disk_bytes": stats.on_disk_bytes,
+                    "stored_bytes": stats.stored_bytes,
+                    "metadata_bytes": stats.metadata_bytes,
+                    "fragmented_bytes": stats.fragmented_bytes,
+                    "key_count": stats.key_count,
+                    "live_keys": stats.live_keys,
+                    "tombstones": stats.tombstones,
+                    "oldest_timestamp": stats.oldest_timestamp.map(|t| t.to_string()),
+                    "newest_timestamp": stats.newest_timestamp.map(|t| t.to_string()),
+                    "cache": cache,
+                })
+            }
+            Err(e) => {
+                // Never fail the admin space over statistics: a storage that is
+                // serving correctly must still report itself.
+                warn!("Failed to collect storage statistics: {}", e);
+                json!({ "error": e.to_string() })
+            }
+        };
+
+        if let Some(obj) = status.as_object_mut() {
+            obj.insert("capability".to_string(), capability);
+            obj.insert("stats".to_string(), stats);
+            if let Some(path) = &self.storage_config.db_path {
+                obj.insert(
+                    "db_path".to_string(),
+                    json!(path.to_string_lossy().to_string()),
+                );
+            }
+        }
+
+        status.into()
     }
 
     async fn put(
@@ -254,7 +326,8 @@ impl Storage for RedbStoragePlugin {
         encoding: Encoding,
         timestamp: Timestamp,
     ) -> ZResult<StorageInsertionResult> {
-        let storage = self.storage.lock().await;
+        let _write = self.write_lock.lock().await;
+        let storage = &self.storage;
 
         if self.storage_config.read_only {
             warn!("Received PUT for read-only DB on {:?} - ignored", key);
@@ -314,7 +387,8 @@ impl Storage for RedbStoragePlugin {
         key: Option<OwnedKeyExpr>,
         timestamp: Timestamp,
     ) -> ZResult<StorageInsertionResult> {
-        let storage = self.storage.lock().await;
+        let _write = self.write_lock.lock().await;
+        let storage = &self.storage;
 
         if self.storage_config.read_only {
             warn!("Received DELETE for read-only DB on {:?} - ignored", key);
@@ -356,7 +430,7 @@ impl Storage for RedbStoragePlugin {
         key: Option<OwnedKeyExpr>,
         _parameters: &str,
     ) -> ZResult<Vec<StoredData>> {
-        let storage = self.storage.lock().await;
+        let storage = &self.storage;
 
         let key_str = match key {
             Some(k) => k.to_string(),
@@ -386,7 +460,7 @@ impl Storage for RedbStoragePlugin {
     }
 
     async fn get_all_entries(&self) -> ZResult<Vec<(Option<OwnedKeyExpr>, Timestamp)>> {
-        let storage = self.storage.lock().await;
+        let storage = &self.storage;
 
         debug!("Getting all entries");
 
@@ -513,7 +587,8 @@ mod tests {
                 garbage_collection_config: Default::default(),
                 replication: None,
             },
-            storage: Arc::new(tokio::sync::Mutex::new(redb_storage)),
+            storage: Arc::new(redb_storage),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
         };
 
@@ -544,7 +619,8 @@ mod tests {
                 garbage_collection_config: Default::default(),
                 replication: None,
             },
-            storage: Arc::new(tokio::sync::Mutex::new(redb_storage)),
+            storage: Arc::new(redb_storage),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
         };
 
@@ -578,7 +654,8 @@ mod tests {
                 garbage_collection_config: Default::default(),
                 replication: None,
             },
-            storage: Arc::new(tokio::sync::Mutex::new(redb_storage)),
+            storage: Arc::new(redb_storage),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
         };
 
@@ -600,6 +677,128 @@ mod tests {
         let data = result.unwrap();
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].payload.to_bytes(), payload.to_bytes());
+    }
+
+    /// The admin space must report what the storage costs, not just its config.
+    #[tokio::test]
+    async fn test_admin_status_reports_size_and_cache() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.redb");
+
+        let storage_config = RedbStorageConfig::new()
+            .with_db_path(db_path.clone())
+            .with_create_db(true)
+            .with_cache_size(8 * 1024 * 1024);
+
+        let redb_storage =
+            RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
+
+        let mut storage_plugin = RedbStoragePlugin {
+            config: StorageConfig {
+                name: "test".to_string(),
+                key_expr: "test/**".parse().unwrap(),
+                strip_prefix: None,
+                volume_cfg: serde_json::Value::Object(Default::default()).into(),
+                volume_id: "test_volume".to_string(),
+                complete: false,
+                garbage_collection_config: Default::default(),
+                replication: None,
+            },
+            storage: Arc::new(redb_storage),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            storage_config,
+        };
+
+        let id = zenoh::time::TimestampId::rand();
+        for i in 0..5 {
+            storage_plugin
+                .put(
+                    Some(OwnedKeyExpr::new(format!("test/k{i}")).unwrap()),
+                    ZBytes::from(vec![0u8; 1024]),
+                    Encoding::ZENOH_BYTES,
+                    Timestamp::new(NTP64(100 + i), id),
+                )
+                .await
+                .unwrap();
+        }
+
+        let status: serde_json::Value =
+            serde_json::to_value(storage_plugin.get_admin_status()).unwrap();
+        let stats = &status["stats"];
+
+        assert_eq!(stats["key_count"], 5);
+        assert_eq!(stats["live_keys"], 5);
+        assert_eq!(stats["tombstones"], 0);
+
+        // The size must be the real file, not an estimate summed from lengths.
+        let on_disk = stats["on_disk_bytes"].as_u64().expect("on_disk_bytes");
+        let actual = std::fs::metadata(&db_path).unwrap().len();
+        assert_eq!(on_disk, actual);
+        assert!(on_disk > 0);
+
+        // Stored bytes must at least account for the payloads we wrote.
+        assert!(
+            stats["stored_bytes"].as_u64().unwrap() >= 5 * 1024,
+            "stored_bytes {} should cover 5 KiB of payloads",
+            stats["stored_bytes"]
+        );
+
+        assert_eq!(stats["cache"]["size_bytes"], 8 * 1024 * 1024);
+        assert!(status["capability"]["persistence"] == "durable");
+
+        // The timestamp span of what is held.
+        assert!(stats["oldest_timestamp"].is_string());
+        assert!(stats["newest_timestamp"].is_string());
+    }
+
+    /// A tombstone must be visible in the counts, distinctly from a live key.
+    #[tokio::test]
+    async fn test_admin_status_counts_are_not_estimates() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.redb");
+
+        let storage_config = RedbStorageConfig::new()
+            .with_db_path(db_path.clone())
+            .with_create_db(true);
+
+        let redb_storage =
+            RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
+
+        let mut storage_plugin = RedbStoragePlugin {
+            config: StorageConfig {
+                name: "test".to_string(),
+                key_expr: "test/**".parse().unwrap(),
+                strip_prefix: None,
+                volume_cfg: serde_json::Value::Object(Default::default()).into(),
+                volume_id: "test_volume".to_string(),
+                complete: false,
+                garbage_collection_config: Default::default(),
+                replication: None,
+            },
+            storage: Arc::new(redb_storage),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            storage_config,
+        };
+
+        let id = zenoh::time::TimestampId::rand();
+        let key = OwnedKeyExpr::new("test/gone").unwrap();
+        storage_plugin
+            .put(
+                Some(key.clone()),
+                ZBytes::from("x"),
+                Encoding::ZENOH_STRING,
+                Timestamp::new(NTP64(100), id),
+            )
+            .await
+            .unwrap();
+        storage_plugin
+            .delete(Some(key), Timestamp::new(NTP64(200), id))
+            .await
+            .unwrap();
+
+        let status: serde_json::Value =
+            serde_json::to_value(storage_plugin.get_admin_status()).unwrap();
+        assert_eq!(status["stats"]["live_keys"], 0);
     }
 
     /// An out-of-order PUT must not clobber a newer stored value.
@@ -630,7 +829,8 @@ mod tests {
                 garbage_collection_config: Default::default(),
                 replication: None,
             },
-            storage: Arc::new(tokio::sync::Mutex::new(redb_storage)),
+            storage: Arc::new(redb_storage),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
         };
 
@@ -709,7 +909,8 @@ mod tests {
                 garbage_collection_config: Default::default(),
                 replication: None,
             },
-            storage: Arc::new(tokio::sync::Mutex::new(redb_storage)),
+            storage: Arc::new(redb_storage),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
         };
 
@@ -772,7 +973,8 @@ mod tests {
                 garbage_collection_config: Default::default(),
                 replication: None,
             },
-            storage: Arc::new(tokio::sync::Mutex::new(redb_storage)),
+            storage: Arc::new(redb_storage),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
         };
 
@@ -818,7 +1020,8 @@ mod tests {
                 garbage_collection_config: Default::default(),
                 replication: None,
             },
-            storage: Arc::new(tokio::sync::Mutex::new(redb_storage)),
+            storage: Arc::new(redb_storage),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
         };
 
@@ -890,7 +1093,8 @@ mod tests {
                 garbage_collection_config: Default::default(),
                 replication: None,
             },
-            storage: Arc::new(tokio::sync::Mutex::new(ro_storage)),
+            storage: Arc::new(ro_storage),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config: ro_config,
         };
 
@@ -948,7 +1152,8 @@ mod tests {
                 garbage_collection_config: Default::default(),
                 replication: None,
             },
-            storage: Arc::new(tokio::sync::Mutex::new(ro_storage)),
+            storage: Arc::new(ro_storage),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config: ro_config,
         };
 
@@ -980,7 +1185,8 @@ mod tests {
                 garbage_collection_config: Default::default(),
                 replication: None,
             },
-            storage: Arc::new(tokio::sync::Mutex::new(redb_storage)),
+            storage: Arc::new(redb_storage),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
         };
 

@@ -23,6 +23,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the serde defaults (it previously gave `fsync: false` and `create_db: false`).
 
 ### Added
+- **Storages report their cost on the admin space.** `get_admin_status` now carries
+  on-disk bytes (the real file), stored/metadata/fragmented bytes, key count, live
+  keys vs tombstones, the timestamp span held, cache size/usage/hit-ratio/evictions,
+  and the declared capability. An operator could previously see that a storage
+  existed but not what it was consuming.
+- `RedbStorage::stats` and the `StorageStats` type.
 - `RedbStorage::get_all_timestamps` — every live key and timestamp without reading
   a payload. This is what the storage manager calls to resolve **every** wildcard
   query, and it previously went through `get_all`, loading the entire database into
@@ -53,6 +59,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently won. It now returns `Outdated` / `Replaced` / `Inserted` correctly.
 - **DELETE no longer discards its timestamp.** A deletion that predates the stored
   value is rejected as `Outdated` instead of removing it.
+- Reads no longer serialise behind a write mutex. `RedbStoragePlugin` held the
+  storage in a `tokio::sync::Mutex` although every `RedbStorage` method takes
+  `&self` and redb does its own concurrency control. The mutex now guards only the
+  read-then-write in `put`/`delete`, which is the part that genuinely must be
+  atomic — and that is what lets the synchronous `get_admin_status` report live
+  statistics instead of giving up under contention.
 - `Dockerfile`: the plugin is now a real member of the zenoh workspace with
   `[patch.crates-io]` pointing at the local sources. It was copied into the tree but
   carried its own lockfile, so it built as a *separate* workspace — the exact

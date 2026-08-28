@@ -141,6 +141,46 @@ the intermediate `Eventual` level, so the trade is sharper than the name suggest
 commits are **not persisted at all** until some later durable commit lands. Reasonable
 for a cache or a replayable stream; wrong for a system of record.
 
+## What a storage reports about itself
+
+Each storage publishes its configuration *and* its cost on Zenoh's admin space,
+under `@/<zid>/router/status/plugins/storage_manager/**`. `zenctl storage list` and
+the GUI's storage panel read it; so can any `GET`.
+
+```json5
+{
+  capability: { persistence: "durable", history: "latest" },
+  db_path: "/var/lib/zenoh/redb/telemetry.redb",
+  stats: {
+    on_disk_bytes:    41947136,   // the real file, from the filesystem
+    stored_bytes:     33554432,   // keys + values actually inserted
+    metadata_bytes:    1048576,   // btree branch keys and redb metadata
+    fragmented_bytes:  7344128,   // what a compaction could reclaim
+    key_count:           10240,
+    live_keys:           10100,
+    tombstones:            140,
+    oldest_timestamp: "...",
+    newest_timestamp: "...",
+    cache: {
+      size_bytes:     67108864,
+      used_bytes:     41943040,
+      read_hits:        982341,
+      read_misses:        1204,
+      hit_ratio:      0.998777,   // absent until something has been read
+      evictions:             0,
+    },
+  },
+}
+```
+
+Sizes come from redb and the filesystem, never from adding up key and value
+lengths. The gap between `stored_bytes` and `on_disk_bytes` *is* the overhead an
+operator needs to see, and an estimate would hide exactly that.
+
+The number to watch is `evictions` climbing while `hit_ratio` sits flat: that is
+`cache_size` being smaller than the working set. `fragmented_bytes` growing without
+bound is the case for a compaction.
+
 ## Usage Examples
 
 ### Basic Storage Configuration
