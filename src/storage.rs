@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tracing::{debug, info, trace, warn};
 use zenoh::bytes::{Encoding, ZBytes};
 use zenoh::internal::buffers::ZSlice;
+use zenoh::key_expr::keyexpr;
 use zenoh::time::{NTP64, Timestamp, TimestampId};
 use zenoh_ext::{z_deserialize, z_serialize};
 
@@ -564,29 +565,27 @@ impl RedbStorage {
             .map_err(|e| RedbBackendError::serialization(format!("Invalid UTF-8 in key: {}", e)))
     }
 
-    /// Check if a key matches a wildcard pattern.
-    /// Supports '*' and '**' wildcards.
+    /// Does `key` match the key expression `pattern`?
+    ///
+    /// This defers to Zenoh's own key-expression algebra rather than splitting on
+    /// `/` ourselves. A storage that answers with different semantics than the
+    /// router that routed the query to it is a divergence that surfaces later as
+    /// "why did this GET answer differently through the storage".
+    ///
+    /// Two rules a hand-rolled `*`/`**` matcher does not have, and both matter:
+    ///
+    /// 1. **Verbatim chunks.** `*` and `**` never match a chunk beginning with `@`.
+    ///    That is the entire basis of the verbatim planes (`@rpc`, `@media`,
+    ///    `@blob`, `@catalog`): `v1/*/state/**` cannot reach `v1/@catalog/state/**`,
+    ///    which is why a catalog needs a storage of its own.
+    /// 2. **`$*`**, the sub-chunk wildcard. A selector using it previously matched
+    ///    nothing at all, silently.
+    ///
+    /// A key or pattern that is not a valid key expression matches nothing.
     fn matches_wildcard(key: &str, pattern: &str) -> bool {
-        let key_parts: Vec<&str> = key.split('/').collect();
-        let pattern_parts: Vec<&str> = pattern.split('/').collect();
-        matches_parts(&key_parts, &pattern_parts)
-    }
-}
-
-/// Recursive helper function for wildcard matching.
-fn matches_parts(key_parts: &[&str], pattern_parts: &[&str]) -> bool {
-    match (key_parts.first(), pattern_parts.first()) {
-        (None, None) => true,
-        (Some(_), None) => false,
-        (None, Some(&"**")) => matches_parts(key_parts, &pattern_parts[1..]),
-        (None, Some(_)) => false,
-        (Some(_), Some(&"**")) => {
-            matches_parts(key_parts, &pattern_parts[1..])
-                || matches_parts(&key_parts[1..], pattern_parts)
-        }
-        (Some(_), Some(&"*")) => matches_parts(&key_parts[1..], &pattern_parts[1..]),
-        (Some(&key_part), Some(&pattern_part)) => {
-            key_part == pattern_part && matches_parts(&key_parts[1..], &pattern_parts[1..])
+        match (keyexpr::new(key), keyexpr::new(pattern)) {
+            (Ok(key), Ok(pattern)) => pattern.intersects(key),
+            _ => false,
         }
     }
 }
@@ -673,11 +672,68 @@ mod tests {
         assert!(!RedbStorage::matches_wildcard("a/b/c", "a/b/d"));
     }
 
+    /// `*` and `**` must not reach a chunk beginning with `@`.
+    ///
+    /// This is the rule the hand-rolled matcher did not have, and it is not a
+    /// detail: the verbatim planes exist because of it. A fleet-wide state
+    /// selector must not be able to see the catalog, which is precisely why the
+    /// catalog is configured as a storage of its own.
     #[test]
-    fn test_matches_parts_function() {
-        let key_parts = vec!["a", "b", "c"];
-        let pattern_parts = vec!["a", "*", "c"];
-        assert!(matches_parts(&key_parts, &pattern_parts));
+    fn star_does_not_match_a_verbatim_chunk() {
+        assert!(!RedbStorage::matches_wildcard(
+            "v1/@catalog/state/entity/h-aaaabbbbcccc",
+            "v1/*/state/**"
+        ));
+        assert!(!RedbStorage::matches_wildcard(
+            "v1/@catalog/state/entity/h-aaaabbbbcccc",
+            "v1/**"
+        ));
+
+        // ...but a selector that names the verbatim chunk reaches it.
+        assert!(RedbStorage::matches_wildcard(
+            "v1/@catalog/state/entity/h-aaaabbbbcccc",
+            "v1/@catalog/state/**"
+        ));
+
+        // The same rule for the other planes.
+        assert!(!RedbStorage::matches_wildcard(
+            "v1/h-aaaabbbbcccc/@rpc/sysinfo/processes",
+            "v1/*/*/sysinfo/**"
+        ));
+    }
+
+    /// `$*` is a sub-chunk wildcard. The old matcher treated it as a literal, so
+    /// a selector using it returned nothing at all and said nothing about it.
+    #[test]
+    fn sub_chunk_wildcard_is_supported() {
+        assert!(RedbStorage::matches_wildcard("a/sensor1/c", "a/sensor$*/c"));
+        assert!(RedbStorage::matches_wildcard("a/sensor/c", "a/sensor$*/c"));
+        assert!(!RedbStorage::matches_wildcard("a/other/c", "a/sensor$*/c"));
+    }
+
+    /// The placeholder used when `strip_prefix` consumes a key entirely is a
+    /// verbatim chunk, so `**` cannot reach it. That is the correct outcome —
+    /// it is an internal sentinel, not part of anyone's keyspace — but it is
+    /// worth pinning so the behaviour is not rediscovered as a bug.
+    #[test]
+    fn the_none_key_sentinel_is_verbatim() {
+        assert!(!RedbStorage::matches_wildcard(
+            crate::plugin::NONE_KEY,
+            "**"
+        ));
+        assert!(RedbStorage::matches_wildcard(
+            crate::plugin::NONE_KEY,
+            crate::plugin::NONE_KEY
+        ));
+    }
+
+    /// Anything that is not a valid key expression matches nothing, rather than
+    /// panicking or matching by accident.
+    #[test]
+    fn invalid_key_expressions_match_nothing() {
+        assert!(!RedbStorage::matches_wildcard("a//b", "**"));
+        assert!(!RedbStorage::matches_wildcard("a/b", "a/["));
+        assert!(!RedbStorage::matches_wildcard("", "**"));
     }
 
     #[test]

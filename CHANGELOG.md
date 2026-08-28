@@ -34,6 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requirement and the three traps that all produce the same silent failure.
 
 ### Fixed
+- **Wildcard matching now uses Zenoh's key-expression algebra** (`keyexpr::intersects`)
+  instead of a hand-rolled `*`/`**` matcher. The hand-rolled one lacked two rules:
+  `*`/`**` must never match a chunk beginning with `@` (the basis of the `@rpc`,
+  `@media`, `@blob` and `@catalog` verbatim planes), and `$*` sub-chunk matching was
+  treated as a literal, so a selector using it silently matched nothing.
 - **PUT no longer overwrites newer data with older data.** `put` never compared
   timestamps and always reported `Inserted`, so a replayed or out-of-order sample
   silently won. It now returns `Outdated` / `Replaced` / `Inserted` correctly.
