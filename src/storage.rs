@@ -1622,25 +1622,41 @@ mod tests {
         RedbStorage::new(db_path, config, "retained".to_string()).unwrap()
     }
 
-    /// Fill `key` with one sample per `step` seconds, ending `now`.
-    fn fill(storage: &RedbStorage, key: &str, count: u64, step: u64, id: TimestampId) {
+    /// Fill `key` with one sample per `step` seconds, ending `now`, and return the
+    /// payloads written, in order.
+    ///
+    /// The return value is the point: the wall clock is read *once*, here. A test
+    /// that re-derived the expected payloads from a second `SystemTime::now()`
+    /// disagreed with this one whenever a second ticked in between — a flake that
+    /// looked exactly like a retention bug.
+    fn fill(
+        storage: &RedbStorage,
+        key: &str,
+        count: u64,
+        step: u64,
+        id: TimestampId,
+    ) -> Vec<String> {
         let now = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
+        let mut written = Vec::new();
         for i in 0..count {
             let secs = now - (count - i) * step;
+            let payload = format!("{secs}");
             storage
                 .put(
                     key,
                     StoredValue::new(
-                        format!("{secs}").into_bytes(),
+                        payload.clone().into_bytes(),
                         at(secs, id),
                         Encoding::ZENOH_BYTES,
                     ),
                 )
                 .unwrap();
+            written.push(payload);
         }
+        written
     }
 
     /// `max_age_secs` must drop older samples and keep newer ones — and the effect
@@ -1700,7 +1716,7 @@ mod tests {
             &dir,
         );
 
-        fill(&storage, "busy", 20, 1, id);
+        let busy = fill(&storage, "busy", 20, 1, id);
         fill(&storage, "quiet", 3, 1, id);
 
         storage.enforce_retention().unwrap();
@@ -1717,16 +1733,10 @@ mod tests {
              not evict another key's history"
         );
 
-        // What survived is the *newest* five, not an arbitrary five. `fill` writes
-        // payloads that are their own timestamps, so the surviving payloads must be
-        // exactly the last five it wrote.
-        let now = SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let expected: Vec<String> = (15..20)
-            .map(|i: u64| (now - (20 - i)).to_string())
-            .collect();
+        // What survived is the *newest* five, not an arbitrary five. Compared
+        // against what `fill` actually wrote rather than against a freshly sampled
+        // clock, which would disagree whenever a second ticked mid-test.
+        let expected: Vec<String> = busy[busy.len() - 5..].to_vec();
         let kept: Vec<String> = storage
             .get_range("busy", &full_range())
             .unwrap()
