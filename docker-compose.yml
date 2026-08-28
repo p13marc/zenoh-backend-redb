@@ -9,7 +9,7 @@ services:
       context: .
       target: test
       args:
-        ZENOH_VERSION: "1.6.2"
+        ZENOH_VERSION: "1.10.0"
     image: zenoh-backend-redb:test
     environment:
       - RUST_BACKTRACE=1
@@ -22,7 +22,7 @@ services:
       context: .
       target: runtime
       args:
-        ZENOH_VERSION: "1.6.2"
+        ZENOH_VERSION: "1.10.0"
     image: zenoh-backend-redb:runtime
     ports:
       - "7447:7447"

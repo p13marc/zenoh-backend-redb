@@ -6,12 +6,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a Zenoh storage backend using [redb](https://www.redb.org/) as the underlying database engine. It implements the `zenoh_backend_traits` interfaces to provide persistent storage for Zenoh's storage manager plugin. The backend is pure Rust with no C dependencies, ACID-compliant, and supports zero-copy reads.
 
-**Current Zenoh version: 1.7.0** (pinned with `=1.7.0` in Cargo.toml)
+**Current Zenoh version: 1.10.0** (pinned with `=1.10.0` in Cargo.toml)
 
 ## Build Commands
 
 ```bash
-# Build everything (uses Rust 1.91.1 via rust-toolchain.toml)
+# Build everything (uses Rust 1.97 via rust-toolchain.toml)
 cargo build --all-features
 
 # Build release plugin (creates libzenoh_backend_redb.so)
@@ -36,7 +36,7 @@ just test-one TEST_NAME
 # RECOMMENDED: Use Podman to ensure version compatibility
 just docker-test-zenohd
 
-# Local zenohd tests (requires zenohd 1.7.0 + storage_manager plugin installed)
+# Local zenohd tests (requires zenohd 1.10.0 + storage_manager plugin installed)
 just test-zenohd
 
 # Run benchmarks
@@ -46,11 +46,11 @@ just bench
 ### Integration Test Requirements
 
 The zenohd integration tests require:
-1. **zenohd** installed and in PATH (version 1.7.0)
+1. **zenohd** installed and in PATH (version 1.10.0)
 2. **libzenoh_plugin_storage_manager.so** in `~/.zenoh/lib/`
 3. **libzenoh_backend_redb.so** in `~/.zenoh/lib/`
 
-All three must be built with the **same Rust version** (1.91.1) and **same Zenoh version** (1.7.0).
+All three must be built with the **same Rust version** (1.97) and **same Zenoh version** (1.10.0).
 
 Tests will skip gracefully with a message if plugins are missing or incompatible.
 
@@ -151,7 +151,7 @@ Backend is configured through Zenoh's storage_manager plugin:
 | `db_file` | string | - | Alternative to dir, explicit filename |
 | `create_db` | bool | true | Create database if missing |
 | `read_only` | bool | false | Read-only mode |
-| `cache_size` | number | redb default | Cache size in bytes |
+| `cache_size` | number | `67108864` (64 MiB) | redb page-cache budget in bytes (never redb’s own 1 GiB default) |
 | `fsync` | bool | true | Enable fsync for durability |
 
 ## Environment Variables

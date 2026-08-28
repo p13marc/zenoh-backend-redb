@@ -161,11 +161,17 @@ watch:
     cargo watch -x build
 
 # Check MSRV (Minimum Supported Rust Version)
+#
+# There is no MSRV window to check: the plugin must be built with the *exact*
+# rustc that zenohd was built with, or Zenoh's compatibility check rejects it
+# ("Incompatible rustc versions") and the router silently serves no storage.
+# rust-toolchain.toml is the single source of truth.
 msrv:
     #!/usr/bin/env bash
-    echo "Checking MSRV (Rust 1.70)..."
-    rustup toolchain install 1.70
-    cargo +1.70 check --all-features
+    set -euo pipefail
+    pinned=$(grep -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)
+    echo "This crate has no MSRV range — it pins rustc $pinned exactly."
+    echo "zenohd must be built with the same version. Active: $(rustc --version)"
 
 # Install all quality tools
 install-tools:
@@ -274,7 +280,7 @@ docker-test-zenohd:
     echo "Building test image with zenohd and plugin..."
     echo "Note: First build takes 10-15 minutes (compiling zenohd from source)"
     echo "========================================"
-    podman-remote build --build-arg ZENOH_VERSION=1.7.0 --target test -t zenoh-backend-redb:test .
+    podman-remote build --build-arg ZENOH_VERSION=1.10.0 --target test -t zenoh-backend-redb:test .
     echo ""
     echo "========================================"
     echo "Running zenohd integration tests..."
@@ -288,16 +294,28 @@ docker-test-zenohd-no-cache:
     echo "Building test image WITHOUT CACHE..."
     echo "Note: This will take 20-40 minutes (full rebuild)"
     echo "========================================"
-    podman-remote build --no-cache --build-arg ZENOH_VERSION=1.7.0 --target test -t zenoh-backend-redb:test .
+    podman-remote build --no-cache --build-arg ZENOH_VERSION=1.10.0 --target test -t zenoh-backend-redb:test .
     echo ""
     echo "========================================"
     echo "Running zenohd integration tests..."
     echo "========================================"
     podman-remote run --rm -e RUST_BACKTRACE=1 -e RUST_LOG=info zenoh-backend-redb:test cargo test --test integration_zenohd -- --test-threads=1 --nocapture
 
-# Run zenohd integration tests with Podman using fast build (pre-built Zenoh image)
+# Re-run the zenohd integration tests against an already-built test image.
+#
+# `docker-test-zenohd` rebuilds the image (which compiles zenohd from source and
+# takes 10-15 minutes). Use this when only the test code changed and the image is
+# still current.
 docker-test-zenohd-fast:
-    #!/usr/bin/env
+    #!/usr/bin/env bash
+    set -euo pipefail
+    podman-remote image exists zenoh-backend-redb:test || {
+      echo "no zenoh-backend-redb:test image — run: just docker-test-zenohd" >&2
+      exit 1
+    }
+    podman-remote run --rm -e RUST_BACKTRACE=1 -e RUST_LOG=info \
+      zenoh-backend-redb:test \
+      cargo test --test integration_zenohd -- --test-threads=1 --nocapture
 
 # Build Podman image
 docker-build:

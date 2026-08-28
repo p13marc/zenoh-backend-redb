@@ -9,7 +9,7 @@ A [Zenoh](https://zenoh.io) storage backend using [redb](https://www.redb.org/) 
 
 This backend provides persistent storage for Zenoh using redb, a pure Rust embedded key-value database with ACID compliance and zero-copy reads. It's particularly well-suited for edge computing, IoT devices, and applications requiring a lightweight, dependency-free storage solution.
 
-**Compatible with Zenoh 1.7.0**
+**Compatible with Zenoh 1.10.0**
 
 ### Features
 
@@ -81,7 +81,7 @@ Each storage instance can be individually configured:
 |-----------|------|---------|-------------|
 | `dir` | String | required | Database directory name (creates `<name>.redb`) |
 | `db_file` | String | - | Alternative to `dir`, explicit database filename |
-| `cache_size` | Number | redb default | Cache size in bytes |
+| `cache_size` | Number | `67108864` (64 MiB) | redb page-cache budget in bytes. See [Why `cache_size` has a default](#why-cache_size-has-a-default). |
 | `fsync` | Boolean | `true` | Enable fsync for durability |
 | `create_db` | Boolean | `true` | Create database if it doesn't exist |
 | `read_only` | Boolean | `false` | Read-only mode |
@@ -89,6 +89,57 @@ Each storage instance can be individually configured:
 ### Environment Variables
 
 - `ZENOH_BACKEND_REDB_ROOT`: Override default storage directory (default: `~/.zenoh/zenoh_backend_redb`)
+
+## Version compatibility
+
+This plugin is a `cdylib` loaded into `zenohd`, and Zenoh checks compatibility by
+comparing a `Compatibility` struct built from the **exact rustc version**, the
+**compiled feature set** and the **struct versions**. A mismatch is not a link error and
+not a crash you can read:
+
+> **zenohd starts, logs a single ERROR line, and then serves no storage at all.**
+
+Every GET returns nothing and every PUT is dropped, with a healthy-looking router. So
+the version requirements below are not advisory.
+
+| | Must match zenohd |
+|---|---|
+| Zenoh | `1.10.0` (pinned `=1.10.0` in `Cargo.toml`, all five zenoh crates) |
+| rustc | `1.97` (`rust-toolchain.toml`) |
+
+### The three traps
+
+All three produce the identical symptom above.
+
+1. **Plugins built in separate workspaces.** `zenoh-plugin-storage-manager` takes
+   `zenoh_backend_traits` with `default-features = false`; other backends take it with
+   defaults. Built separately, their compiled feature strings differ and the
+   compatibility check rejects the pair — *"Incompatible Zenoh feature sets"*. Build the
+   storage manager and this backend in **one** cargo workspace so features unify. The
+   `Dockerfile` here does that; `just docker-test-zenohd` is the supported path.
+2. **A crate shipping its own `rust-toolchain.toml`.** It will pin a different rustc
+   than the one `zenohd` was built with — *"Incompatible rustc versions"*. Remove it
+   before building, or build everything with the host toolchain.
+3. **A version-skewed `zenohd`.** `cargo install zenohd --version 1.10.0 --locked`, and
+   confirm with `zenohd --version` before blaming the backend.
+
+### Why `cache_size` has a default
+
+`cache_size` defaults to **64 MiB** and is always passed to redb explicitly. This
+backend never inherits redb's own default, which is **1 GiB** in redb 4.
+
+That is a deliberate refusal, not a tuning preference. On a small guest an unbounded
+page cache presents as a slow multi-day RSS climb that ends at the OOM killer, with
+nothing in any log connecting it to a storage setting. Raise it on a host with memory to
+spare (read-heavy: 200 MiB+); lower it on an edge node (10–50 MiB).
+
+### Durability
+
+`fsync: true` (the default) maps to redb's `Durability::Immediate`: when a commit
+returns, the data is on disk. `fsync: false` maps to `Durability::None` — redb 4 removed
+the intermediate `Eventual` level, so the trade is sharper than the name suggests:
+commits are **not persisted at all** until some later durable commit lands. Reasonable
+for a cache or a replayable stream; wrong for a system of record.
 
 ## Usage Examples
 
@@ -285,7 +336,7 @@ The zenohd integration tests verify the full plugin lifecycle:
 # Recommended: Use Podman for version-matched testing
 just docker-test-zenohd
 
-# Local testing (requires matching zenohd 1.7.0 + plugins in ~/.zenoh/lib/)
+# Local testing (requires matching zenohd 1.10.0 + plugins in ~/.zenoh/lib/)
 just test-zenohd
 ```
 

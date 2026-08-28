@@ -14,6 +14,14 @@ ignore = [
     # Marvin Attack in rsa crate (transitive from zenoh-transport)
     # No fixed version available - waiting for upstream Zenoh to address
     "RUSTSEC-2023-0071",
+
+    # lz4_flex block-decode can leak uninitialised memory (or a previous
+    # decompression's output) when fed invalid input. Reached only through
+    # zenoh-transport 1.10.0, which pins `lz4_flex = "0.10.0"` — a caret
+    # requirement that cannot reach the fixed 0.11.6 / 0.12.1, and there is no
+    # patched 0.10.x. Not resolvable from this crate; it needs an upstream zenoh
+    # bump. Re-check on every zenoh upgrade and delete this the moment it clears.
+    "RUSTSEC-2026-0041",
 ]
 
 [licenses]

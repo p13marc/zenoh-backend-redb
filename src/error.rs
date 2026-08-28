@@ -26,6 +26,10 @@ pub enum RedbBackendError {
     #[error("Transaction error: {0}")]
     TransactionError(Box<redb::TransactionError>),
 
+    /// Error setting the durability level on a write transaction.
+    #[error("Durability error: {0}")]
+    SetDurabilityError(Box<redb::SetDurabilityError>),
+
     /// Configuration error.
     #[error("Configuration error: {0}")]
     ConfigError(String),
@@ -147,5 +151,11 @@ impl From<redb::CommitError> for RedbBackendError {
 impl From<redb::TransactionError> for RedbBackendError {
     fn from(err: redb::TransactionError) -> Self {
         RedbBackendError::TransactionError(Box::new(err))
+    }
+}
+
+impl From<redb::SetDurabilityError> for RedbBackendError {
+    fn from(err: redb::SetDurabilityError) -> Self {
+        RedbBackendError::SetDurabilityError(Box::new(err))
     }
 }

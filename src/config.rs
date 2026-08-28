@@ -21,7 +21,7 @@ pub struct RedbBackendConfig {
 }
 
 /// Configuration for a single redb storage instance.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedbStorageConfig {
     /// Database file name. If not specified, uses the storage name.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -31,10 +31,14 @@ pub struct RedbStorageConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub db_path: Option<PathBuf>,
 
-    /// Cache size in bytes for redb.
-    /// If not specified, uses redb's default.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache_size: Option<usize>,
+    /// Page-cache budget in bytes for redb.
+    ///
+    /// Defaults to [`DEFAULT_CACHE_SIZE`] (64 MiB) and is **always** set explicitly —
+    /// this backend never inherits redb's own default, which is 1 GiB. On a small
+    /// guest an unbounded cache reads as a slow multi-day RSS climb ending at the OOM
+    /// killer, with nothing in the logs to connect it to a storage setting.
+    #[serde(default = "default_cache_size")]
+    pub cache_size: usize,
 
     /// Whether to enable fsync for durability.
     /// Default is true for data safety.
@@ -120,7 +124,7 @@ impl RedbStorageConfig {
 
     /// Set the cache size in bytes.
     pub fn with_cache_size(mut self, cache_size: usize) -> Self {
-        self.cache_size = Some(cache_size);
+        self.cache_size = cache_size;
         self
     }
 
@@ -177,7 +181,36 @@ impl RedbStorageConfig {
     }
 }
 
+/// Default redb page-cache budget: 64 MiB.
+///
+/// Deliberately not redb's default (1 GiB). See [`RedbStorageConfig::cache_size`].
+pub const DEFAULT_CACHE_SIZE: usize = 64 * 1024 * 1024;
+
+/// `Default` is written out rather than derived so that it cannot drift from the
+/// serde defaults above. A derived `Default` gave `fsync: false`, `create_db: false`
+/// and an empty `table_name`, none of which matches what parsing the same config
+/// from JSON produces.
+impl Default for RedbStorageConfig {
+    fn default() -> Self {
+        Self {
+            db_file: None,
+            db_path: None,
+            cache_size: default_cache_size(),
+            fsync: default_true(),
+            key_expr: None,
+            strip_prefix: false,
+            table_name: default_table_name(),
+            create_db: true,
+            read_only: false,
+        }
+    }
+}
+
 // Default value functions for serde
+fn default_cache_size() -> usize {
+    DEFAULT_CACHE_SIZE
+}
+
 fn default_base_dir() -> PathBuf {
     PathBuf::from("./zenoh_redb_backend")
 }
@@ -194,6 +227,34 @@ fn default_table_name() -> String {
 mod tests {
     use super::*;
 
+    /// The cache budget must never fall back to redb's own default (1 GiB in redb 4).
+    /// An unbounded page cache on a small guest is a slow RSS climb that ends at the
+    /// OOM killer, and nothing in the logs points back at a storage setting.
+    #[test]
+    fn cache_size_defaults_to_64_mib_not_redbs_default() {
+        assert_eq!(DEFAULT_CACHE_SIZE, 64 * 1024 * 1024);
+        assert_eq!(RedbStorageConfig::default().cache_size, DEFAULT_CACHE_SIZE);
+
+        // ...and a config parsed from JSON that omits the field agrees.
+        let parsed: RedbStorageConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.cache_size, DEFAULT_CACHE_SIZE);
+    }
+
+    /// `Default` is hand-written precisely so it cannot drift from the serde
+    /// defaults; a derived one gave `fsync: false` and `create_db: false`.
+    #[test]
+    fn derived_and_parsed_defaults_agree() {
+        let parsed: RedbStorageConfig = serde_json::from_str("{}").unwrap();
+        let default = RedbStorageConfig::default();
+
+        assert_eq!(parsed.fsync, default.fsync);
+        assert_eq!(parsed.create_db, default.create_db);
+        assert_eq!(parsed.table_name, default.table_name);
+        assert_eq!(parsed.read_only, default.read_only);
+        assert!(default.fsync, "fsync must default to on");
+        assert!(default.create_db, "create_db must default to on");
+    }
+
     #[test]
     fn test_default_config() {
         let config = RedbBackendConfig::default();
@@ -209,7 +270,7 @@ mod tests {
             .with_fsync(false);
 
         assert_eq!(config.db_file, Some("test.redb".to_string()));
-        assert_eq!(config.cache_size, Some(1024 * 1024));
+        assert_eq!(config.cache_size, 1024 * 1024);
         assert!(!config.fsync);
     }
 

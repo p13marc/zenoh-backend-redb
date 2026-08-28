@@ -127,7 +127,8 @@
 //   - db_file (optional): Alternative to 'dir', specifies full filename
 //   - create_db (optional, default: true): Create database if missing
 //   - read_only (optional, default: false): Open in read-only mode
-//   - cache_size (optional): Cache size in bytes
+//   - cache_size (optional, default 67108864 = 64 MiB): redb page-cache budget
+//     in bytes. Never redb's own default, which is 1 GiB — see README.
 //   - fsync (optional, default: true): Enable fsync for durability
 //
 // Storage-level:

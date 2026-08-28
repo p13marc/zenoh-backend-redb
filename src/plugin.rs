@@ -268,6 +268,29 @@ impl Storage for RedbStoragePlugin {
 
         debug!("Storing key: {} with timestamp: {}", key_str, timestamp);
 
+        // Last-writer-wins, decided here rather than trusted from upstream.
+        //
+        // The storage manager does filter outdated samples before calling us, but it
+        // does so against an in-memory cache seeded from `get_all_entries` at startup
+        // (`storages_mgt/service.rs`, `guard_cache_if_latest`). That cache is
+        // per-process and per-storage; replay, alignment and a restarted manager can
+        // all deliver an older sample to a key we already hold a newer value for.
+        // Without this check the older payload silently wins and the newer data is
+        // gone, which is exactly the class of bug a durable storage must not have.
+        let existing = storage
+            .timestamp_of(&key_str)
+            .map_err(|e| zerror!("Failed to read timestamp for key '{}': {}", key_str, e))?;
+
+        if let Some(stored) = existing
+            && timestamp <= stored
+        {
+            debug!(
+                "Ignoring outdated PUT for {}: incoming {} <= stored {}",
+                key_str, timestamp, stored
+            );
+            return Ok(StorageInsertionResult::Outdated);
+        }
+
         // Convert ZBytes to Vec<u8>
         let payload_bytes = payload.to_bytes().to_vec();
 
@@ -279,13 +302,17 @@ impl Storage for RedbStoragePlugin {
             .put(&key_str, value)
             .map_err(|e| zerror!("Failed to put key '{}': {}", key_str, e))?;
 
-        Ok(StorageInsertionResult::Inserted)
+        Ok(if existing.is_some() {
+            StorageInsertionResult::Replaced
+        } else {
+            StorageInsertionResult::Inserted
+        })
     }
 
     async fn delete(
         &mut self,
         key: Option<OwnedKeyExpr>,
-        _timestamp: Timestamp,
+        timestamp: Timestamp,
     ) -> ZResult<StorageInsertionResult> {
         let storage = self.storage.lock().await;
 
@@ -299,13 +326,28 @@ impl Storage for RedbStoragePlugin {
             None => NONE_KEY.to_string(),
         };
 
-        debug!("Deleting key: {}", key_str);
+        debug!("Deleting key: {} with timestamp: {}", key_str, timestamp);
+
+        // Same last-writer-wins rule as `put`: a DELETE that predates the value we
+        // hold must not remove it.
+        if let Some(stored) = storage
+            .timestamp_of(&key_str)
+            .map_err(|e| zerror!("Failed to read timestamp for key '{}': {}", key_str, e))?
+            && timestamp < stored
+        {
+            debug!(
+                "Ignoring outdated DELETE for {}: incoming {} < stored {}",
+                key_str, timestamp, stored
+            );
+            return Ok(StorageInsertionResult::Outdated);
+        }
 
         storage
             .delete(&key_str)
             .map_err(|e| zerror!("Failed to delete key '{}': {}", key_str, e))?;
 
-        // Always return Deleted, even if key wasn't found
+        // Deleting an absent key is not an error: the storage manager replays
+        // deletions during alignment and expects them to be idempotent.
         Ok(StorageInsertionResult::Deleted)
     }
 
@@ -557,6 +599,153 @@ mod tests {
         let data = result.unwrap();
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].payload.to_bytes(), payload.to_bytes());
+    }
+
+    /// An out-of-order PUT must not clobber a newer stored value.
+    ///
+    /// The storage manager filters most of these upstream, but only against an
+    /// in-memory cache seeded at startup — replay, alignment and a restarted manager
+    /// all reach the backend directly.
+    #[tokio::test]
+    async fn test_storage_put_outdated_is_rejected() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.redb");
+
+        let storage_config = RedbStorageConfig::new()
+            .with_db_path(db_path.clone())
+            .with_create_db(true);
+
+        let redb_storage =
+            RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
+
+        let mut storage_plugin = RedbStoragePlugin {
+            config: StorageConfig {
+                name: "test".to_string(),
+                key_expr: "test/**".parse().unwrap(),
+                strip_prefix: None,
+                volume_cfg: serde_json::Value::Object(Default::default()).into(),
+                volume_id: "test_volume".to_string(),
+                complete: false,
+                garbage_collection_config: Default::default(),
+                replication: None,
+            },
+            storage: Arc::new(tokio::sync::Mutex::new(redb_storage)),
+            storage_config,
+        };
+
+        let key = OwnedKeyExpr::new("test/ordered").unwrap();
+        let id = zenoh::time::TimestampId::rand();
+
+        // First write of this key: Inserted.
+        let newer = storage_plugin
+            .put(
+                Some(key.clone()),
+                ZBytes::from("newer"),
+                Encoding::ZENOH_STRING,
+                Timestamp::new(NTP64(200), id),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(newer, StorageInsertionResult::Inserted));
+
+        // An older sample arrives late: rejected, and the payload is untouched.
+        let older = storage_plugin
+            .put(
+                Some(key.clone()),
+                ZBytes::from("older"),
+                Encoding::ZENOH_STRING,
+                Timestamp::new(NTP64(100), id),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(older, StorageInsertionResult::Outdated));
+
+        let data = storage_plugin.get(Some(key.clone()), "").await.unwrap();
+        assert_eq!(data.len(), 1);
+        assert_eq!(
+            data[0].payload.to_bytes().as_ref(),
+            b"newer",
+            "the older PUT must not have overwritten the newer value"
+        );
+
+        // A genuinely newer sample replaces it.
+        let newest = storage_plugin
+            .put(
+                Some(key.clone()),
+                ZBytes::from("newest"),
+                Encoding::ZENOH_STRING,
+                Timestamp::new(NTP64(300), id),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(newest, StorageInsertionResult::Replaced));
+
+        let data = storage_plugin.get(Some(key), "").await.unwrap();
+        assert_eq!(data[0].payload.to_bytes().as_ref(), b"newest");
+    }
+
+    /// A DELETE that predates the stored value must not remove it.
+    #[tokio::test]
+    async fn test_storage_delete_outdated_is_rejected() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.redb");
+
+        let storage_config = RedbStorageConfig::new()
+            .with_db_path(db_path.clone())
+            .with_create_db(true);
+
+        let redb_storage =
+            RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
+
+        let mut storage_plugin = RedbStoragePlugin {
+            config: StorageConfig {
+                name: "test".to_string(),
+                key_expr: "test/**".parse().unwrap(),
+                strip_prefix: None,
+                volume_cfg: serde_json::Value::Object(Default::default()).into(),
+                volume_id: "test_volume".to_string(),
+                complete: false,
+                garbage_collection_config: Default::default(),
+                replication: None,
+            },
+            storage: Arc::new(tokio::sync::Mutex::new(redb_storage)),
+            storage_config,
+        };
+
+        let key = OwnedKeyExpr::new("test/tombstone").unwrap();
+        let id = zenoh::time::TimestampId::rand();
+
+        storage_plugin
+            .put(
+                Some(key.clone()),
+                ZBytes::from("live"),
+                Encoding::ZENOH_STRING,
+                Timestamp::new(NTP64(200), id),
+            )
+            .await
+            .unwrap();
+
+        let stale = storage_plugin
+            .delete(Some(key.clone()), Timestamp::new(NTP64(100), id))
+            .await
+            .unwrap();
+        assert!(matches!(stale, StorageInsertionResult::Outdated));
+        assert_eq!(
+            storage_plugin
+                .get(Some(key.clone()), "")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a stale DELETE must not remove a newer value"
+        );
+
+        let fresh = storage_plugin
+            .delete(Some(key.clone()), Timestamp::new(NTP64(300), id))
+            .await
+            .unwrap();
+        assert!(matches!(fresh, StorageInsertionResult::Deleted));
+        assert!(storage_plugin.get(Some(key), "").await.unwrap().is_empty());
     }
 
     #[tokio::test]

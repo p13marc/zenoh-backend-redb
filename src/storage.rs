@@ -5,7 +5,7 @@
 
 use crate::config::RedbStorageConfig;
 use crate::error::{RedbBackendError, Result};
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, Durability, ReadableDatabase, ReadableTable, TableDefinition};
 use std::cell::RefCell;
 use std::path::Path;
 use std::sync::Arc;
@@ -162,14 +162,79 @@ pub struct RedbStorage {
 }
 
 impl RedbStorage {
+    /// Open (or create) the redb database with the cache budget and create/open
+    /// semantics the storage config asks for.
+    ///
+    /// The cache size is always set explicitly. redb's own default is 1 GiB, which
+    /// on a small guest reads as a slow multi-day RSS climb ending at the OOM killer
+    /// rather than as a configuration mistake — so this backend never inherits it.
+    ///
+    /// `read_only` is still enforced in this crate rather than by redb:
+    /// `Builder::open_read_only` returns a distinct `ReadOnlyDatabase` type, which
+    /// would split every transaction call site below for no behavioural gain.
+    fn open_database(path: &Path, config: &RedbStorageConfig) -> Result<Database> {
+        let mut builder = Database::builder();
+        builder.set_cache_size(config.cache_size);
+
+        // `read_only` and `create_db: false` both mean "this file must already exist".
+        let result = if config.read_only || !config.create_db {
+            builder.open(path)
+        } else {
+            builder.create(path)
+        };
+
+        result.map_err(|e| {
+            // redb 3 dropped support for the v2 file format this crate wrote before
+            // 0.4. The error you get is about a bad magic number, which reads as
+            // corruption rather than as a version skew, so say what it really is.
+            if matches!(e, redb::DatabaseError::UpgradeRequired(_)) {
+                RedbBackendError::other(format!(
+                    "{path:?} was written by an older redb file format that redb 4 \
+                     cannot open. Either delete it, or open it once with redb 2.6 and \
+                     call `Database::upgrade()` before using this version. ({e})"
+                ))
+            } else {
+                RedbBackendError::from(e)
+            }
+        })
+    }
+
+    /// Apply the configured durability to a write transaction.
+    ///
+    /// `fsync: true` (the default) is `Durability::Immediate`: a commit that returns
+    /// has reached the disk. `fsync: false` is `Durability::None` — redb 4 removed
+    /// the intermediate `Eventual` level, so the trade is sharper than the config
+    /// name suggests: commits are not persisted at all until some later durable
+    /// commit lands. Fine for a cache or a replayable stream, wrong for a system of
+    /// record.
+    fn apply_durability(
+        txn: &mut redb::WriteTransaction,
+        config: &RedbStorageConfig,
+    ) -> Result<()> {
+        txn.set_durability(if config.fsync {
+            Durability::Immediate
+        } else {
+            Durability::None
+        })?;
+        Ok(())
+    }
+
+    /// Begin a write transaction with the configured durability applied.
+    fn begin_write(&self) -> Result<redb::WriteTransaction> {
+        let mut txn = self.db.begin_write()?;
+        Self::apply_durability(&mut txn, &self.config)?;
+        Ok(txn)
+    }
+
     /// Create a new RedbStorage instance.
     pub fn new<P: AsRef<Path>>(path: P, config: RedbStorageConfig, name: String) -> Result<Self> {
         info!("Creating redb storage at: {:?}", path.as_ref());
 
-        let db = Database::create(path.as_ref())?;
+        let db = Self::open_database(path.as_ref(), &config)?;
 
         // Initialize both tables
-        let write_txn = db.begin_write()?;
+        let mut write_txn = db.begin_write()?;
+        Self::apply_durability(&mut write_txn, &config)?;
         {
             // Create both tables if they don't exist
             write_txn.open_table(PAYLOADS_TABLE)?;
@@ -220,7 +285,7 @@ impl RedbStorage {
                     false, // not deleted
                 )?;
 
-                let write_txn = self.db.begin_write()?;
+                let write_txn = self.begin_write()?;
                 {
                     // Store payload
                     let mut payloads_table = write_txn.open_table(PAYLOADS_TABLE)?;
@@ -307,7 +372,7 @@ impl RedbStorage {
             key_buf.clear();
             self.encode_key_into(key, &mut key_buf)?;
 
-            let write_txn = self.db.begin_write()?;
+            let write_txn = self.begin_write()?;
             {
                 // Delete from both tables
                 let mut payloads_table = write_txn.open_table(PAYLOADS_TABLE)?;
@@ -358,6 +423,24 @@ impl RedbStorage {
 
         debug!("Retrieved {} entries", results.len());
         Ok(results)
+    }
+
+    /// Read only the stored timestamp for a key, without loading its payload.
+    ///
+    /// Unlike [`RedbStorage::get`] this reports the timestamp of a tombstone too: a
+    /// DELETE at t=5 must still win against a PUT at t=3 that arrives afterwards, so
+    /// the caller comparing timestamps needs to see it.
+    pub fn timestamp_of(&self, key: &str) -> Result<Option<Timestamp>> {
+        let read_txn = self.db.begin_read()?;
+        let data_info_table = read_txn.open_table(DATA_INFO_TABLE)?;
+
+        match data_info_table.get(key.as_bytes())? {
+            Some(info_guard) => {
+                let (_, timestamp, _) = decode_data_info(info_guard.value())?;
+                Ok(Some(timestamp))
+            }
+            None => Ok(None),
+        }
     }
 
     /// Retrieve all key-value pairs matching a given prefix.
@@ -453,7 +536,7 @@ impl RedbStorage {
 
         info!("Clearing all entries from storage");
 
-        let write_txn = self.db.begin_write()?;
+        let write_txn = self.begin_write()?;
         {
             // Delete and recreate both tables - much more efficient than removing keys one by one
             write_txn.delete_table(PAYLOADS_TABLE)?;

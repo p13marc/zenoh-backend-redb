@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Breaking**: Updated to Zenoh 1.10.0 (pinned `=1.10.0`). A 1.7 plugin cannot load
+  into the 1.9/1.10 routers this backend targets; the failure is silent — zenohd
+  starts, logs one ERROR line, and serves no storage.
+- **Breaking**: Updated redb 2.6 → 4.2. redb 3 dropped support for the file format
+  this crate wrote before 0.4, so **existing `.redb` files will not open**. Delete
+  them, or open them once with redb 2.6 and call `Database::upgrade()` first. The
+  error now says so explicitly instead of surfacing as apparent corruption.
+- **Breaking**: `cache_size` is now a plain `usize` with a default of **64 MiB**
+  rather than `Option<usize>` meaning "redb's default". redb 4 defaults to 1 GiB,
+  which on a small guest reads as a slow RSS climb ending at the OOM killer.
+- `thiserror` 1 → 2; dev-dependencies `criterion` 0.5 → 0.8, `rand` 0.8 → 0.10.
+- `RedbStorageConfig`'s `Default` is hand-written so it can no longer disagree with
+  the serde defaults (it previously gave `fsync: false` and `create_db: false`).
+
+### Added
+- `cache_size` is actually passed to redb. It was parsed and stored but never
+  reached the database, so every storage silently ran on redb's default cache.
+- `fsync` is actually passed to redb, as `Durability::Immediate` / `Durability::None`.
+  It was likewise parsed and ignored.
+- `create_db: false` and `read_only: true` now open an existing database instead of
+  creating one.
+- `RedbStorage::timestamp_of` — reads a key's timestamp without loading its payload.
+- README: a **Version compatibility** section documenting the exact rustc/Zenoh match
+  requirement and the three traps that all produce the same silent failure.
+
+### Fixed
+- **PUT no longer overwrites newer data with older data.** `put` never compared
+  timestamps and always reported `Inserted`, so a replayed or out-of-order sample
+  silently won. It now returns `Outdated` / `Replaced` / `Inserted` correctly.
+- **DELETE no longer discards its timestamp.** A deletion that predates the stored
+  value is rejected as `Outdated` instead of removing it.
+- `Dockerfile`: the plugin is now a real member of the zenoh workspace with
+  `[patch.crates-io]` pointing at the local sources. It was copied into the tree but
+  carried its own lockfile, so it built as a *separate* workspace — the exact
+  configuration that produces "Incompatible Zenoh feature sets".
+- `docker-compose.yml` pinned `ZENOH_VERSION 1.6.2` against a 1.7.0 plugin.
+- `justfile`: `docker-test-zenohd-fast` had an empty body; `msrv` checked Rust 1.70,
+  impossible under `edition = "2024"`.
+- `release.yml` published the *test* image stage, because `buildah build` defaults to
+  the last stage and no `--target` was given.
+
 ## [0.3.1] - 2024-12-28
 
 ### Fixed

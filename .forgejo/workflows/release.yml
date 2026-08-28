@@ -48,6 +48,7 @@ jobs:
           cd src
           buildah login --tls-verify=false -u marcpardo -p "${{ secrets.REGISTRY_TOKEN }}" "$REGISTRY"
           buildah build \
+            --target runtime \
             --label "org.opencontainers.image.source=https://git.marcpardo.eu/${GITHUB_REPOSITORY}" \
             --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
             -t "$image:${GITHUB_REF_NAME}" -t "$image:latest" -f Dockerfile .

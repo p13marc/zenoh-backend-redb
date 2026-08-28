@@ -96,7 +96,7 @@ fn test_storage_creation_with_custom_config() {
         .create_storage("custom_storage".to_string(), Some(config))
         .expect("Failed to create storage");
 
-    assert_eq!(storage.config().cache_size, Some(10 * 1024 * 1024));
+    assert_eq!(storage.config().cache_size, 10 * 1024 * 1024);
     assert!(!storage.config().fsync);
     assert_eq!(storage.config().key_expr, Some("test/**".to_string()));
     assert!(storage.config().strip_prefix);
