@@ -71,6 +71,80 @@ impl HistoryMode {
     }
 }
 
+/// What a storage is allowed to keep.
+///
+/// **Zenoh storages have no TTL.** The storage manager's `garbage_collection`
+/// prunes *metadata* — its own in-memory wildcard-update and latest-value caches —
+/// and never touches stored values. So retention is the backend's job, and an
+/// `all`-mode storage without a policy is an unbounded disk write.
+///
+/// Every limit is optional and all of them apply; a sample is dropped if *any* rule
+/// says so. A policy with no limits at all is rejected, because it is almost
+/// certainly a mistake rather than a deliberate "keep everything forever".
+///
+/// ```json5
+/// retention: {
+///   max_age_secs: 2592000,       // 30 d
+///   max_bytes: 10737418240,      // 10 GiB
+///   max_samples_per_key: 100000,
+///   decimate: { recent_secs: 86400, bucket_secs: 300 },
+/// }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RetentionPolicy {
+    /// Drop samples older than this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_age_secs: Option<u64>,
+
+    /// Evict oldest samples until the database file is under this size.
+    ///
+    /// Measured against the real file, not an estimate. redb does not shrink the
+    /// file when rows are removed, so enforcing this also compacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<u64>,
+
+    /// Bound per-key growth independently of age and total size. A single
+    /// pathological key should not be able to evict every other key's history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_samples_per_key: Option<u64>,
+
+    /// Keep full resolution recently and thin out beyond it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decimate: Option<DecimationPolicy>,
+
+    /// Seconds between retention passes. Enforcement is periodic, not per-write:
+    /// paying for it on every PUT would put a scan on the hot path.
+    #[serde(default = "default_retention_interval_secs")]
+    pub interval_secs: u64,
+}
+
+/// Thin out older samples to one per bucket.
+///
+/// This is what makes a year of 5-second telemetry affordable, and it is a policy
+/// only the backend can apply: the router's downsampling interceptor shapes
+/// *traffic*, not storage, so it cannot thin data that is already written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecimationPolicy {
+    /// Keep every sample newer than this.
+    pub recent_secs: u64,
+    /// Beyond `recent_secs`, keep one sample per bucket of this width.
+    pub bucket_secs: u64,
+}
+
+impl RetentionPolicy {
+    /// Does this policy actually bound anything?
+    pub fn is_bounded(&self) -> bool {
+        self.max_age_secs.is_some()
+            || self.max_bytes.is_some()
+            || self.max_samples_per_key.is_some()
+            || self.decimate.is_some()
+    }
+}
+
+fn default_retention_interval_secs() -> u64 {
+    3600
+}
+
 /// Configuration for a single redb storage instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedbStorageConfig {
@@ -123,6 +197,10 @@ pub struct RedbStorageConfig {
     /// see [`HistoryMode`] for why it is a volume-level choice.
     #[serde(default)]
     pub history: HistoryMode,
+
+    /// What this storage is allowed to keep. Required for [`HistoryMode::All`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention: Option<RetentionPolicy>,
 }
 
 impl Default for RedbBackendConfig {
@@ -181,6 +259,12 @@ impl RedbStorageConfig {
     /// Set the cache size in bytes.
     pub fn with_cache_size(mut self, cache_size: usize) -> Self {
         self.cache_size = cache_size;
+        self
+    }
+
+    /// Set what this storage is allowed to keep.
+    pub fn with_retention(mut self, retention: RetentionPolicy) -> Self {
+        self.retention = Some(retention);
         self
     }
 
@@ -265,6 +349,7 @@ impl Default for RedbStorageConfig {
             create_db: true,
             read_only: false,
             history: HistoryMode::Latest,
+            retention: None,
         }
     }
 }

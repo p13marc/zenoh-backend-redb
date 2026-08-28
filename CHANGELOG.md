@@ -29,6 +29,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the serde defaults (it previously gave `fsync: false` and `create_db: false`).
 
 ### Added
+- **Retention.** A per-storage `retention` policy with `max_age_secs`, `max_bytes`,
+  `max_samples_per_key` and optional `decimate` (full resolution for `recent_secs`,
+  then one sample per `bucket_secs`), enforced by a background task on an interval
+  rather than on every write.
+  - An `all`-mode storage with **no** retention policy now **refuses to start**; a
+    policy that sets no limit is rejected; and a policy on a `latest`-mode volume is
+    rejected too, since there is no history there to prune and it would report
+    passes while reclaiming nothing.
+  - `max_bytes` is measured against the real file and enforcing it **compacts** —
+    redb does not return space to the filesystem on delete, so without that the
+    policy could never converge and every pass would delete more data while
+    reporting no improvement.
+  - Each pass is reported on the admin space, so retention is verifiable from
+    outside the process.
+  - The pass runs on a plain OS thread, not a tokio task: `Volume::create_storage`
+    is not called from inside a tokio runtime in `zenohd`, so spawning a task there
+    panicked and took down every `all`-mode storage at router startup.
 - **`History::All`.** A volume configured `history: "all"` keeps every sample rather
   than one value per key, addressed by `(key, timestamp)`, and answers Zenoh's
   `_time` selector parameter with the window — both documented syntaxes, including

@@ -30,6 +30,10 @@ pub enum RedbBackendError {
     #[error("Durability error: {0}")]
     SetDurabilityError(Box<redb::SetDurabilityError>),
 
+    /// Error compacting the database file.
+    #[error("Compaction error: {0}")]
+    CompactionError(Box<redb::CompactionError>),
+
     /// Configuration error.
     #[error("Configuration error: {0}")]
     ConfigError(String),
@@ -157,5 +161,11 @@ impl From<redb::TransactionError> for RedbBackendError {
 impl From<redb::SetDurabilityError> for RedbBackendError {
     fn from(err: redb::SetDurabilityError) -> Self {
         RedbBackendError::SetDurabilityError(Box::new(err))
+    }
+}
+
+impl From<redb::CompactionError> for RedbBackendError {
+    fn from(err: redb::CompactionError) -> Self {
+        RedbBackendError::CompactionError(Box::new(err))
     }
 }

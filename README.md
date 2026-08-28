@@ -203,14 +203,85 @@ served by the same plugin.
 ### Two things to know before deploying `all`
 
 - **Replication is unavailable** on an `all` volume. Do not configure both.
-- **Retention is not optional.** Zenoh storages have no TTL, and an unbounded
-  telemetry store fills a disk quietly. Size the volume against your sample rate,
-  or prune it on a schedule.
+- **Retention is mandatory.** An `all`-mode storage with no `retention` policy
+  **refuses to start**. See below.
 
 Deletions are recorded in the history as tombstones — a deletion is a fact about a
 point in time, and dropping it would make the history claim the previous value was
 live right up to the next sample. Tombstones are never *replied* to: there is no
 value to return.
+
+## Retention
+
+**Zenoh storages have no TTL.** The storage manager's `garbage_collection` prunes
+*metadata* — its own in-memory wildcard-update and latest-value caches — and never
+touches stored values. So retention is this backend's job, and an `all`-mode storage
+without a policy **refuses to start**: a loud config error is recoverable in
+seconds, a full disk is not.
+
+```json5
+storages: {
+  "fleet-timeseries": {
+    key_expr: "v1/*/telemetry/**",
+    volume: {
+      id: "redb-history",
+      dir: "timeseries",
+      retention: {
+        max_age_secs: 2592000,        // 30 d — drop samples older than this
+        max_bytes: 10737418240,       // 10 GiB — evict oldest until under
+        max_samples_per_key: 100000,  // bound per-key growth independently
+        decimate: {                   // optional: thin out older data
+          recent_secs: 86400,         // full resolution for a day
+          bucket_secs: 300,           // then one sample per 5 min
+        },
+        interval_secs: 3600,          // how often a pass runs
+      },
+    },
+  },
+}
+```
+
+| Limit | Effect |
+|---|---|
+| `max_age_secs` | Drop samples older than this |
+| `max_bytes` | Evict oldest samples until the **file** is under this size |
+| `max_samples_per_key` | Cap one key's history so a pathological key cannot evict everyone else's |
+| `decimate` | Full resolution for `recent_secs`, then one sample per `bucket_secs` |
+| `interval_secs` | Seconds between passes (default 3600) |
+
+Every limit is optional and all of them apply — a sample goes if *any* rule says so.
+Two shapes are **rejected** rather than accepted quietly, because both read as
+protection that is not there: a `retention` block that sets no limit at all, and a
+`retention` block on a `latest`-mode volume, which has no history to prune and would
+report passes on the admin space while reclaiming nothing.
+
+`max_bytes` bounds the file, but retention only ever deletes *history*. If the
+current values and redb's own overhead already exceed the budget, a pass logs that
+plainly and stops — it will not delete live data to hit a number.
+
+Decimation is what makes a year of 5-second telemetry affordable, and it is a policy
+only the backend can apply: the router's downsampling interceptor shapes *traffic*,
+not storage, so it cannot thin data that is already on disk.
+
+### How it runs
+
+A background thread on `interval_secs`, not a check on every write — enforcement on
+the PUT path would make every write pay for a scan. (A thread rather than an async
+task: `zenohd` does not call a volume's `create_storage` from inside a tokio
+runtime, and the work — scanning tables and compacting the file — is blocking
+anyway.) Deletions go out in bounded,
+committed batches, so a pass never holds the write lock across the whole database,
+and reads are never blocked.
+
+`max_bytes` is measured against the **real file** and enforcing it **compacts**.
+This matters: redb does not return space to the filesystem when rows are removed, so
+without compaction the file size would never fall, the policy would never converge,
+and every pass would delete more data while reporting no improvement — silent data
+loss dressed up as retention.
+
+Each pass is reported on the admin space (`retention.last_pass`: samples dropped,
+bytes before and after, duration), so a policy is verifiable from outside the
+process. A storage claiming to be bounded is not the same as a storage that is.
 
 ## What a storage reports about itself
 

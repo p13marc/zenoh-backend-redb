@@ -4,15 +4,15 @@
 //! Zenoh's plugin system, implementing the required traits for Volume and Storage.
 
 use crate::backend::RedbBackend;
-use crate::config::{HistoryMode, RedbBackendConfig, RedbStorageConfig};
+use crate::config::{HistoryMode, RedbBackendConfig, RedbStorageConfig, RetentionPolicy};
 
-use crate::storage::{RedbStorage, StoredValue, WriteOutcome};
+use crate::storage::{RedbStorage, RetentionPass, StoredValue, WriteOutcome};
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tracing::{debug, info, warn};
 use zenoh::{
     Result as ZResult,
@@ -44,12 +44,63 @@ pub const PROP_STORAGE_CREATE_DB: &str = "create_db";
 pub const PROP_STORAGE_READ_ONLY: &str = "read_only";
 pub const PROP_STORAGE_CACHE_SIZE: &str = "cache_size";
 pub const PROP_STORAGE_FSYNC: &str = "fsync";
+pub const PROP_STORAGE_RETENTION: &str = "retention";
 
 // Volume configuration properties
 pub const PROP_VOLUME_HISTORY: &str = "history";
 
 // Special key for None (when the prefix being stripped exactly matches the key)
 pub const NONE_KEY: &str = "@@none_key@@";
+
+/// Run retention on an interval until the storage is dropped.
+///
+/// Enforcement is periodic rather than per-write: a scan on the PUT path would make
+/// every write pay for a policy that only needs checking occasionally.
+///
+/// This is a plain OS thread, deliberately. The obvious implementation —
+/// `tokio::task::spawn` — panics: `Volume::create_storage` is not called from
+/// inside a tokio runtime context in `zenohd`, so spawning there takes down every
+/// `all`-mode storage at router startup. (Found by the conformance suite, which is
+/// exactly the class of assumption unit tests cannot check: under `#[tokio::test]`
+/// a runtime is always present.) A thread also suits the work, which is blocking
+/// by nature — it scans tables and compacts the file.
+///
+/// `recv_timeout` doubles as the interval and the shutdown wait, so `Drop` stops
+/// the thread promptly instead of leaving it sleeping out its interval.
+fn spawn_retention_task(
+    storage: Arc<RedbStorage>,
+    last_pass: Arc<std::sync::Mutex<RetentionPass>>,
+    shutdown: std::sync::mpsc::Receiver<()>,
+    interval: Duration,
+    name: String,
+) {
+    std::thread::Builder::new()
+        .name(format!("redb-retention-{name}"))
+        .spawn(move || {
+            info!(
+                "Retention task for '{}' running every {}s",
+                name,
+                interval.as_secs()
+            );
+            loop {
+                match shutdown.recv_timeout(interval) {
+                    // Told to stop, or the storage was dropped and the sender with
+                    // it. Either way there is nothing left to retain.
+                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        debug!("Retention task for '{}' stopping", name);
+                        return;
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                }
+
+                match storage.enforce_retention() {
+                    Ok(pass) => *last_pass.lock().unwrap_or_else(|e| e.into_inner()) = pass,
+                    Err(e) => warn!("Retention pass on '{}' failed: {}", name, e),
+                }
+            }
+        })
+        .expect("spawn retention thread");
+}
 
 /// The selector parameter Zenoh reserves for a time range.
 pub const PARAM_TIME: &str = "_time";
@@ -295,6 +346,73 @@ impl Volume for RedbVolume {
         }
         storage_config = storage_config.with_history(self.history);
 
+        // Retention. Parsed from the storage's volume config, not the volume's own,
+        // because how long to keep telemetry is a per-storage decision even though
+        // *whether* history is kept is not.
+        let retention = match volume_cfg.get(PROP_STORAGE_RETENTION) {
+            None => None,
+            Some(value) => {
+                let policy: RetentionPolicy =
+                    serde_json::from_value(value.clone()).map_err(|e| {
+                        zerror!(
+                            "Storage '{}': invalid `{}`: {}",
+                            config.name,
+                            PROP_STORAGE_RETENTION,
+                            e
+                        )
+                    })?;
+                if !policy.is_bounded() {
+                    bail!(
+                        "Storage '{}': `{}` sets no limit. Give it at least one of \
+                         max_age_secs, max_bytes, max_samples_per_key or decimate — \
+                         an empty policy is almost certainly a mistake, and it reads \
+                         as protection that is not there.",
+                        config.name,
+                        PROP_STORAGE_RETENTION
+                    )
+                }
+                Some(policy)
+            }
+        };
+
+        // Retention only has something to act on in `all` mode: the policy prunes
+        // the history tables, which a latest-value storage never writes to. A
+        // policy configured here would spawn a task, report a pass on the admin
+        // space every interval, and reclaim nothing — protection that looks real
+        // and is not. Refuse it rather than let it read as a bound.
+        if self.history != HistoryMode::All && retention.is_some() {
+            bail!(
+                "Storage '{}' declares `{}` but its volume is `history: \"latest\"`, \
+                 which keeps one value per key and has no history to prune. A policy \
+                 here would report passes on the admin space while reclaiming \
+                 nothing. Either drop it, or move this storage to a \
+                 `history: \"all\"` volume.",
+                config.name,
+                PROP_STORAGE_RETENTION
+            )
+        }
+
+        // An `all`-mode storage without retention is an unbounded disk write, and
+        // Zenoh storages have no TTL to fall back on: the storage manager's
+        // `garbage_collection` prunes its own metadata and never touches stored
+        // values. Refuse to start rather than fill a disk quietly — a loud config
+        // error is recoverable in seconds, a full pool is not.
+        if self.history == HistoryMode::All && retention.is_none() {
+            bail!(
+                "Storage '{}' is on a `history: \"all\"` volume but declares no \
+                 `{}` policy. An all-mode storage keeps every sample forever, and \
+                 Zenoh has no TTL — `garbage_collection` prunes metadata, not \
+                 values. Add a retention policy, e.g. \
+                 `retention: {{ max_age_secs: 2592000, max_bytes: 10737418240 }}`.",
+                config.name,
+                PROP_STORAGE_RETENTION
+            )
+        }
+
+        if let Some(policy) = retention.clone() {
+            storage_config = storage_config.with_retention(policy);
+        }
+
         // Get storage name from config
         let storage_name = config.name.clone();
 
@@ -304,11 +422,29 @@ impl Volume for RedbVolume {
 
         info!("Created redb storage '{}' at {:?}", storage_name, db_path);
 
+        let storage = Arc::new(redb_storage);
+        let last_pass = Arc::new(std::sync::Mutex::new(RetentionPass::default()));
+        // Dropping this sender stops the retention thread, so the storage owns its
+        // task's lifetime without needing an explicit shutdown handshake.
+        let (shutdown, shutdown_rx) = std::sync::mpsc::channel();
+
+        if let Some(policy) = &retention {
+            spawn_retention_task(
+                storage.clone(),
+                last_pass.clone(),
+                shutdown_rx,
+                Duration::from_secs(policy.interval_secs.max(1)),
+                storage_name.clone(),
+            );
+        }
+
         Ok(Box::new(RedbStoragePlugin {
             config,
-            storage: Arc::new(redb_storage),
+            storage,
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
+            last_retention_pass: last_pass,
+            shutdown,
         }))
     }
 }
@@ -326,6 +462,14 @@ struct RedbStoragePlugin {
     /// has to be atomic or two concurrent writers can each decide they are newer.
     write_lock: Arc<tokio::sync::Mutex<()>>,
     storage_config: RedbStorageConfig,
+    /// Result of the most recent retention pass, for the admin space. A std mutex
+    /// because `get_admin_status` is synchronous and the critical section is a
+    /// struct copy.
+    last_retention_pass: Arc<std::sync::Mutex<RetentionPass>>,
+    /// Stops the retention thread: dropping this sender disconnects the channel it
+    /// is waiting on.
+    #[allow(dead_code)]
+    shutdown: std::sync::mpsc::Sender<()>,
 }
 
 #[async_trait]
@@ -383,8 +527,27 @@ impl Storage for RedbStoragePlugin {
             }
         };
 
+        // Retention: the policy in force, and what the last pass actually did. The
+        // second half is the point — a declared policy is not evidence that anything
+        // is being reclaimed.
+        let pass = self
+            .last_retention_pass
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let retention = json!({
+            "policy": self.storage_config.retention,
+            "last_pass": pass.ran_at.map(|_| json!({
+                "samples_dropped": pass.samples_dropped,
+                "bytes_before": pass.bytes_before,
+                "bytes_after": pass.bytes_after,
+                "duration_ms": pass.duration.map(|d| d.as_millis() as u64),
+            })),
+        });
+
         if let Some(obj) = status.as_object_mut() {
             obj.insert("capability".to_string(), capability);
+            obj.insert("retention".to_string(), retention);
             obj.insert("stats".to_string(), stats);
             if let Some(path) = &self.storage_config.db_path {
                 obj.insert(
@@ -587,8 +750,10 @@ impl Storage for RedbStoragePlugin {
 
 impl Drop for RedbStoragePlugin {
     fn drop(&mut self) {
-        debug!("Dropping redb storage plugin");
-        // Storage cleanup is handled automatically by RedbStorage's Drop implementation
+        // The retention thread stops when `shutdown` drops with this struct.
+        // Without that it would outlive the storage and go on compacting a database
+        // nobody is serving from.
+        debug!("Dropping redb storage plugin '{}'", self.config.name);
     }
 }
 
@@ -681,6 +846,8 @@ mod tests {
             storage: Arc::new(redb_storage),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
+            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
+            shutdown: std::sync::mpsc::channel().0,
         };
 
         // Drop should work without panic
@@ -713,6 +880,8 @@ mod tests {
             storage: Arc::new(redb_storage),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
+            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
+            shutdown: std::sync::mpsc::channel().0,
         };
 
         let admin_status = storage_plugin.get_admin_status();
@@ -748,6 +917,8 @@ mod tests {
             storage: Arc::new(redb_storage),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
+            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
+            shutdown: std::sync::mpsc::channel().0,
         };
 
         // Put data
@@ -768,6 +939,150 @@ mod tests {
         let data = result.unwrap();
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].payload.to_bytes(), payload.to_bytes());
+    }
+
+    fn storage_config_for(volume_cfg: serde_json::Value, dir: &TempDir) -> StorageConfig {
+        let mut cfg = volume_cfg;
+        cfg["db_file"] = json!(dir.path().join("s.redb").to_string_lossy().to_string());
+        StorageConfig {
+            name: "s".to_string(),
+            key_expr: "test/**".parse().unwrap(),
+            strip_prefix: None,
+            volume_cfg: cfg.into(),
+            volume_id: "redb".to_string(),
+            complete: false,
+            garbage_collection_config: Default::default(),
+            replication: None,
+        }
+    }
+
+    /// An `all`-mode storage with no retention policy must refuse to start.
+    ///
+    /// Zenoh storages have no TTL — the manager's `garbage_collection` prunes its
+    /// own metadata, never stored values — so an unbounded all-mode storage fills a
+    /// disk quietly. A loud config error is recoverable in seconds; a full pool is
+    /// not.
+    #[tokio::test]
+    async fn test_all_mode_without_retention_refuses_to_start() {
+        let dir = TempDir::new().unwrap();
+        let backend = RedbBackend::new(
+            RedbBackendConfig::new()
+                .with_base_dir(dir.path().to_path_buf())
+                .with_create_dir(true),
+        )
+        .unwrap();
+
+        let volume = RedbVolume {
+            history: HistoryMode::All,
+            admin_status: serde_json::Value::Object(Default::default()),
+            backend: Arc::new(backend),
+        };
+
+        let Err(err) = volume
+            .create_storage(storage_config_for(json!({ "dir": "unbounded" }), &dir))
+            .await
+        else {
+            panic!("an all-mode storage with no retention must not start");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("retention"),
+            "the error must name the missing policy, got: {msg}"
+        );
+
+        // With a policy, it starts.
+        volume
+            .create_storage(storage_config_for(
+                json!({ "dir": "bounded", "retention": { "max_age_secs": 3600 } }),
+                &dir,
+            ))
+            .await
+            .map(|_| ())
+            .expect("an all-mode storage with a policy must start");
+    }
+
+    /// A retention policy on a latest-mode volume must be rejected, not silently
+    /// ignored: it would spawn a task that reports passes on the admin space while
+    /// reclaiming nothing, which reads as a bound that is not there.
+    #[tokio::test]
+    async fn test_retention_on_a_latest_volume_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let backend = RedbBackend::new(
+            RedbBackendConfig::new()
+                .with_base_dir(dir.path().to_path_buf())
+                .with_create_dir(true),
+        )
+        .unwrap();
+
+        let volume = RedbVolume {
+            history: HistoryMode::Latest,
+            admin_status: serde_json::Value::Object(Default::default()),
+            backend: Arc::new(backend),
+        };
+
+        let Err(err) = volume
+            .create_storage(storage_config_for(
+                json!({ "dir": "bounded-latest", "retention": { "max_age_secs": 60 } }),
+                &dir,
+            ))
+            .await
+        else {
+            panic!("a retention policy on a latest-mode volume must be rejected");
+        };
+        assert!(err.to_string().contains("latest"), "{err}");
+    }
+
+    /// A latest-mode storage needs no policy — it already keeps one value per key.
+    #[tokio::test]
+    async fn test_latest_mode_needs_no_retention() {
+        let dir = TempDir::new().unwrap();
+        let backend = RedbBackend::new(
+            RedbBackendConfig::new()
+                .with_base_dir(dir.path().to_path_buf())
+                .with_create_dir(true),
+        )
+        .unwrap();
+
+        let volume = RedbVolume {
+            history: HistoryMode::Latest,
+            admin_status: serde_json::Value::Object(Default::default()),
+            backend: Arc::new(backend),
+        };
+
+        volume
+            .create_storage(storage_config_for(json!({ "dir": "plain" }), &dir))
+            .await
+            .map(|_| ())
+            .expect("a latest-mode storage needs no retention policy");
+    }
+
+    /// A retention block that sets no limit reads as protection that is not there.
+    #[tokio::test]
+    async fn test_empty_retention_policy_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let backend = RedbBackend::new(
+            RedbBackendConfig::new()
+                .with_base_dir(dir.path().to_path_buf())
+                .with_create_dir(true),
+        )
+        .unwrap();
+
+        let volume = RedbVolume {
+            history: HistoryMode::All,
+            admin_status: serde_json::Value::Object(Default::default()),
+            backend: Arc::new(backend),
+        };
+
+        let Err(err) = volume
+            .create_storage(storage_config_for(
+                json!({ "dir": "empty", "retention": {} }),
+                &dir,
+            ))
+            .await
+        else {
+            panic!("a retention policy with no limits must be rejected");
+        };
+        assert!(err.to_string().contains("no limit"), "{err}");
     }
 
     /// A `_time`-ranged GET against an `all`-mode storage returns the window; the
@@ -800,6 +1115,8 @@ mod tests {
             storage: Arc::new(redb_storage),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
+            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
+            shutdown: std::sync::mpsc::channel().0,
         };
 
         let key = OwnedKeyExpr::new("test/cpu").unwrap();
@@ -891,6 +1208,8 @@ mod tests {
             storage: Arc::new(redb_storage),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
+            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
+            shutdown: std::sync::mpsc::channel().0,
         };
 
         let id = zenoh::time::TimestampId::rand();
@@ -962,6 +1281,8 @@ mod tests {
             storage: Arc::new(redb_storage),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
+            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
+            shutdown: std::sync::mpsc::channel().0,
         };
 
         let id = zenoh::time::TimestampId::rand();
@@ -1016,6 +1337,8 @@ mod tests {
             storage: Arc::new(redb_storage),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
+            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
+            shutdown: std::sync::mpsc::channel().0,
         };
 
         let key = OwnedKeyExpr::new("test/ordered").unwrap();
@@ -1096,6 +1419,8 @@ mod tests {
             storage: Arc::new(redb_storage),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
+            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
+            shutdown: std::sync::mpsc::channel().0,
         };
 
         let key = OwnedKeyExpr::new("test/tombstone").unwrap();
@@ -1160,6 +1485,8 @@ mod tests {
             storage: Arc::new(redb_storage),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
+            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
+            shutdown: std::sync::mpsc::channel().0,
         };
 
         // Put with None key
@@ -1207,6 +1534,8 @@ mod tests {
             storage: Arc::new(redb_storage),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
+            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
+            shutdown: std::sync::mpsc::channel().0,
         };
 
         // Put data
@@ -1280,6 +1609,8 @@ mod tests {
             storage: Arc::new(ro_storage),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config: ro_config,
+            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
+            shutdown: std::sync::mpsc::channel().0,
         };
 
         // Try to put - should fail
@@ -1339,6 +1670,8 @@ mod tests {
             storage: Arc::new(ro_storage),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config: ro_config,
+            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
+            shutdown: std::sync::mpsc::channel().0,
         };
 
         // Try to delete - should fail
@@ -1372,6 +1705,8 @@ mod tests {
             storage: Arc::new(redb_storage),
             write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
+            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
+            shutdown: std::sync::mpsc::channel().0,
         };
 
         // Put multiple entries
