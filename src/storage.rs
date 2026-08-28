@@ -444,6 +444,29 @@ impl RedbStorage {
         }
     }
 
+    /// Every live key and its timestamp, without reading a single payload.
+    ///
+    /// This is what the storage manager calls to resolve a wildcard query: it asks
+    /// for every entry, intersects the selector itself, and only then issues
+    /// per-key GETs. Answering that from [`RedbStorage::get_all`] meant loading the
+    /// entire database into memory and discarding all of it, on every wildcard
+    /// query. Here only the metadata table is touched.
+    pub fn get_all_timestamps(&self) -> Result<Vec<(String, Timestamp)>> {
+        let read_txn = self.db.begin_read()?;
+        let data_info_table = read_txn.open_table(DATA_INFO_TABLE)?;
+
+        let mut results = Vec::new();
+        for item in data_info_table.iter()? {
+            let (key_bytes, info_bytes) = item?;
+            let (_, timestamp, deleted) = decode_data_info(info_bytes.value())?;
+            if !deleted {
+                results.push((self.decode_key(key_bytes.value())?, timestamp));
+            }
+        }
+
+        Ok(results)
+    }
+
     /// Retrieve all key-value pairs matching a given prefix.
     pub fn get_by_prefix(&self, prefix: &str) -> Result<Vec<(String, StoredValue)>> {
         trace!("Getting entries by prefix: {}", prefix);
@@ -454,19 +477,21 @@ impl RedbStorage {
 
         let mut results = Vec::new();
 
-        for item in data_info_table.iter()? {
+        // redb tables are ordered, so start at the prefix and stop as soon as we
+        // leave it rather than reading every row in the table.
+        for item in data_info_table.range(prefix.as_bytes()..)? {
             let (key_bytes, info_bytes) = item?;
+            if !key_bytes.value().starts_with(prefix.as_bytes()) {
+                break;
+            }
             let key = self.decode_key(key_bytes.value())?;
 
-            if key.starts_with(prefix) {
-                let (encoding, timestamp, deleted) = decode_data_info(info_bytes.value())?;
+            let (encoding, timestamp, deleted) = decode_data_info(info_bytes.value())?;
 
-                if !deleted && let Some(payload_guard) = payloads_table.get(key_bytes.value())? {
-                    let payload_bytes = payload_guard.value();
-                    let stored_value =
-                        StoredValue::new(payload_bytes.to_vec(), timestamp, encoding);
-                    results.push((key, stored_value));
-                }
+            if !deleted && let Some(payload_guard) = payloads_table.get(key_bytes.value())? {
+                let payload_bytes = payload_guard.value();
+                let stored_value = StoredValue::new(payload_bytes.to_vec(), timestamp, encoding);
+                results.push((key, stored_value));
             }
         }
 
@@ -488,8 +513,35 @@ impl RedbStorage {
 
         let mut results = Vec::new();
 
-        for item in data_info_table.iter()? {
+        // Only the rows under the selector's literal prefix can possibly match, and
+        // redb keeps the table ordered, so the scan starts there and stops on the
+        // first key that leaves it. `keyexpr::intersects` then runs over candidates
+        // rather than over the whole table.
+        let prefix = literal_prefix(pattern);
+
+        // One key can match without living under the prefix: `a/**` intersects `a`
+        // itself, but its literal prefix is `a/` and `a` sorts *before* `a/`, so the
+        // range below starts past it. Probe it directly rather than widening the
+        // scan, which would drag in every unrelated key sharing those bytes.
+        if let Some(exact) = prefix.strip_suffix('/')
+            && !exact.is_empty()
+            && Self::matches_wildcard(exact, pattern)
+            && let Some(info_guard) = data_info_table.get(exact.as_bytes())?
+        {
+            let (encoding, timestamp, deleted) = decode_data_info(info_guard.value())?;
+            if !deleted && let Some(payload_guard) = payloads_table.get(exact.as_bytes())? {
+                results.push((
+                    exact.to_string(),
+                    StoredValue::new(payload_guard.value().to_vec(), timestamp, encoding),
+                ));
+            }
+        }
+
+        for item in data_info_table.range(prefix.as_bytes()..)? {
             let (key_bytes, info_bytes) = item?;
+            if !key_bytes.value().starts_with(prefix.as_bytes()) {
+                break;
+            }
             let key = self.decode_key(key_bytes.value())?;
 
             if Self::matches_wildcard(&key, pattern) {
@@ -588,6 +640,30 @@ impl RedbStorage {
             _ => false,
         }
     }
+}
+
+/// The longest wildcard-free prefix of a key expression: everything up to the
+/// first chunk containing `*` or `$`.
+///
+/// This is what bounds a wildcard scan. `v1/h-3fa9c2d41b7e/telemetry/**` yields
+/// `v1/h-3fa9c2d41b7e/telemetry/` — a per-host drill-in reads a slice of the table
+/// instead of all of it. `v1/*/state/**` yields `v1/`, which buys nothing, and that is
+/// fine: the point is that the common shapes are bounded, not that every shape is.
+///
+/// The prefix always ends at a chunk boundary, so it can never match a partial
+/// chunk: for `v1/h-3fa*/x` the prefix is `v1/`, not `v1/h-3fa`.
+fn literal_prefix(pattern: &str) -> &str {
+    let mut end = 0;
+    for chunk in pattern.split('/') {
+        if chunk.contains('*') || chunk.contains('$') {
+            break;
+        }
+        // +1 for the '/' that follows this chunk.
+        end += chunk.len() + 1;
+    }
+    // A pattern with no wildcard at all is entirely literal; `end` then overshoots
+    // by the trailing separator that is not there.
+    &pattern[..end.min(pattern.len())]
 }
 
 #[cfg(test)]
@@ -700,6 +776,132 @@ mod tests {
             "v1/h-aaaabbbbcccc/@rpc/sysinfo/processes",
             "v1/*/*/sysinfo/**"
         ));
+    }
+
+    #[test]
+    fn literal_prefix_stops_at_the_first_wildcard_chunk() {
+        // The shapes that matter: a per-host drill-in and a catalog read are
+        // bounded; a fleet-wide selector is not, and that is expected.
+        assert_eq!(
+            literal_prefix("v1/h-3fa9c2d41b7e/telemetry/**"),
+            "v1/h-3fa9c2d41b7e/telemetry/"
+        );
+        assert_eq!(
+            literal_prefix("v1/@catalog/state/entity/*"),
+            "v1/@catalog/state/entity/"
+        );
+        assert_eq!(literal_prefix("v1/*/state/**"), "v1/");
+        assert_eq!(literal_prefix("**"), "");
+
+        // A fully literal pattern is its own prefix, with no trailing separator
+        // invented for it.
+        assert_eq!(literal_prefix("a/b/c"), "a/b/c");
+
+        // The prefix must never cut a chunk in half: `h-3fa` is not a key boundary,
+        // so a scan starting there could skip rows that do match.
+        assert_eq!(literal_prefix("v1/h-3fa*/x"), "v1/");
+        assert_eq!(literal_prefix("v1/sensor$*/x"), "v1/");
+    }
+
+    /// The bounded scan must return exactly what the full scan returned.
+    #[test]
+    fn range_scan_finds_the_same_keys_a_full_scan_would() {
+        let (storage, _temp) = create_test_storage();
+        let ts = Timestamp::new(NTP64(1), TimestampId::rand());
+
+        for key in [
+            "v1/h-aaaa/telemetry/cpu",
+            "v1/h-aaaa/telemetry/mem",
+            "v1/h-aaaa/state/health",
+            "v1/h-bbbb/telemetry/cpu",
+            "v1/@catalog/state/entity/h-aaaa",
+        ] {
+            let value = StoredValue::new(b"x".to_vec(), ts, Encoding::ZENOH_BYTES);
+            storage.put(key, value).unwrap();
+        }
+
+        // Bounded by a literal prefix.
+        let mut hit: Vec<String> = storage
+            .get_by_wildcard("v1/h-aaaa/telemetry/**")
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        hit.sort();
+        assert_eq!(
+            hit,
+            vec!["v1/h-aaaa/telemetry/cpu", "v1/h-aaaa/telemetry/mem"]
+        );
+
+        // Unbounded prefix (`v1/`) still has to give the right answer — and still
+        // must not reach the verbatim @catalog chunk.
+        let mut hit: Vec<String> = storage
+            .get_by_wildcard("v1/*/state/**")
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        hit.sort();
+        assert_eq!(hit, vec!["v1/h-aaaa/state/health"]);
+    }
+
+    /// `a/**` intersects `a` itself, and the bounded scan must not lose it.
+    ///
+    /// This is the case a range scan gets wrong for free: the literal prefix of
+    /// `a/**` is `a/`, and `a` sorts *before* `a/`, so a scan that simply starts at
+    /// the prefix skips a key that genuinely matches. Zenoh's own algebra says it
+    /// matches (`ab/**` intersects `ab`), and the full scan this replaced returned
+    /// it.
+    #[test]
+    fn a_wildcard_still_finds_the_key_equal_to_its_literal_prefix() {
+        let (storage, _temp) = create_test_storage();
+        let ts = Timestamp::new(NTP64(1), TimestampId::rand());
+
+        for key in ["sensors", "sensors/room1", "sensorsX", "other"] {
+            let value = StoredValue::new(b"x".to_vec(), ts, Encoding::ZENOH_BYTES);
+            storage.put(key, value).unwrap();
+        }
+
+        assert!(
+            RedbStorage::matches_wildcard("sensors", "sensors/**"),
+            "precondition: zenoh's algebra says `sensors/**` matches `sensors`"
+        );
+
+        let mut hit: Vec<String> = storage
+            .get_by_wildcard("sensors/**")
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        hit.sort();
+        assert_eq!(hit, vec!["sensors", "sensors/room1"]);
+
+        // And the probe must not invent a match: `sensorsX` shares the bytes but is
+        // a different chunk.
+        assert!(!hit.contains(&"sensorsX".to_string()));
+    }
+
+    /// A range scan must stop at the prefix, not run past it into the next key.
+    #[test]
+    fn prefix_scan_does_not_bleed_into_neighbouring_keys() {
+        let (storage, _temp) = create_test_storage();
+        let ts = Timestamp::new(NTP64(1), TimestampId::rand());
+
+        // `a/bc` sorts immediately after `a/b/...` and must not be picked up by a
+        // scan for `a/b/`.
+        for key in ["a/b/one", "a/b/two", "a/bc/three", "a/c/four"] {
+            let value = StoredValue::new(b"x".to_vec(), ts, Encoding::ZENOH_BYTES);
+            storage.put(key, value).unwrap();
+        }
+
+        let mut hit: Vec<String> = storage
+            .get_by_prefix("a/b/")
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        hit.sort();
+        assert_eq!(hit, vec!["a/b/one", "a/b/two"]);
     }
 
     /// `$*` is a sub-chunk wildcard. The old matcher treated it as a literal, so

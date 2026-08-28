@@ -157,6 +157,7 @@ COPY --from=builder /usr/local/bin/zenohd /usr/local/bin/zenohd
 # Copy zenoh plugins to /usr/local/lib where zenohd searches
 COPY --from=builder /build/zenoh-src/target/release/libzenoh_plugin_rest.so /usr/local/lib/
 COPY --from=builder /build/zenoh-src/target/release/libzenoh_plugin_storage_manager.so /usr/local/lib/
+COPY --from=builder /build/zenoh-src/target/release/libzenoh_backend_redb.so /usr/local/lib/
 
 # Carry the whole zenoh workspace across, not just our crate: the lockfile, the
 # `[patch.crates-io]` table and the compiled target/ all live at the workspace
@@ -164,6 +165,8 @@ COPY --from=builder /build/zenoh-src/target/release/libzenoh_plugin_storage_mana
 # crates.io and rebuild a plugin that no longer matches the zenohd beside it.
 WORKDIR /app
 COPY --from=builder /build/zenoh-src ./
+# Carry the registry cache too, or `cargo test` re-downloads every crate.
+COPY --from=builder /usr/local/cargo/registry /usr/local/cargo/registry
 
 # Ensure zenohd is in PATH and executable
 RUN chmod +x /usr/local/bin/zenohd && zenohd --version

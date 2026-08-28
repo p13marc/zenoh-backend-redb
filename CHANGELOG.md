@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the serde defaults (it previously gave `fsync: false` and `create_db: false`).
 
 ### Added
+- `RedbStorage::get_all_timestamps` — every live key and timestamp without reading
+  a payload. This is what the storage manager calls to resolve **every** wildcard
+  query, and it previously went through `get_all`, loading the entire database into
+  memory to discard all of it. On a 100k-key store that was ~30 ms and 100k payload
+  copies per wildcard GET.
+- Wildcard and prefix scans are now bounded range scans over the ordered table
+  rather than full scans. On a 100k-key store, a prefix-heavy selector
+  (`v1/h-00000/telemetry/**`) went from ~30 ms to ~249 µs. A selector that
+  wildcards early (`v1/*/telemetry/x`) still scans the table, by construction.
 - `cache_size` is actually passed to redb. It was parsed and stored but never
   reached the database, so every storage silently ran on redb's default cache.
 - `fsync` is actually passed to redb, as `Durability::Immediate` / `Durability::None`.

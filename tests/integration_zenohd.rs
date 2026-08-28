@@ -29,53 +29,52 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tempfile::TempDir;
 
+/// Candidate directories that may hold a built `libzenoh_backend_redb.so`.
+///
+/// `target/` is not always beside the manifest: when this crate is built as a
+/// member of the zenoh workspace — which is how the version-matched Docker image
+/// builds it, and the only way to get the feature sets to unify — the target
+/// directory belongs to the workspace root, one level up. Looking only beside the
+/// manifest is why these tests reported "plugin not built" in an image that had
+/// just built it.
+fn plugin_dir_candidates() -> Vec<PathBuf> {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut dirs = vec![manifest.join("target/release")];
+
+    // Workspace target dir, when this crate is a member rather than the root.
+    if let Some(parent) = manifest.parent() {
+        dirs.push(parent.join("target/release"));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        dirs.push(cwd.join("target/release"));
+    }
+    dirs.push(PathBuf::from("/usr/local/lib"));
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join(".zenoh/lib"));
+    }
+    dirs
+}
+
 /// Get the path to the built plugin library
 fn get_plugin_path() -> PathBuf {
-    // Check local build first
-    let local_path = std::env::current_dir()
-        .expect("Failed to get current directory")
-        .join("target/release/libzenoh_backend_redb.so");
-
-    if local_path.exists() {
-        return local_path;
+    let candidates = plugin_dir_candidates();
+    for dir in &candidates {
+        let path = dir.join("libzenoh_backend_redb.so");
+        if path.exists() {
+            return path;
+        }
     }
-
-    // Check system path (Docker environment)
-    let system_path = PathBuf::from("/usr/local/lib/libzenoh_backend_redb.so");
-    if system_path.exists() {
-        return system_path;
-    }
-
-    local_path
+    // Nothing found: return the most likely location so the error names a path a
+    // developer recognises.
+    candidates[0].join("libzenoh_backend_redb.so")
 }
 
 /// Get the directory containing plugins (storage_manager and our redb backend)
 fn get_plugin_search_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-
-    // Local release build directory
-    if let Ok(cwd) = std::env::current_dir() {
-        let local_release = cwd.join("target/release");
-        if local_release.exists() {
-            dirs.push(local_release);
-        }
-    }
-
-    // System lib directory (Docker)
-    let system_lib = PathBuf::from("/usr/local/lib");
-    if system_lib.exists() {
-        dirs.push(system_lib);
-    }
-
-    // User's zenoh lib directory
-    if let Some(home) = std::env::var_os("HOME") {
-        let zenoh_lib = PathBuf::from(home).join(".zenoh/lib");
-        if zenoh_lib.exists() {
-            dirs.push(zenoh_lib);
-        }
-    }
-
-    dirs
+    plugin_dir_candidates()
+        .into_iter()
+        .filter(|d| d.exists())
+        .collect()
 }
 
 /// Helper struct to manage zenohd process lifecycle

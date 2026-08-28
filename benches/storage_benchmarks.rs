@@ -315,6 +315,67 @@ fn bench_concurrent_reads(c: &mut Criterion) {
     });
 }
 
+/// The scan this backend actually has to survive: a large store, queried with a
+/// prefix-heavy selector.
+///
+/// Both selectors below return the same handful of rows. The difference is how
+/// much of the table has to be read to find them:
+///
+/// * `bounded` — `v1/h-00000/telemetry/**` has a literal prefix three chunks deep,
+///   so the range scan touches one host's slice.
+/// * `unbounded` — `v1/*/telemetry/cpu` starts wildcarding at the second chunk, so
+///   the prefix is `v1/` and the scan degenerates to the whole table. This is the
+///   shape a fleet-wide selector has, and it is the honest control: the prefix
+///   optimisation does nothing for it, by construction.
+fn bench_wildcard_scan_100k(c: &mut Criterion) {
+    let mut group = c.benchmark_group("wildcard_scan_100k");
+    // A 100k-key store takes a while to build; don't rebuild it per sample.
+    group.sample_size(10);
+
+    let (backend, _temp_dir) = create_test_backend();
+    let storage = backend
+        .create_storage("bench_storage".to_string(), None)
+        .unwrap();
+
+    // 500 hosts x 200 metrics = 100k keys.
+    let mut counter = 0u64;
+    for host in 0..500 {
+        for metric in 0..200 {
+            let key = format!("v1/h-{host:05}/telemetry/m{metric:04}");
+            storage.put(&key, create_value(256, counter)).unwrap();
+            counter += 1;
+        }
+    }
+
+    group.bench_function("bounded_prefix", |b| {
+        b.iter(|| {
+            let hits = storage
+                .get_by_wildcard(black_box("v1/h-00000/telemetry/**"))
+                .unwrap();
+            assert_eq!(hits.len(), 200);
+            hits
+        });
+    });
+
+    group.bench_function("unbounded_prefix", |b| {
+        b.iter(|| {
+            let hits = storage
+                .get_by_wildcard(black_box("v1/*/telemetry/m0000"))
+                .unwrap();
+            assert_eq!(hits.len(), 500);
+            hits
+        });
+    });
+
+    // What the storage manager actually calls on every wildcard query. It used to
+    // load all 100k payloads to return 100k timestamps.
+    group.bench_function("all_timestamps", |b| {
+        b.iter(|| storage.get_all_timestamps().unwrap().len());
+    });
+
+    group.finish();
+}
+
 /// Benchmark storage with fsync enabled vs disabled
 fn bench_fsync_impact(c: &mut Criterion) {
     let mut group = c.benchmark_group("fsync_impact");
@@ -400,6 +461,7 @@ criterion_group!(
     bench_wildcard_multi_segment,
     bench_get_all,
     bench_concurrent_reads,
+    bench_wildcard_scan_100k,
     bench_fsync_impact,
     bench_prefix_stripping,
     bench_key_operations,

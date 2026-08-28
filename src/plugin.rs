@@ -390,12 +390,16 @@ impl Storage for RedbStoragePlugin {
 
         debug!("Getting all entries");
 
+        // Metadata only. The storage manager calls this to resolve *every* wildcard
+        // query (it intersects the selector itself, then issues per-key GETs), so
+        // reading payloads here would mean loading the whole database into memory
+        // and throwing it away on each one.
         let entries = storage
-            .get_all()
+            .get_all_timestamps()
             .map_err(|e| zerror!("Failed to get all entries: {}", e))?;
 
         let mut result = Vec::new();
-        for (key_str, stored_value) in entries {
+        for (key_str, timestamp) in entries {
             // Convert key string back to OwnedKeyExpr
             let key_expr = if key_str == NONE_KEY {
                 None
@@ -408,9 +412,6 @@ impl Storage for RedbStoragePlugin {
                     }
                 }
             };
-
-            // Use the stored timestamp directly (preserves both time and ID)
-            let timestamp = stored_value.timestamp;
 
             result.push((key_expr, timestamp));
         }
