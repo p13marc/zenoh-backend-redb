@@ -1,0 +1,50 @@
+// Router config for the two cases an `fs`/latest volume cannot cover at all:
+// a `_time`-ranged GET, and a retention pass that drops old samples.
+//
+// This is the config that exists because this backend exists. `history: "all"` is
+// a VOLUME property — Zenoh asks the volume for its capability, and a volume
+// reporting `All` cannot host a replicated storage — so the timeseries volume is
+// declared separately from any latest-value one and names this backend explicitly.
+//
+// RETENTION IS MANDATORY HERE. An all-mode storage with no retention policy
+// refuses to start: Zenoh has no TTL, and an unbounded telemetry store fills a
+// disk quietly. The values below are deliberately tiny so a test can observe a
+// pass rather than wait an hour for one.
+{
+  mode: "router",
+  listen: { endpoints: ["tcp/0.0.0.0:7447"] },
+
+  timestamping: {
+    enabled: { router: true, peer: true, client: true },
+  },
+
+  plugins_loading: { enabled: true },
+
+  plugins: {
+    storage_manager: {
+      volumes: {
+        // Same plugin as `redb`, different capability. `backend` names the plugin;
+        // the volume id is what storages reference.
+        "redb-history": {
+          backend: "redb",
+          history: "all",
+        },
+      },
+      storages: {
+        "fleet-timeseries": {
+          key_expr: "v1/*/telemetry/**",
+          strip_prefix: "v1",
+          volume: {
+            id: "redb-history",
+            dir: "timeseries",
+            retention: {
+              // 60s and a 2s pass interval: small enough to watch happen.
+              max_age_secs: 60,
+              interval_secs: 2,
+            },
+          },
+        },
+      },
+    },
+  },
+}

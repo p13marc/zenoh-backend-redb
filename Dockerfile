@@ -74,6 +74,11 @@ RUN test -f target/release/libzenoh_backend_redb.so || \
 
 # Build test binaries
 RUN cargo test --no-run -p zenoh-backend-redb --test integration_zenohd
+RUN cargo test --no-run -p zenoh-backend-redb --test conformance_router_storage
+
+# The conformance suite spawns `zenohd` by name, so it must be on PATH inside the
+# test image as well as installed for the runtime one.
+RUN cp target/release/zenohd /usr/local/bin/zenohd 2>/dev/null || true
 
 # Runtime stage for production use
 FROM debian:bookworm-slim as runtime
@@ -140,40 +145,30 @@ LABEL org.opencontainers.image.source="https://git.marcpardo.eu/marcpardo/zenoh-
 LABEL org.opencontainers.image.version="0.4.0"
 LABEL org.opencontainers.image.licenses="Apache-2.0 OR MIT"
 
-# Test stage - includes everything needed to run integration tests
-FROM rust:1.97-slim as test
+# Test stage - the builder itself, with a test entrypoint.
+#
+# Deliberately `FROM builder` rather than a fresh base. The tests need the whole
+# zenoh workspace: the lockfile, the `[patch.crates-io]` table and the compiled
+# target/ all live at the workspace root, and copying the crate alone would make
+# cargo re-resolve against crates.io and rebuild a plugin that no longer matches
+# the zenohd beside it.
+#
+# But copying the *workspace* into a fresh stage means moving ~7 GB through the
+# storage driver, which took longer than compiling zenoh did. The builder already
+# holds every one of those things in the right place, so extending it costs
+# nothing and copies nothing.
+FROM builder AS test
 
-# Install runtime and test dependencies
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    libssl3 \
-    pkg-config \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
+# zenohd searches /usr/local/lib; the backend is built into the workspace target
+# dir, so put a copy where the router will look.
+RUN cp /build/zenoh-src/target/release/libzenoh_backend_redb.so /usr/local/lib/ \
+    && zenohd --version
 
-# Copy zenohd binary
-COPY --from=builder /usr/local/bin/zenohd /usr/local/bin/zenohd
+WORKDIR /build/zenoh-src
 
-# Copy zenoh plugins to /usr/local/lib where zenohd searches
-COPY --from=builder /build/zenoh-src/target/release/libzenoh_plugin_rest.so /usr/local/lib/
-COPY --from=builder /build/zenoh-src/target/release/libzenoh_plugin_storage_manager.so /usr/local/lib/
-COPY --from=builder /build/zenoh-src/target/release/libzenoh_backend_redb.so /usr/local/lib/
-
-# Carry the whole zenoh workspace across, not just our crate: the lockfile, the
-# `[patch.crates-io]` table and the compiled target/ all live at the workspace
-# root now. Copying the member alone would make cargo re-resolve against
-# crates.io and rebuild a plugin that no longer matches the zenohd beside it.
-WORKDIR /app
-COPY --from=builder /build/zenoh-src ./
-# Carry the registry cache too, or `cargo test` re-downloads every crate.
-COPY --from=builder /usr/local/cargo/registry /usr/local/cargo/registry
-
-# Ensure zenohd is in PATH and executable
-RUN chmod +x /usr/local/bin/zenohd && zenohd --version
-
-# Set environment for testing
 ENV RUST_BACKTRACE=1
 ENV RUST_LOG=debug
 
-# Run integration tests including zenohd tests
+# Default to the zenohd integration tests; the conformance suite is run by
+# overriding this command (see `just conformance`).
 CMD ["cargo", "test", "-p", "zenoh-backend-redb", "--test", "integration_zenohd", "--", "--test-threads=1", "--nocapture"]

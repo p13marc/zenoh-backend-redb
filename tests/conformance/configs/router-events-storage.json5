@@ -1,0 +1,28 @@
+// Router config for the event-log conformance case, on a redb volume.
+//
+// Every event record owns a unique key — the grammar ends in a ULID and nothing
+// ever overwrites — so "latest per key" and "the whole log" are the same set, and
+// a latest-value volume retains everything. Two records under the same subject is
+// the case that distinguishes the two readings: if only one survives, the volume
+// really did collapse them.
+//
+// No `garbage_collection`: nothing ever DELETEs an event record, so there are no
+// tombstones to reap.
+{
+  mode: "router",
+  listen: { endpoints: ["tcp/0.0.0.0:7447"] },
+  plugins_loading: { enabled: true },
+
+  plugins: {
+    storage_manager: {
+      volumes: { redb: {} },
+      storages: {
+        "fleet-events": {
+          key_expr: "v1/*/events/**",
+          strip_prefix: "v1",
+          volume: { id: "redb", dir: "events" },
+        },
+      },
+    },
+  },
+}

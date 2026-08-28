@@ -1,0 +1,54 @@
+// Router config for the state/catalog conformance cases.
+//
+// This mirrors the shape a fleet deployment uses for its `latest` and `catalog`
+// storages, pointed at a redb volume. It is not a ZenSight file and this crate
+// does not depend on ZenSight; the key expressions are written out here so the
+// config stands on its own.
+//
+// TWO STORAGES, DELIBERATELY.
+//
+// `*` and `**` never match a chunk beginning with `@`, so `v1/*/state/**` cannot
+// reach `v1/@catalog/state/**`. The catalog therefore needs a storage of its own —
+// that is not redundancy, it is the verbatim-chunk rule. If a single storage ever
+// starts serving both, one of them is silently dead.
+//
+// NOT `complete`. A complete storage short-circuits BestMatching and collapses a
+// fleet-wide @rpc GET to a single reply: two hosts answer, the operator sees one,
+// and nothing errors.
+//
+// The test harness overrides listen/scouting onto loopback. The endpoint below is
+// never used by the suite; it documents the deployed shape.
+{
+  mode: "router",
+  listen: { endpoints: ["tcp/0.0.0.0:7447"] },
+
+  // State documents are last-writer-wins mutable keys, so the router must
+  // timestamp them for the storage to resolve ordering.
+  timestamping: {
+    enabled: { router: true, peer: true, client: true },
+  },
+
+  plugins_loading: { enabled: true },
+
+  plugins: {
+    storage_manager: {
+      volumes: {
+        // Latest-value volume. ZENOH_BACKEND_REDB_ROOT sets the base directory
+        // that the relative `dir`s below hang under.
+        redb: {},
+      },
+      storages: {
+        "fleet-latest": {
+          key_expr: "v1/*/state/**",
+          strip_prefix: "v1",
+          volume: { id: "redb", dir: "latest" },
+        },
+        "fleet-catalog": {
+          key_expr: "v1/@catalog/state/**",
+          strip_prefix: "v1",
+          volume: { id: "redb", dir: "catalog" },
+        },
+      },
+    },
+  },
+}

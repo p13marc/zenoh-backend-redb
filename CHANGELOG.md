@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the serde defaults (it previously gave `fsync: false` and `create_db: false`).
 
 ### Added
+- **A router-storage conformance suite**, run against a real `zenohd` with a redb
+  volume under it (`tests/conformance_router_storage.rs`, `just conformance`, and a
+  `conformance` CI job that gates merges). It asserts the standard storage-backend
+  contract — a state doc outliving its publisher, a DELETE retiring it, `*` not
+  reaching a `@catalog` chunk, blob chunks surviving their sensor, a fleet `@rpc`
+  GET still fanning in, every event record surviving, and no config claiming
+  `complete` — plus the two cases a latest-value backend cannot pass at all: a
+  `_time`-ranged GET and a retention pass.
 - **Retention.** A per-storage `retention` policy with `max_age_secs`, `max_bytes`,
   `max_samples_per_key` and optional `decimate` (full resolution for `recent_secs`,
   then one sample per `bucket_secs`), enforced by a background task on an interval

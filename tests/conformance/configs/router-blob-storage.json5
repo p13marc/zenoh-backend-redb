@@ -1,0 +1,25 @@
+// Router config for the content-addressed blob conformance case, on a redb volume.
+//
+// Sensors PUT chunks into the router and then exit; readers GET them by hash long
+// afterwards, because the bytes live on the router rather than on the sensor. A
+// wrong strip_prefix here is an artifact download that hangs forever after the
+// producer restarts, which is why it is worth asserting rather than reasoning
+// about.
+{
+  mode: "router",
+  listen: { endpoints: ["tcp/0.0.0.0:7447"] },
+  plugins_loading: { enabled: true },
+
+  plugins: {
+    storage_manager: {
+      volumes: { redb: {} },
+      storages: {
+        "fleet-blob-chunks": {
+          key_expr: "v1/*/@blob/store/**",
+          strip_prefix: "v1",
+          volume: { id: "redb", dir: "blob-chunks" },
+        },
+      },
+    },
+  },
+}

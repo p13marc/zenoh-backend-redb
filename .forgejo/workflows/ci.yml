@@ -67,6 +67,96 @@ jobs:
           tool: cargo-deny
       - run: cargo deny check
 
+  # The router-storage conformance suite, against a real zenohd 1.10 with a redb
+  # volume under it. This is the gate that proves swapping the backend changes
+  # nothing an operator depends on, and the only place the two things a
+  # latest-value backend cannot do (`_time` GET, retention) are exercised
+  # end-to-end.
+  #
+  # Built with cargo on the runner rather than in a container: this runner has no
+  # podman, and it already has Rust plus the sccache -> garage cache, so a rebuild
+  # of zenoh is cheap after the first run.
+  #
+  # THE ONE THING THAT MATTERS HERE: zenohd, the storage-manager plugin and this
+  # backend must be built in ONE cargo workspace with ONE toolchain. Built
+  # separately their compiled `zenoh_backend_traits` feature strings diverge and
+  # zenoh's compatibility check rejects the plugin — by starting zenohd, logging a
+  # single ERROR line, and then serving no storage at all. Every conformance test
+  # would fail as "nothing was stored" and none of them would say why.
+  #
+  # `[patch.crates-io]` is what makes the pin exact: our `=1.10.0` dependencies
+  # resolve to the very sources zenohd is built from, not a second copy.
+  conformance:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: https://data.forgejo.org/actions/checkout@v7.0.1
+        with:
+          path: backend
+      - uses: https://github.com/dtolnay/rust-toolchain@stable
+      - uses: https://github.com/Swatinem/rust-cache@v2
+        with:
+          cache-targets: false
+          workspaces: zenoh-src
+
+      - name: Clone zenoh at the pinned version
+        run: |
+          git clone --depth 1 --branch 1.10.0 \
+            https://github.com/eclipse-zenoh/zenoh.git zenoh-src
+
+      - name: Add the backend to the zenoh workspace
+        run: |
+          set -eux
+          cp -r backend zenoh-src/zenoh-backend-redb
+          # The workspace lockfile governs; a second one would make this a
+          # separate workspace again, which is the whole trap.
+          rm -f zenoh-src/zenoh-backend-redb/Cargo.lock
+          # A crate shipping its own rust-toolchain.toml would pin a different
+          # rustc than zenohd is built with ("Incompatible rustc versions").
+          rm -f zenoh-src/zenoh-backend-redb/rust-toolchain.toml
+          cd zenoh-src
+          sed -i 's|^members = \[|members = [\n  "zenoh-backend-redb",|' Cargo.toml
+          # printf rather than a heredoc: a heredoc here would need re-indenting,
+          # and a blanket `sed` to strip that indentation would also eat leading
+          # whitespace elsewhere in the file.
+          printf '\n[patch.crates-io]\n' >> Cargo.toml
+          printf 'zenoh = { path = "zenoh" }\n' >> Cargo.toml
+          printf 'zenoh-plugin-trait = { path = "plugins/zenoh-plugin-trait" }\n' >> Cargo.toml
+          printf 'zenoh_backend_traits = { path = "plugins/zenoh-backend-traits" }\n' >> Cargo.toml
+          printf 'zenoh-util = { path = "commons/zenoh-util" }\n' >> Cargo.toml
+          printf 'zenoh-ext = { path = "zenoh-ext" }\n' >> Cargo.toml
+          grep -A 2 '^members' Cargo.toml
+          tail -8 Cargo.toml
+
+      - name: Build zenohd and both plugins in one workspace
+        working-directory: zenoh-src
+        run: |
+          set -eux
+          cargo build --release \
+            -p zenohd -p zenoh-plugin-storage-manager -p zenoh-backend-redb
+          # zenohd searches ~/.zenoh/lib for plugins, and the suite spawns `zenohd`
+          # by name — so put the binary on PATH rather than needing root to install
+          # it.
+          mkdir -p ~/.zenoh/lib
+          cp target/release/libzenoh_plugin_storage_manager.so ~/.zenoh/lib/
+          cp target/release/libzenoh_backend_redb.so ~/.zenoh/lib/
+          echo "$PWD/target/release" >> "$GITHUB_PATH"
+
+      - name: Confirm the versions actually match
+        working-directory: zenoh-src
+        run: |
+          zenohd --version
+          rustc --version
+          ls -l ~/.zenoh/lib
+
+      - name: Run the conformance suite
+        working-directory: zenoh-src
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: warn
+        run: |
+          cargo test -p zenoh-backend-redb --test conformance_router_storage -- \
+            --ignored --nocapture --test-threads=1
+
   docs:
     runs-on: ubuntu-24.04
     env:

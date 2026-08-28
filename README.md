@@ -504,6 +504,20 @@ Run unit and integration tests (excludes zenohd tests):
 just test
 ```
 
+### Conformance
+
+`just conformance` runs the router-storage conformance suite against a real
+`zenohd` with a redb volume under it. It asserts the contract an operator actually
+depends on — a state doc outliving its publisher, a DELETE retiring it, `*` not
+reaching a `@catalog` chunk, blob chunks surviving their sensor, a fleet `@rpc` GET
+still fanning in, every event record surviving — plus the two cases a latest-value
+backend cannot pass at all: a `_time`-ranged GET and a retention pass.
+
+The first seven say nothing specific to redb; a correct backend of any kind passes
+them. That is the point: they are the cheapest proof that swapping the backend
+changes nothing an operator relies on. The suite runs in CI and a failure blocks
+merge.
+
 ### zenohd Integration Tests
 
 The zenohd integration tests verify the full plugin lifecycle:

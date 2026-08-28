@@ -273,6 +273,35 @@ test-zenohd:
     echo "Running zenohd integration tests..."
     cargo test --test integration_zenohd -- --test-threads=1 --nocapture
 
+# Run the router-storage conformance suite against a redb volume.
+#
+# This is the standard storage-backend contract — a state doc outliving its
+# publisher, a DELETE retiring it, `*` not reaching `@catalog`, blob chunks
+# surviving their sensor, a fleet @rpc GET still fanning in, every event record
+# surviving — plus the two cases a latest-value backend cannot pass at all: a
+# `_time`-ranged GET and a retention pass.
+#
+# It needs a `zenohd` built with the EXACT rustc and Zenoh version this plugin was
+# built with, and both plugins built in ONE workspace so their compiled feature
+# sets unify. The Dockerfile already does all of that, so this runs inside it
+# rather than inventing a second way to get the pairing right.
+conformance:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if command -v podman >/dev/null; then
+      echo "Building the version-matched zenohd + plugins image (10-15 min first run)..."
+      podman build --build-arg ZENOH_VERSION=1.10.0 --target test \
+        -t zenoh-backend-redb:test .
+      podman run --rm -e RUST_BACKTRACE=1 -e RUST_LOG=warn zenoh-backend-redb:test \
+        cargo test -p zenoh-backend-redb --test conformance_router_storage -- \
+          --ignored --nocapture --test-threads=1
+    else
+      echo "podman not found — see the `conformance` job in .forgejo/workflows/ci.yml" >&2
+      echo "for the container-free equivalent (clone zenoh, add this crate as a" >&2
+      echo "workspace member, build zenohd + both plugins together)." >&2
+      exit 1
+    fi
+
 # Run zenohd integration tests with Podman (ensures matching Zenoh versions)
 docker-test-zenohd:
     #!/usr/bin/env bash
