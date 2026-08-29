@@ -2,6 +2,7 @@
 name = "zenoh-backend-redb"
 version = "0.4.0"
 edition = "2024"
+rust-version = "1.97"
 authors = ["Marc PARDO <p13marc@gmail.com>"]
 license = "Apache-2.0 OR MIT"
 description = "A Zenoh storage backend using redb embedded database"
@@ -24,7 +25,7 @@ dynamic_plugin = []
 redb = { version = "4.2", features = ["cache_metrics"] }
 
 # Zenoh dependencies
-zenoh = { version = "=1.10.0", features = ["plugins", "unstable", "internal"] }
+zenoh = { version = "1.10", features = ["plugins", "unstable", "internal"] }
 zenoh-plugin-trait = "=1.10.0"
 zenoh_backend_traits = { version = "=1.10.0", default-features = false }
 zenoh-util = "=1.10.0"
@@ -32,7 +33,7 @@ zenoh-ext = { version = "=1.10.0", features = ["unstable"] }
 
 # Async support
 async-trait = "0.1"
-tokio = { version = "1.35", features = ["sync", "rt-multi-thread"] }
+tokio = { version = "1", features = ["sync", "rt-multi-thread"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
