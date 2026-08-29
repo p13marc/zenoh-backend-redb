@@ -1,0 +1,6 @@
+# Keep developer tooling out of `git archive` output — the release workflow builds
+# its source tarball that way, and a 20 MB CI-runner binary has no business in a
+# source release.
+bin/act export-ignore
+.forgejo/ export-ignore
+bin/ export-ignore
