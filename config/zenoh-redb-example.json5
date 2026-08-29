@@ -67,21 +67,27 @@
           }
         },
 
-        // Example 3: Read-only storage
-        static_config: {
-          key_expr: "config/**",
-
-          volume: {
-            id: "redb",
-            dir: "config_data",
-
-            // Open in read-only mode - no writes allowed
-            read_only: true,
-
-            // Don't try to create (must already exist)
-            create_db: false,
-          }
-        },
+        // Example 3: Read-only storage — COMMENTED OUT ON PURPOSE.
+        //
+        // `read_only: true` (like `create_db: false`) means "this database must
+        // already exist": the backend opens it and will not create it. Pointed at a
+        // path that does not exist yet — which is the case on a fresh container —
+        // the storage fails to start and the router serves the other three while
+        // logging one line about this one.
+        //
+        // Uncomment it once `config_data.redb` exists under
+        // ZENOH_BACKEND_REDB_ROOT, e.g. after populating it with a writable
+        // storage first.
+        //
+        // static_config: {
+        //   key_expr: "config/**",
+        //   volume: {
+        //     id: "redb",
+        //     dir: "config_data",
+        //     read_only: true,   // no writes accepted
+        //     create_db: false,  // must already exist
+        //   }
+        // },
 
         // Example 4: Time-series data storage
         timeseries: {

@@ -91,7 +91,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `fsync` is actually passed to redb, as `Durability::Immediate` / `Durability::None`.
   It was likewise parsed and ignored.
 - `create_db: false` and `read_only: true` now open an existing database instead of
-  creating one.
+  creating one. Because that is a real behaviour change, the failure explains
+  itself: a missing file reports which setting stopped it being created, rather than
+  a bare "No such file or directory". The shipped example config's read-only storage
+  is commented out for the same reason — it pointed at a database nothing creates,
+  which the old code papered over by ignoring both flags.
 - `RedbStorage::timestamp_of` — reads a key's timestamp without loading its payload.
 - README: a **Version compatibility** section documenting the exact rustc/Zenoh match
   requirement and the three traps that all produce the same silent failure.

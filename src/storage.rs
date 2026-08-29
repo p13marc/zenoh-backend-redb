@@ -357,6 +357,22 @@ impl RedbStorage {
         };
 
         result.map_err(|e| {
+            // "No such file or directory" is technically true and completely
+            // unhelpful: the file is missing *because we were told not to create
+            // it*. Say which setting caused that, since the two that can are far
+            // apart in a config file.
+            if !path.exists() {
+                return RedbBackendError::other(format!(
+                    "{path:?} does not exist, and this storage is configured not to \
+                     create it ({}). Either create the database first, or set \
+                     `create_db: true` and `read_only: false`. ({e})",
+                    if config.read_only {
+                        "`read_only: true` implies the database must already exist"
+                    } else {
+                        "`create_db: false`"
+                    }
+                ));
+            }
             // redb 3 dropped support for the v2 file format this crate wrote before
             // 0.4. The error you get is about a bad magic number, which reads as
             // corruption rather than as a version skew, so say what it really is.
@@ -1915,6 +1931,44 @@ mod tests {
         assert_eq!(pass.samples_dropped, 0);
         assert!(pass.ran_at.is_none());
         assert_eq!(storage.get_range("k", &full_range()).unwrap().len(), 10);
+    }
+
+    /// `read_only` / `create_db: false` on a database that does not exist must fail
+    /// with an error that names the setting responsible.
+    ///
+    /// The bare redb error is "No such file or directory", which is true and
+    /// useless: the file is missing precisely because the config said not to create
+    /// it. This shipped as a broken storage in the example config until the flags
+    /// were actually wired, so the message needs to point at the cause.
+    #[test]
+    fn opening_a_missing_database_read_only_explains_why() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("never-created.redb");
+
+        for (config, expected) in [
+            (
+                RedbStorageConfig::default()
+                    .with_db_path(path.clone())
+                    .with_read_only(true),
+                "read_only",
+            ),
+            (
+                RedbStorageConfig::default()
+                    .with_db_path(path.clone())
+                    .with_create_db(false),
+                "create_db",
+            ),
+        ] {
+            let Err(err) = RedbStorage::new(&path, config, "probe".to_string()) else {
+                panic!("a missing database must not be created here");
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains(expected),
+                "the error must name the setting responsible; got: {msg}"
+            );
+            assert!(!path.exists(), "nothing may have been created");
+        }
     }
 
     /// A composite key must survive a round trip exactly — the timestamp is the
