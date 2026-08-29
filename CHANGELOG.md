@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.0] - 2026-08-29
 
 ### Changed
 - **Breaking**: `RedbStorage::delete` takes the deletion's `Timestamp`. A deletion
@@ -207,7 +207,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Links
 
-- [Repository](https://github.com/p13marc/zenoh-backend-redb)
-- [Issue Tracker](https://github.com/p13marc/zenoh-backend-redb/issues)
+- [Repository](https://git.marcpardo.eu/marcpardo/zenoh-backend-redb)
+- [Issue Tracker](https://git.marcpardo.eu/marcpardo/zenoh-backend-redb/issues)
 - [Zenoh Documentation](https://zenoh.io/docs/)
 - [redb Documentation](https://docs.rs/redb/)

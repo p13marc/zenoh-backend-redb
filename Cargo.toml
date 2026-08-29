@@ -1,11 +1,11 @@
 [package]
 name = "zenoh-backend-redb"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 authors = ["Marc PARDO <p13marc@gmail.com>"]
 license = "Apache-2.0 OR MIT"
 description = "A Zenoh storage backend using redb embedded database"
-repository = "https://github.com/p13marc/zenoh-backend-redb"
+repository = "https://git.marcpardo.eu/marcpardo/zenoh-backend-redb"
 readme = "README.md"
 keywords = ["zenoh", "storage", "backend", "redb", "database"]
 categories = ["database", "network-programming"]

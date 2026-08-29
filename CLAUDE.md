@@ -95,25 +95,82 @@ RedbStorage uses a dual-table architecture (similar to RocksDB column families):
 - **payloads table**: Raw payload bytes keyed by Zenoh key expression
 - **data_info table**: Metadata (timestamp, encoding, deleted flag) for each key
 
+In `history: "all"` volumes two more tables are written, keyed by a composite
+`key || 0x00 || big-endian NTP64 || TimestampId`:
+
+- **history_payloads / history_info**: every sample, not just the latest
+
+The `0x00` separator is safe because a Zenoh key expression can never contain a NUL,
+and it sorts below every byte a key can hold — so one key's samples are contiguous
+and `a/b` sorts entirely before `a/b/c` instead of interleaving. Big-endian NTP64
+makes redb's lexicographic order *be* chronological order, which is what turns a
+time window into a single bounded range scan. `data_info` stays the latest-value
+index in both modes, which keeps `get_all_entries` O(keys) and a no-`_time` GET a
+point lookup.
+
 Thread-local buffers (`KEY_BUFFER`, `VALUE_BUFFER`) are used for zero-allocation PUT/GET operations.
+
+### History and retention
+
+Two features that are easy to miss and hard to rediscover:
+
+- **`history`** is a **volume**-level property (`"latest"` default, or `"all"`).
+  It cannot be per-storage, because Zenoh asks the *volume* for its capability and
+  makes two decisions from it a storage cannot override: a storage declaring
+  `replication` refuses to start unless the volume reports `History::Latest`, and in
+  `latest` mode the storage manager discards outdated samples before they reach the
+  backend. Declare one volume per mode; the same plugin serves both.
+- **`retention`** is per-storage and **mandatory for `all`-mode storages**, which
+  refuse to start without it. Zenoh has no TTL — the manager's `garbage_collection`
+  prunes its own in-memory metadata, never stored values — so bounding the disk is
+  this backend's job. `max_bytes` compacts, because redb does not return space to
+  the filesystem on delete and the policy would otherwise never converge.
+
+Retention runs on a plain OS thread, **not** a tokio task: `Volume::create_storage`
+is not called from inside a tokio runtime in zenohd, and spawning one there panics
+and takes down every `all`-mode storage at router startup.
 
 ### Wildcard Matching
 
-The `matches_wildcard()` function in storage.rs supports Zenoh key expression wildcards:
-- `*` matches a single path segment
-- `**` matches zero or more path segments
+`matches_wildcard()` in storage.rs defers to Zenoh's own algebra
+(`keyexpr::intersects`) rather than splitting on `/`. Two rules a hand-rolled
+matcher does not have, and both matter:
+
+- `*` and `**` never match a chunk beginning with `@`. That is the entire basis of
+  the verbatim planes (`@rpc`, `@blob`, `@catalog`): `v1/*/state/**` cannot reach
+  `v1/@catalog/state/**`, which is why a catalog needs a storage of its own.
+- `$*` is a sub-chunk wildcard; treating it as a literal makes a selector silently
+  match nothing.
+
+Wildcard and prefix reads are **bounded range scans** over the ordered table, using
+the selector's longest wildcard-free prefix (`literal_prefix`). Note the subtlety:
+`a/**` also matches `a` itself, which sorts *before* the prefix `a/`, so that key is
+probed separately — a scan that just starts at the prefix loses it.
 
 ### Plugin System
 
 The crate builds as both `rlib` (library) and `cdylib` (dynamic plugin). The `plugin` feature enables `zenoh_plugin_trait::declare_plugin!` for dynamic loading by zenohd.
 
-**Critical**: The plugin must be compiled with the exact same Rust version and Zenoh dependency version as zenohd. ABI incompatibility causes SIGSEGV crashes. Feature sets must also match - this is why `zenoh_backend_traits` uses `default-features = false`.
+**Critical**: The plugin must be compiled with the exact same Rust version and Zenoh
+dependency version as zenohd, and both plugins must be built in **one** cargo
+workspace so their compiled feature strings unify.
+
+The failure is not a crash — it is worse. zenohd starts, logs a single ERROR line,
+and then serves no storage at all. Three distinct causes produce that identical
+symptom: separate workspaces ("Incompatible Zenoh feature sets"), a crate shipping
+its own `rust-toolchain.toml` ("Incompatible rustc versions"), and a version-skewed
+zenohd. See the Version compatibility section of README.md.
 
 ### Plugin Hierarchy
 
 1. **RedbBackendPlugin** -> implements `Plugin`, creates RedbVolume
 2. **RedbVolume** -> implements `Volume`, creates RedbStoragePlugin instances
-3. **RedbStoragePlugin** -> implements `Storage`, wraps RedbStorage with async mutex
+3. **RedbStoragePlugin** -> implements `Storage`, holds `Arc<RedbStorage>`
+
+Reads take no lock: every `RedbStorage` method takes `&self` and redb does its own
+concurrency control. An async mutex guards only the read-then-write in `put`/`delete`
+(the last-writer-wins comparison, which must be atomic), which is what lets the
+*synchronous* `get_admin_status` report live statistics.
 
 ## Configuration
 
@@ -152,7 +209,14 @@ Backend is configured through Zenoh's storage_manager plugin:
 | `create_db` | bool | true | Create database if missing |
 | `read_only` | bool | false | Read-only mode |
 | `cache_size` | number | `67108864` (64 MiB) | redb page-cache budget in bytes (never redb’s own 1 GiB default) |
-| `fsync` | bool | true | Enable fsync for durability |
+| `fsync` | bool | true | `Durability::Immediate` vs `Durability::None` (redb 4 dropped `Eventual`, so `false` means *not persisted* until a later durable commit) |
+| `retention` | object | - | Required for `all`-mode storages. `max_age_secs`, `max_bytes`, `max_samples_per_key`, `decimate`, `interval_secs` |
+
+Volume-level:
+
+| Property | Type | Default | Description |
+|----------|------|---------|-------------|
+| `history` | string | `"latest"` | `"latest"` or `"all"` — see History and retention above |
 
 ## Environment Variables
 

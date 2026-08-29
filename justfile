@@ -60,10 +60,19 @@ coverage-open: coverage
         open tarpaulin-report.html || xdg-open tarpaulin-report.html || start tarpaulin-report.html; \
     fi
 
-# Security audit
-# Ignoring known upstream vulnerabilities from Zenoh dependencies
+# Security audit.
+#
+# deny.toml is the single source of truth for which advisories are ignored and why
+# — it is what CI gates on. The ignore list is read from it rather than repeated
+# here, because three copies of that list (justfile, audit.toml, deny.toml) had
+# already drifted into disagreeing with each other.
 audit:
-    cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2024-0436
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ignores=$(grep -oE 'RUSTSEC-[0-9]{4}-[0-9]{4}' deny.toml | sort -u | sed 's/^/--ignore /' | tr '\n' ' ')
+    echo "ignoring (from deny.toml): ${ignores:-none}"
+    # shellcheck disable=SC2086
+    cargo audit $ignores
 
 # Check for unused dependencies (nightly required)
 udeps:

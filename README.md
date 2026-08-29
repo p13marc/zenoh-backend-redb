@@ -573,4 +573,13 @@ at your option.
 
 ## Status
 
-This project is currently in **alpha** stage. The API may change as we gather feedback and improve the implementation.
+**Beta.** The storage contract is verified end-to-end against a real `zenohd` on
+every change: `tests/conformance_router_storage.rs` spawns a router and asserts that
+a state doc outlives its publisher, a DELETE retires it, `*` cannot reach a
+`@catalog` chunk, blob chunks survive their sensor, a fleet `@rpc` GET still fans
+in, every event record survives, plus a `_time`-ranged GET and a retention pass. A
+failure blocks merge.
+
+The Rust API is still moving — 0.4 changed `RedbStorage::put`/`delete` signatures —
+and `history: "all"` has not yet run in a production deployment. Treat the plugin
+interface and on-disk format as stable, and the library API as not.

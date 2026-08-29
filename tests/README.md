@@ -169,20 +169,21 @@ The test generates a configuration similar to:
 
 ## CI/CD Considerations
 
-For CI pipelines:
+This repository already does it: see the `conformance` job in
+[`.forgejo/workflows/ci.yml`](../.forgejo/workflows/ci.yml), which gates merges.
 
-```yaml
-# Example GitHub Actions snippet
-- name: Install zenohd
-  run: cargo install zenohd --git https://github.com/eclipse-zenoh/zenoh --branch main
+Do **not** install zenohd separately from the plugins. The job clones zenoh at the
+pinned tag, adds this crate to that workspace as a member with `[patch.crates-io]`,
+and builds `zenohd`, `zenoh-plugin-storage-manager` and the backend **together**:
 
-- name: Build plugin
-  run: cargo build --release --features plugin
-
-- name: Run integration tests
-  run: cargo test --test integration_zenohd -- --ignored --nocapture
-  timeout-minutes: 5
+```bash
+cargo build --release -p zenohd -p zenoh-plugin-storage-manager -p zenoh-backend-redb
 ```
+
+Built separately, their compiled `zenoh_backend_traits` feature strings diverge and
+zenoh's compatibility check rejects the plugin — by starting zenohd, logging one
+ERROR line, and then serving no storage at all. Every test then fails as "nothing
+was stored" and none of them says why.
 
 ## Performance Testing
 
@@ -211,7 +212,7 @@ When adding new integration tests:
 
 ## Related Documentation
 
-- [PERFORMANCE_ANALYSIS.md](../PERFORMANCE_ANALYSIS.md) - Detailed performance analysis
-- [OPTIMIZATIONS.md](../OPTIMIZATIONS.md) - Implemented optimizations
+- [`benches/`](../benches) - Criterion benchmarks, including `bench_wildcard_scan_100k`
+  which measures the bounded range scan against a 100k-key store
 - [README.md](../README.md) - Main project documentation
 - [Zenoh Documentation](https://zenoh.io/docs/) - Zenoh protocol and API
