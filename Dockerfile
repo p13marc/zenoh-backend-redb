@@ -18,7 +18,7 @@ WORKDIR /build
 
 # First, build zenohd from source with the matching version
 # This ensures zenohd and plugin use the exact same Zenoh version
-ARG ZENOH_VERSION=1.10.0
+ARG ZENOH_VERSION=1.10.2
 RUN git clone --depth 1 --branch ${ZENOH_VERSION} https://github.com/eclipse-zenoh/zenoh.git zenoh-src
 
 WORKDIR /build/zenoh-src

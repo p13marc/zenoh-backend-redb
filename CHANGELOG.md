@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- Updated to Zenoh 1.10.2 (pinned `=1.10.2`, now on all five zenoh crates: `zenoh`
+  itself was `"1.10"`). The plugin must be rebuilt against a 1.10.2 `zenohd`; the
+  toolchain stays at 1.97.
+- Lockfile refresh for advisories in transitive dependencies: `quinn-proto`,
+  `quinn-udp`, `rustls`, `rustls-webpki`, `webpki-root-certs`, `tokio`, `url`.
+- Renovate no longer proposes toolchain bumps. The plugin must be built with the
+  rustc that built `zenohd`, so the toolchain moves only with a zenoh upgrade.
+
 ## [0.4.0] - 2026-08-29
 
 ### Changed

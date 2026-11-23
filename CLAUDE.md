@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a Zenoh storage backend using [redb](https://www.redb.org/) as the underlying database engine. It implements the `zenoh_backend_traits` interfaces to provide persistent storage for Zenoh's storage manager plugin. The backend is pure Rust with no C dependencies, ACID-compliant, and supports zero-copy reads.
 
-**Current Zenoh version: 1.10.0** (pinned with `=1.10.0` in Cargo.toml)
+**Current Zenoh version: 1.10.2** (pinned with `=1.10.2` in Cargo.toml)
 
 ## Build Commands
 
@@ -36,7 +36,7 @@ just test-one TEST_NAME
 # RECOMMENDED: Use Podman to ensure version compatibility
 just docker-test-zenohd
 
-# Local zenohd tests (requires zenohd 1.10.0 + storage_manager plugin installed)
+# Local zenohd tests (requires zenohd 1.10.2 + storage_manager plugin installed)
 just test-zenohd
 
 # Run benchmarks
@@ -46,11 +46,11 @@ just bench
 ### Integration Test Requirements
 
 The zenohd integration tests require:
-1. **zenohd** installed and in PATH (version 1.10.0)
+1. **zenohd** installed and in PATH (version 1.10.2)
 2. **libzenoh_plugin_storage_manager.so** in `~/.zenoh/lib/`
 3. **libzenoh_backend_redb.so** in `~/.zenoh/lib/`
 
-All three must be built with the **same Rust version** (1.97) and **same Zenoh version** (1.10.0).
+All three must be built with the **same Rust version** (1.97) and **same Zenoh version** (1.10.2).
 
 Tests will skip gracefully with a message if plugins are missing or incompatible.
 

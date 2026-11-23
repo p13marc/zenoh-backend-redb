@@ -29,7 +29,7 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
-  # rust-toolchain.toml (1.91.1) governs the version; the dtolnay action just
+  # rust-toolchain.toml governs the version; the dtolnay action just
   # provides rustup + a default toolchain (the act image ships no Rust).
   fmt:
     runs-on: ubuntu-24.04
@@ -92,7 +92,7 @@ jobs:
   # single ERROR line, and then serving no storage at all. Every conformance test
   # would fail as "nothing was stored" and none of them would say why.
   #
-  # `[patch.crates-io]` is what makes the pin exact: our `=1.10.0` dependencies
+  # `[patch.crates-io]` is what makes the pin exact: our `=1.10.2` dependencies
   # resolve to the very sources zenohd is built from, not a second copy.
   conformance:
     runs-on: ubuntu-24.04
@@ -108,7 +108,7 @@ jobs:
 
       - name: Clone zenoh at the pinned version
         run: |
-          git clone --depth 1 --branch 1.10.0 \
+          git clone --depth 1 --branch 1.10.2 \
             https://github.com/eclipse-zenoh/zenoh.git zenoh-src
 
       - name: Add the backend to the zenoh workspace

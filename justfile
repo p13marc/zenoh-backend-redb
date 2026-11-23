@@ -299,7 +299,7 @@ conformance:
     set -euo pipefail
     if command -v podman >/dev/null; then
       echo "Building the version-matched zenohd + plugins image (10-15 min first run)..."
-      podman build --build-arg ZENOH_VERSION=1.10.0 --target test \
+      podman build --build-arg ZENOH_VERSION=1.10.2 --target test \
         -t zenoh-backend-redb:test .
       podman run --rm -e RUST_BACKTRACE=1 -e RUST_LOG=warn zenoh-backend-redb:test \
         cargo test -p zenoh-backend-redb --test conformance_router_storage -- \
@@ -318,7 +318,7 @@ docker-test-zenohd:
     echo "Building test image with zenohd and plugin..."
     echo "Note: First build takes 10-15 minutes (compiling zenohd from source)"
     echo "========================================"
-    podman-remote build --build-arg ZENOH_VERSION=1.10.0 --target test -t zenoh-backend-redb:test .
+    podman-remote build --build-arg ZENOH_VERSION=1.10.2 --target test -t zenoh-backend-redb:test .
     echo ""
     echo "========================================"
     echo "Running zenohd integration tests..."
@@ -332,7 +332,7 @@ docker-test-zenohd-no-cache:
     echo "Building test image WITHOUT CACHE..."
     echo "Note: This will take 20-40 minutes (full rebuild)"
     echo "========================================"
-    podman-remote build --no-cache --build-arg ZENOH_VERSION=1.10.0 --target test -t zenoh-backend-redb:test .
+    podman-remote build --no-cache --build-arg ZENOH_VERSION=1.10.2 --target test -t zenoh-backend-redb:test .
     echo ""
     echo "========================================"
     echo "Running zenohd integration tests..."

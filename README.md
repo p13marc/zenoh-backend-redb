@@ -9,7 +9,7 @@ A [Zenoh](https://zenoh.io) storage backend using [redb](https://www.redb.org/) 
 
 This backend provides persistent storage for Zenoh using redb, a pure Rust embedded key-value database with ACID compliance and zero-copy reads. It's particularly well-suited for edge computing, IoT devices, and applications requiring a lightweight, dependency-free storage solution.
 
-**Compatible with Zenoh 1.10.0**
+**Compatible with Zenoh 1.10.2**
 
 ### Features
 
@@ -110,7 +110,7 @@ the version requirements below are not advisory.
 
 | | Must match zenohd |
 |---|---|
-| Zenoh | `1.10.0` (pinned `=1.10.0` in `Cargo.toml`, all five zenoh crates) |
+| Zenoh | `1.10.2` (pinned `=1.10.2` in `Cargo.toml`, all five zenoh crates) |
 | rustc | `1.97` (`rust-toolchain.toml`) |
 
 ### The three traps
@@ -126,7 +126,7 @@ All three produce the identical symptom above.
 2. **A crate shipping its own `rust-toolchain.toml`.** It will pin a different rustc
    than the one `zenohd` was built with — *"Incompatible rustc versions"*. Remove it
    before building, or build everything with the host toolchain.
-3. **A version-skewed `zenohd`.** `cargo install zenohd --version 1.10.0 --locked`, and
+3. **A version-skewed `zenohd`.** `cargo install zenohd --version 1.10.2 --locked`, and
    confirm with `zenohd --version` before blaming the backend.
 
 ### Why `cache_size` has a default
@@ -532,7 +532,7 @@ The zenohd integration tests verify the full plugin lifecycle:
 # Recommended: Use Podman for version-matched testing
 just docker-test-zenohd
 
-# Local testing (requires matching zenohd 1.10.0 + plugins in ~/.zenoh/lib/)
+# Local testing (requires matching zenohd 1.10.2 + plugins in ~/.zenoh/lib/)
 just test-zenohd
 ```
 

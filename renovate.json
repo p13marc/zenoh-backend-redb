@@ -1,4 +1,17 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["local>marcpardo/myserver//renovate/default"]
+  "extends": ["local>marcpardo/myserver//renovate/default"],
+  "packageRules": [
+    {
+      "description": "The plugin is a cdylib loaded by zenohd, and zenoh rejects a plugin built with a different rustc. The toolchain follows zenoh's own rust-toolchain.toml and moves only with a zenoh upgrade, by hand.",
+      "matchManagers": ["rust-toolchain"],
+      "enabled": false
+    },
+    {
+      "description": "Same constraint for the image the Dockerfile builds zenohd and the plugin in.",
+      "matchManagers": ["dockerfile"],
+      "matchPackageNames": ["rust"],
+      "enabled": false
+    }
+  ]
 }
