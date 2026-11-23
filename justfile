@@ -136,13 +136,9 @@ pre-commit: check test doc audit
 # Simulate CI pipeline locally (full checks)
 ci: check test doc audit deny
 
-# Run CI checks locally (matches GitHub Actions)
+# Run what the Forgejo CI runs, except the conformance job (see `conformance`)
 ci-local:
     ./ci-local.sh
-
-# Run CI using act (Docker-based GitHub Actions simulation)
-ci-act:
-    ./bin/act push -j ci
 
 # Run comprehensive quality checks
 quality: check test coverage doc audit udeps machete deny outdated
@@ -420,8 +416,7 @@ help:
     @echo ""
     @echo "CI/CD:"
     @echo "  ci                  - Simulate CI pipeline (full)"
-    @echo "  ci-local            - Run CI checks (matches GitHub)"
-    @echo "  ci-act              - Run CI with act (Docker)"
+    @echo "  ci-local            - Run what CI runs, minus conformance"
     @echo "  pre-commit          - Pre-commit checks"
     @echo "  verify              - Verify before commit"
     @echo "  test-zenohd              - Run zenohd integration tests (local)"

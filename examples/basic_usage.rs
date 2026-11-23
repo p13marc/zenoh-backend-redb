@@ -24,10 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 2. Create a storage instance
     println!("2. Creating storage...");
-    let storage_config = RedbStorageConfig::new()
-        .with_key_expr("demo/**".to_string())
-        .with_strip_prefix(false)
-        .with_fsync(true);
+    let storage_config = RedbStorageConfig::new().with_fsync(true);
 
     let storage = backend.create_storage("demo_storage".to_string(), Some(storage_config))?;
     println!("   ✓ Storage 'demo_storage' created\n");

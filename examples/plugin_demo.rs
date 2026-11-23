@@ -39,17 +39,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("3. Creating storage instances...");
 
     // Storage 1: Sensor data
-    let sensor_config = RedbStorageConfig::new()
-        .with_key_expr("sensor/**".to_string())
-        .with_strip_prefix(true)
-        .with_cache_size(50 * 1024 * 1024); // 50MB
+    let sensor_config = RedbStorageConfig::new().with_cache_size(50 * 1024 * 1024); // 50MB
 
     let sensor_storage = backend.create_storage("sensor_data".to_string(), Some(sensor_config))?;
     println!("   ✓ Created 'sensor_data' storage");
 
     // Storage 2: Configuration data (read-only)
     let config_config = RedbStorageConfig::new()
-        .with_key_expr("config/**".to_string())
         .with_read_only(false) // Set to true for actual read-only
         .with_fsync(true);
 
@@ -58,8 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Storage 3: Time-series metrics
     let metrics_config = RedbStorageConfig::new()
-        .with_key_expr("metrics/**".to_string())
-        .with_fsync(false) // Faster writes, less durable
+        .with_fsync(false) // Faster writes; durable every flush_interval_secs
         .with_cache_size(100 * 1024 * 1024); // 100MB
 
     let metrics_storage =

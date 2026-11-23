@@ -286,15 +286,15 @@ mod tests {
         let (backend, _temp) = create_test_backend();
 
         let custom_config = RedbStorageConfig::new()
-            .with_key_expr("demo/**".to_string())
-            .with_strip_prefix(true);
+            .with_cache_size(8 * 1024 * 1024)
+            .with_fsync(false);
 
         let storage = backend
             .create_storage("custom_storage".to_string(), Some(custom_config))
             .unwrap();
 
-        assert_eq!(storage.config().key_expr, Some("demo/**".to_string()));
-        assert!(storage.config().strip_prefix);
+        assert_eq!(storage.config().cache_size, 8 * 1024 * 1024);
+        assert!(!storage.config().fsync);
     }
 
     #[test]

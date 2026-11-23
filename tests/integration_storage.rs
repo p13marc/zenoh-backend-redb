@@ -555,8 +555,12 @@ fn test_concurrent_writes() {
     assert_eq!(storage.count().unwrap(), 100);
 }
 
+/// The backend stores the key it is given. Prefix stripping is the storage
+/// manager's job, done before the backend is called; `RedbStorageConfig`'s
+/// `strip_prefix` is not read, and this pins that setting it changes nothing.
 #[test]
-fn test_storage_with_prefix_stripping() {
+#[allow(deprecated)]
+fn test_strip_prefix_in_the_backend_config_is_inert() {
     let temp_dir = TempDir::new().unwrap();
     let config = RedbBackendConfig::new()
         .with_base_dir(temp_dir.path().to_path_buf())
@@ -576,9 +580,10 @@ fn test_storage_with_prefix_stripping() {
     let value = test_value(b"test".to_vec(), 1);
     storage.put("demo/app/sensor/temp", value).unwrap();
 
-    // Should be able to retrieve with full key
+    // Stored, and found, under the full key: nothing was stripped.
     let retrieved = storage.get("demo/app/sensor/temp").unwrap();
     assert!(retrieved.is_some());
+    assert!(storage.get("sensor/temp").unwrap().is_none());
 }
 
 #[test]

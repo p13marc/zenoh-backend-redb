@@ -9,10 +9,10 @@
 //! - Pure Rust implementation with no C dependencies
 //! - ACID compliance with MVCC (Multi-Version Concurrency Control)
 //! - Zero-copy reads for excellent performance
-//! - Support for Zenoh wildcard queries (`*` and `**`)
+//! - Zenoh's own key-expression matching for wildcard queries (`*`, `**`, `$*`)
+//! - Optional full history per key, with `_time`-ranged reads and retention
 //! - Configurable per-storage settings
 //! - Read-only mode support
-//! - Prefix stripping for efficient key storage
 //!
 //! # Example
 //!
@@ -28,8 +28,8 @@
 //!
 //! // Create a storage instance
 //! let storage_config = RedbStorageConfig::new()
-//!     .with_key_expr("demo/**".to_string())
-//!     .with_strip_prefix(false);
+//!     .with_cache_size(32 * 1024 * 1024)
+//!     .with_fsync(true);
 //!
 //! let storage = backend.create_storage(
 //!     "my_storage".to_string(),

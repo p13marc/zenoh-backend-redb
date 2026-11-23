@@ -409,39 +409,6 @@ fn bench_fsync_impact(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark storage with prefix stripping
-fn bench_prefix_stripping(c: &mut Criterion) {
-    let mut group = c.benchmark_group("prefix_stripping");
-
-    for strip_prefix in [false, true].iter() {
-        let label = if *strip_prefix {
-            "with_strip"
-        } else {
-            "without_strip"
-        };
-        group.bench_function(label, |b| {
-            let (backend, _temp_dir) = create_test_backend();
-            let mut config =
-                RedbStorageConfig::new().with_key_expr("test/long/prefix/path/".to_string());
-            if *strip_prefix {
-                config = config.with_strip_prefix(true);
-            }
-            let storage = backend
-                .create_storage("bench_storage".to_string(), Some(config))
-                .unwrap();
-
-            let mut counter = 0u64;
-            b.iter(|| {
-                let key = format!("test/long/prefix/path/sensor/{}", counter);
-                let value = create_value(100, counter);
-                counter += 1;
-                storage.put(&key, black_box(value)).unwrap();
-            });
-        });
-    }
-    group.finish();
-}
-
 /// Benchmark key encoding/decoding overhead
 fn bench_key_operations(c: &mut Criterion) {
     c.bench_function("key_encoding", |b| {
@@ -467,7 +434,6 @@ criterion_group!(
     bench_concurrent_reads,
     bench_wildcard_scan_100k,
     bench_fsync_impact,
-    bench_prefix_stripping,
     bench_key_operations,
 );
 

@@ -44,6 +44,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directly, and the rest from a snapshot computed on a background thread once the
   file is over 64 MiB. `usage_age_secs` says how old that snapshot is.
 
+- **A `_time` GET scanned the key's whole history** (#37) and filtered by time in
+  memory, although the key layout exists to make a window one bounded range scan.
+  It now reads only the rows of the window.
+- **A dot in `dir` was truncated** (#39). `dir: "telemetry.v1"` and
+  `dir: "telemetry.v2"` both became `telemetry.redb`, and the second storage failed
+  to open a file the first had locked. `.redb` is now appended. A deployment that
+  already ran with a dotted `dir` keeps opening its existing (truncated-name) file,
+  with a warning, until the correctly named file exists.
+
+### Removed
+- `bin/act` (a 20 MB GitHub-Actions runner binary) and `just ci-act`. `ci-local.sh`
+  now runs what the Forgejo CI runs, minus the conformance job.
+
+### Deprecated
+- `RedbStorageConfig::with_key_expr`, `with_strip_prefix` and `with_table_name`. The
+  fields behind them were never read: the storage manager filters keys and strips
+  the prefix before it calls a backend, and the tables have fixed names.
+
 ### Changed
 - **Breaking (API):** `RedbStorage::stats()` is O(1) and `StorageStats` loses
   `stored_bytes`, `metadata_bytes`, `fragmented_bytes`, `live_keys`, `tombstones`,

@@ -174,6 +174,39 @@ fn spawn_background(
         .expect("spawn storage background thread");
 }
 
+/// The database file for a storage's `dir` property: `<base>/<dir>.redb`.
+///
+/// `.redb` is **appended**. This used `PathBuf::set_extension`, which *replaces*
+/// whatever follows the last dot, so `dir: "telemetry.v1"` and `dir: "telemetry.v2"`
+/// both became `telemetry.redb` and the second storage failed to open a file the
+/// first had locked.
+///
+/// A deployment that already ran with a dotted `dir` has its data in the truncated
+/// file. That file is still opened — when it exists and the correct one does not —
+/// so an upgrade does not silently start an empty database; the log says how to
+/// move off it.
+fn db_path_for_dir(base: &std::path::Path, dir: &str, storage: &str) -> PathBuf {
+    // Somebody who wrote the extension out meant the file, not `x.redb.redb`.
+    let path = if dir.ends_with(".redb") {
+        base.join(dir)
+    } else {
+        base.join(format!("{dir}.redb"))
+    };
+
+    let mut legacy = base.join(dir);
+    legacy.set_extension("redb");
+    if legacy != path && legacy.exists() && !path.exists() {
+        warn!(
+            "Storage '{}': `dir: \"{}\"` names {:?}, but an earlier version of this backend \
+             dropped everything after the last dot and put its data in {:?}. Opening that \
+             file. To move to the correct name, stop the router and rename it.",
+            storage, dir, path, legacy
+        );
+        return legacy;
+    }
+    path
+}
+
 /// Run one retention pass, containing whatever goes wrong in it.
 ///
 /// A failed pass is logged and skipped. So is a *panicking* one, which matters
@@ -428,10 +461,7 @@ impl Volume for RedbVolume {
         // Determine database path
         let db_path = if let Some(serde_json::Value::String(dir)) = volume_cfg.get(PROP_STORAGE_DIR)
         {
-            let mut path = self.backend.config().base_dir.clone();
-            path.push(dir);
-            path.set_extension("redb");
-            path
+            db_path_for_dir(&self.backend.config().base_dir, dir, &config.name)
         } else if let Some(serde_json::Value::String(filename)) =
             volume_cfg.get(PROP_STORAGE_DB_FILE)
         {
@@ -550,14 +580,10 @@ impl Volume for RedbVolume {
 struct RedbStoragePlugin {
     config: StorageConfig,
     /// The storage itself. Every `RedbStorage` method takes `&self` and redb does
-    /// its own concurrency control, so reads need no lock — which is what lets the
-    /// *synchronous* `get_admin_status` report live statistics rather than having
-    /// to give up under contention.
+    /// its own concurrency control, so nothing here needs a lock: `put` and
+    /// `delete` compare timestamps and write inside one redb write transaction,
+    /// and redb admits one writer at a time.
     storage: Arc<RedbStorage>,
-    /// Serialises the read-then-write in `put` and `delete`. Those compare the
-    /// incoming timestamp against the stored one and then act on the result, which
-    /// has to be atomic or two concurrent writers can each decide they are newer.
-    write_lock: Arc<tokio::sync::Mutex<()>>,
     storage_config: RedbStorageConfig,
     /// What the background thread reports back: the last retention pass and the
     /// usage snapshot. Std mutexes inside, because `get_admin_status` is
@@ -605,7 +631,6 @@ impl RedbStoragePlugin {
         Self {
             config,
             storage,
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
             storage_config,
             shared,
             requests,
@@ -777,7 +802,6 @@ impl Storage for RedbStoragePlugin {
         encoding: Encoding,
         timestamp: Timestamp,
     ) -> ZResult<StorageInsertionResult> {
-        let _write = self.write_lock.lock().await;
         let storage = &self.storage;
 
         if self.storage_config.read_only {
@@ -822,7 +846,6 @@ impl Storage for RedbStoragePlugin {
         key: Option<OwnedKeyExpr>,
         timestamp: Timestamp,
     ) -> ZResult<StorageInsertionResult> {
-        let _write = self.write_lock.lock().await;
         let storage = &self.storage;
 
         if self.storage_config.read_only {
@@ -1279,6 +1302,90 @@ mod tests {
             };
             assert!(err.to_string().contains(names), "{err}");
         }
+    }
+
+    /// #39: `.redb` is appended to `dir`, so a dot in it survives and two storages
+    /// cannot land on one file.
+    #[test]
+    fn test_a_dot_in_dir_is_part_of_the_name() {
+        let base = TempDir::new().unwrap();
+        let base = base.path();
+
+        assert_eq!(db_path_for_dir(base, "plain", "s"), base.join("plain.redb"));
+        assert_eq!(
+            db_path_for_dir(base, "telemetry.v1", "s"),
+            base.join("telemetry.v1.redb")
+        );
+        assert_ne!(
+            db_path_for_dir(base, "telemetry.v1", "s"),
+            db_path_for_dir(base, "telemetry.v2", "s"),
+            "two dirs that differ after the dot must not share a file"
+        );
+        // Writing the extension out does not double it.
+        assert_eq!(
+            db_path_for_dir(base, "named.redb", "s"),
+            base.join("named.redb")
+        );
+
+        // A deployment that already ran with a dotted dir has its data under the
+        // truncated name. Keep using it rather than starting empty...
+        std::fs::write(base.join("telemetry.redb"), b"").unwrap();
+        assert_eq!(
+            db_path_for_dir(base, "telemetry.v1", "s"),
+            base.join("telemetry.redb")
+        );
+        // ...until the correctly named file exists.
+        std::fs::write(base.join("telemetry.v1.redb"), b"").unwrap();
+        assert_eq!(
+            db_path_for_dir(base, "telemetry.v1", "s"),
+            base.join("telemetry.v1.redb")
+        );
+        // An undotted dir never looks anywhere else.
+        assert_eq!(
+            db_path_for_dir(base, "telemetry", "s"),
+            base.join("telemetry.redb")
+        );
+    }
+
+    /// Two storages whose `dir`s differ only after a dot both start.
+    #[tokio::test]
+    async fn test_two_dotted_dirs_do_not_collide() {
+        let dir = TempDir::new().unwrap();
+        let backend = RedbBackend::new(
+            RedbBackendConfig::new()
+                .with_base_dir(dir.path().to_path_buf())
+                .with_create_dir(true),
+        )
+        .unwrap();
+        let volume = RedbVolume {
+            history: HistoryMode::Latest,
+            admin_status: serde_json::Value::Object(Default::default()),
+            backend: Arc::new(backend),
+        };
+        let cfg = |name: &str| StorageConfig {
+            name: name.to_string(),
+            key_expr: "test/**".parse().unwrap(),
+            strip_prefix: None,
+            volume_cfg: json!({ "dir": name }).into(),
+            volume_id: "redb".to_string(),
+            complete: false,
+            garbage_collection_config: Default::default(),
+            replication: None,
+        };
+
+        let _v1 = volume
+            .create_storage(cfg("telemetry.v1"))
+            .await
+            .map_err(|e| e.to_string())
+            .expect("first storage");
+        let _v2 = volume
+            .create_storage(cfg("telemetry.v2"))
+            .await
+            .map_err(|e| e.to_string())
+            .expect("second storage must not collide with the first");
+
+        assert!(dir.path().join("telemetry.v1.redb").exists());
+        assert!(dir.path().join("telemetry.v2.redb").exists());
     }
 
     /// A latest-mode storage needs no policy — it already keeps one value per key.

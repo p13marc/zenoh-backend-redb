@@ -19,12 +19,11 @@ use zenoh::internal::buffers::ZSlice;
 use zenoh::key_expr::keyexpr;
 use zenoh::time::{NTP64, Timestamp, TimestampId};
 use zenoh_ext::{z_deserialize, z_serialize};
-use zenoh_util::time_range::TimeRange;
+use zenoh_util::time_range::{TimeBound, TimeRange};
 
-// Thread-local buffers for zero-allocation PUT/GET operations
+// Thread-local key buffer, so PUT/GET/DELETE do not allocate one per call.
 thread_local! {
     static KEY_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(256));
-    static VALUE_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(1024));
 }
 
 /// Table definition for storing payloads.
@@ -105,12 +104,57 @@ fn key_range_end(key: &[u8]) -> Vec<u8> {
     end
 }
 
-/// The half-open byte range covering every sample of `key`.
-fn history_key_bounds(key: &str) -> (Vec<u8>, Vec<u8>) {
-    (
-        key_range_start(key.as_bytes()),
-        key_range_end(key.as_bytes()),
-    )
+/// A `SystemTime` as raw NTP64, clamped to what an NTP64 can hold.
+///
+/// `NTP64::from(Duration)` asserts that the seconds fit in 32 bits, and a time
+/// before the epoch has no `Duration` at all; a selector can ask for either.
+fn ntp_clamped(time: SystemTime) -> u64 {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Err(_) => 0,
+        Ok(since_epoch) => match u32::try_from(since_epoch.as_secs()) {
+            Ok(_) => NTP64::from(since_epoch).0,
+            Err(_) => u64::MAX,
+        },
+    }
+}
+
+/// The inclusive byte range holding every sample of `key` that `range` could
+/// contain.
+///
+/// This is what makes a time window one bounded scan: the composite key is
+/// `key || 0x00 || big-endian NTP64 || id`, so a window in time is a window in the
+/// table. The range is widened by a millisecond at both ends, because the caller
+/// filters with `TimeRange::contains` on a `SystemTime` and the two clocks do not
+/// round identically; a bound's inclusivity is left to that filter too.
+fn history_window_bounds(key: &str, range: &TimeRange<SystemTime>) -> (Vec<u8>, Vec<u8>) {
+    /// A millisecond, in NTP64 units (2^-32 s). Far more than the rounding between
+    /// a nanosecond `SystemTime` and an NTP64 fraction, far less than any window.
+    const WINDOW_SLACK: u64 = (1u64 << 32) / 1000;
+
+    let lower = match &range.start {
+        TimeBound::Inclusive(t) | TimeBound::Exclusive(t) => {
+            ntp_clamped(*t).saturating_sub(WINDOW_SLACK)
+        }
+        TimeBound::Unbounded => 0,
+    };
+    let upper = match &range.end {
+        TimeBound::Inclusive(t) | TimeBound::Exclusive(t) => {
+            ntp_clamped(*t).saturating_add(WINDOW_SLACK)
+        }
+        TimeBound::Unbounded => u64::MAX,
+    };
+
+    let mut start = key_range_start(key.as_bytes());
+    start.extend_from_slice(&lower.to_be_bytes());
+    // The lowest possible id, so every sample at `lower` is included.
+    start.extend_from_slice(&[0u8; 16]);
+
+    let mut end = key_range_start(key.as_bytes());
+    end.extend_from_slice(&upper.to_be_bytes());
+    // The highest possible id, so every sample at `upper` is included.
+    end.extend_from_slice(&[0xFFu8; 16]);
+
+    (start, end)
 }
 
 /// Split a composite key into its key bytes and its time, without allocating.
@@ -881,15 +925,18 @@ impl RedbStorage {
         let payloads_table = read_txn.open_table(HISTORY_PAYLOADS_TABLE)?;
         let info_table = read_txn.open_table(HISTORY_INFO_TABLE)?;
 
-        let (start, end) = history_key_bounds(key);
+        // Bounded to the window, not just to the key: a five-minute query on a key
+        // holding a year of samples reads five minutes of rows.
+        let (start, end) = history_window_bounds(key, range);
         let mut results = Vec::new();
 
-        for item in info_table.range(start.as_slice()..end.as_slice())? {
+        for item in info_table.range(start.as_slice()..=end.as_slice())? {
             let (key_bytes, info_bytes) = item?;
             let (_, timestamp) = decode_history_key(key_bytes.value())?;
 
-            // The scan is already bounded to this key; `contains` applies the
-            // bound's inclusivity, which the byte range cannot express.
+            // The scan is a slightly generous superset of the window; `contains`
+            // applies the exact bounds and their inclusivity, which the byte range
+            // cannot express.
             if !range.contains(timestamp.get_time().to_system_time()) {
                 continue;
             }
@@ -2889,6 +2936,87 @@ mod tests {
         );
     }
 
+    /// #37: a `_time` window must be a bounded scan of the table, not a scan of
+    /// the key's whole history filtered afterwards.
+    #[test]
+    fn a_time_window_reads_only_the_rows_of_that_window() {
+        let dir = TempDir::new().unwrap();
+        let id = TimestampId::rand();
+        let storage = bulk_storage(
+            RetentionPolicy {
+                max_age_secs: Some(u64::MAX),
+                ..Default::default()
+            },
+            &dir.path().join("window.redb"),
+        );
+
+        // 2000 samples a second apart ending 100s ago, and a neighbour that sorts
+        // right after `k`, which a sloppy upper bound would run into.
+        put_aged(&storage, "k", 2000, 100, b"x", id);
+        put_aged(&storage, "k/child", 50, 100, b"x", id);
+        let newest = storage
+            .get_range("k", &full_range())
+            .unwrap()
+            .last()
+            .map(|s| u64::from(s.timestamp.get_time().as_secs()))
+            .unwrap();
+        let secs = |s: u64| std::time::UNIX_EPOCH + Duration::from_secs(s);
+
+        // What the scan would touch for a window, counted straight off the table.
+        let rows_scanned = |range: &TimeRange<SystemTime>| {
+            let (start, end) = history_window_bounds("k", range);
+            let read_txn = storage.begin_read().unwrap();
+            let info = read_txn.open_table(HISTORY_INFO_TABLE).unwrap();
+            info.range(start.as_slice()..=end.as_slice())
+                .unwrap()
+                .count()
+        };
+
+        // The ten samples in [newest-9, newest].
+        let window = TimeRange {
+            start: TimeBound::Inclusive(secs(newest - 9)),
+            end: TimeBound::Inclusive(secs(newest)),
+        };
+        assert_eq!(storage.get_range("k", &window).unwrap().len(), 10);
+        assert_eq!(
+            rows_scanned(&window),
+            10,
+            "a 10-sample window on a 2000-sample key must read 10 rows"
+        );
+
+        // Exclusive bounds drop the two ends, and are still a bounded scan.
+        let exclusive = TimeRange {
+            start: TimeBound::Exclusive(secs(newest - 9)),
+            end: TimeBound::Exclusive(secs(newest)),
+        };
+        assert_eq!(storage.get_range("k", &exclusive).unwrap().len(), 8);
+        assert_eq!(rows_scanned(&exclusive), 10);
+
+        // Half-open windows.
+        let since = TimeRange {
+            start: TimeBound::Inclusive(secs(newest - 4)),
+            end: TimeBound::Unbounded,
+        };
+        assert_eq!(storage.get_range("k", &since).unwrap().len(), 5);
+        assert_eq!(rows_scanned(&since), 5, "must stop at the end of `k`");
+        let until = TimeRange {
+            start: TimeBound::Unbounded,
+            end: TimeBound::Exclusive(secs(newest - 1994)),
+        };
+        assert_eq!(storage.get_range("k", &until).unwrap().len(), 5);
+
+        // Unbounded is the whole key and nothing of its neighbour.
+        assert_eq!(storage.get_range("k", &full_range()).unwrap().len(), 2000);
+        assert_eq!(rows_scanned(&full_range()), 2000);
+
+        // Bounds an NTP64 cannot represent are clamped, not panicked on.
+        let absurd = TimeRange {
+            start: TimeBound::Inclusive(std::time::UNIX_EPOCH - Duration::from_secs(86400)),
+            end: TimeBound::Inclusive(secs(u64::from(u32::MAX) + 86400)),
+        };
+        assert_eq!(storage.get_range("k", &absurd).unwrap().len(), 2000);
+    }
+
     /// A policy that bounds nothing is not a policy.
     #[test]
     fn an_empty_retention_policy_is_not_bounded() {
@@ -2991,7 +3119,7 @@ mod tests {
         );
 
         // And the bounds cover exactly one key's rows.
-        let (start, end) = history_key_bounds("a/b");
+        let (start, end) = (key_range_start(b"a/b"), key_range_end(b"a/b"));
         assert!(start.as_slice() <= earlier.as_slice() && earlier.as_slice() < end.as_slice());
         assert!(start.as_slice() <= later.as_slice() && later.as_slice() < end.as_slice());
         assert!(

@@ -226,18 +226,20 @@ pub struct RedbStorageConfig {
     #[serde(default = "default_flush_interval_secs")]
     pub flush_interval_secs: u64,
 
-    /// Key expression prefix for this storage.
-    /// Only keys matching this prefix will be stored.
+    /// **Unused.** Nothing in this crate reads it. Which keys reach a storage is
+    /// decided by the storage manager from the storage's own `key_expr`, before the
+    /// backend is called. Kept so existing configs still deserialize.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_expr: Option<String>,
 
-    /// Whether to strip the key_expr prefix from stored keys.
-    /// Default is false (store full key).
+    /// **Unused.** Nothing in this crate reads it. Prefix stripping is done by the
+    /// storage manager (the storage's `strip_prefix`), which hands the backend keys
+    /// that are already stripped. Kept so existing configs still deserialize.
     #[serde(default)]
     pub strip_prefix: bool,
 
-    /// Table name within the database.
-    /// Default is "zenoh_kv"
+    /// **Unused.** The four tables have fixed names. Kept so existing configs
+    /// still deserialize.
     #[serde(default = "default_table_name")]
     pub table_name: String,
 
@@ -342,19 +344,28 @@ impl RedbStorageConfig {
         self
     }
 
-    /// Set the key expression prefix.
+    /// Has no effect; see [`RedbStorageConfig::key_expr`].
+    #[deprecated(
+        since = "0.5.0",
+        note = "never read: the storage manager filters keys before calling the backend"
+    )]
     pub fn with_key_expr(mut self, key_expr: String) -> Self {
         self.key_expr = Some(key_expr);
         self
     }
 
-    /// Set whether to strip the prefix from stored keys.
+    /// Has no effect; see [`RedbStorageConfig::strip_prefix`].
+    #[deprecated(
+        since = "0.5.0",
+        note = "never read: the storage manager strips the prefix before calling the backend"
+    )]
     pub fn with_strip_prefix(mut self, strip_prefix: bool) -> Self {
         self.strip_prefix = strip_prefix;
         self
     }
 
-    /// Set the table name.
+    /// Has no effect; see [`RedbStorageConfig::table_name`].
+    #[deprecated(since = "0.5.0", note = "never read: the tables have fixed names")]
     pub fn with_table_name(mut self, table_name: String) -> Self {
         self.table_name = table_name;
         self
@@ -579,12 +590,22 @@ mod tests {
     fn test_serde_roundtrip() {
         let config = RedbStorageConfig::new()
             .with_cache_size(1024)
-            .with_key_expr("demo/**".to_string());
+            .with_fsync(false)
+            .with_flush_interval_secs(30);
 
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: RedbStorageConfig = serde_json::from_str(&json).unwrap();
 
         assert_eq!(config.cache_size, deserialized.cache_size);
-        assert_eq!(config.key_expr, deserialized.key_expr);
+        assert_eq!(config.fsync, deserialized.fsync);
+        assert_eq!(config.flush_interval_secs, deserialized.flush_interval_secs);
+
+        // A config written by an earlier version, naming the fields nothing reads,
+        // still loads.
+        let old: RedbStorageConfig = serde_json::from_str(
+            r#"{ "key_expr": "demo/**", "strip_prefix": true, "table_name": "zenoh_kv" }"#,
+        )
+        .unwrap();
+        assert_eq!(old.key_expr.as_deref(), Some("demo/**"));
     }
 }

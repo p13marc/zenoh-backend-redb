@@ -55,5 +55,3 @@ zenoh_redb_storage/
 .env
 .env.local
 
-# 20 MB `act` binary — never needed in an image build context
-bin/

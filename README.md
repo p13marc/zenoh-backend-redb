@@ -79,7 +79,7 @@ Each storage instance can be individually configured:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `dir` | String | required | Database directory name (creates `<name>.redb`) |
+| `dir` | String | required | Database name: the file is `<dir>.redb` under the backend root. A dot in the name is kept (`telemetry.v1` → `telemetry.v1.redb`). |
 | `db_file` | String | - | Alternative to `dir`, explicit database filename |
 | `cache_size` | Number | `67108864` (64 MiB) | redb page-cache budget in bytes. See [Why `cache_size` has a default](#why-cache_size-has-a-default). |
 | `fsync` | Boolean | `true` | Every commit reaches the disk before it returns. See [Durability](#durability). |

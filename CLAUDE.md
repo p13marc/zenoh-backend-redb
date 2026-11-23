@@ -191,10 +191,10 @@ synchronous, it runs for every admin-space query, and redb's `Table::stats()` wa
 every page of the table. `RedbStorage::stats()` is the free half; `usage()` reads the
 whole database and is only called inline for files up to 64 MiB.
 
-Reads take no lock: every `RedbStorage` method takes `&self` and redb does its own
-concurrency control. An async mutex guards only the read-then-write in `put`/`delete`
-(the last-writer-wins comparison, which must be atomic), which is what lets the
-*synchronous* `get_admin_status` report live statistics.
+Nothing in the plugin layer takes a lock: every `RedbStorage` method takes `&self` and
+redb does its own concurrency control. `put`/`delete` do their last-writer-wins
+comparison and the write inside one redb write transaction, and redb admits one writer
+at a time, which is what makes that comparison atomic.
 
 ## Configuration
 
@@ -228,7 +228,7 @@ Backend is configured through Zenoh's storage_manager plugin:
 
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
-| `dir` | string | required | Database directory name (creates `<name>.redb`) |
+| `dir` | string | required | Database name; the file is `<dir>.redb`, with `.redb` *appended* (a dot in `dir` is kept) |
 | `db_file` | string | - | Alternative to dir, explicit filename |
 | `create_db` | bool | true | Create database if missing |
 | `read_only` | bool | false | Read-only mode |

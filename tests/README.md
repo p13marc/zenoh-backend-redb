@@ -25,6 +25,29 @@ Tests the plugin layer functionality, including:
 - Plugin exports and accessibility
 - Feature flag handling
 
+### `conformance_router_storage.rs` — the suite CI gates on
+The router-storage contract, asserted against a **real `zenohd`** with a redb volume
+under it, using the configs in `conformance/configs/`: a state doc outliving its
+publisher, a DELETE retiring it, `*` not reaching `@catalog`, blob chunks surviving
+their sensor, a fleet `@rpc` GET fanning in, every event record surviving, a
+`_time`-ranged GET and a retention pass.
+
+`#[ignore]`d, because it needs a `zenohd` built with the same rustc and Zenoh version
+as the plugin, in one cargo workspace. `just conformance` builds that pairing in a
+container; the `conformance` job in `.forgejo/workflows/ci.yml` builds it without one.
+This is the only test that proves the plugin *loads*.
+
+### `crash_durability.rs`
+What an `fsync: false` storage still has after the process is killed. Each case
+re-runs the test binary as a child that writes and then `abort()`s — a crash cannot
+be simulated in-process, because the file lock is only released by a dead process.
+
+### `retention_memory.rs`
+The heap growth of a retention pass over 100 000 samples, measured with a counting
+global allocator. It asserts a pass does not hold the history in memory. Ignored in a
+debug build (it takes minutes unoptimised): `just test-memory`, or
+`cargo test --release --test retention_memory`. CI runs it.
+
 ### `integration_zenohd.rs` 🚀 **End-to-End Test**
 Full integration test that spawns a real `zenohd` daemon with the redb backend plugin loaded.
 
