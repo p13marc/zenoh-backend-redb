@@ -206,10 +206,25 @@ pub struct RedbStorageConfig {
     #[serde(default = "default_cache_size")]
     pub cache_size: usize,
 
-    /// Whether to enable fsync for durability.
+    /// Whether every commit reaches the disk before it returns.
     /// Default is true for data safety.
+    ///
+    /// `false` trades that for write throughput: commits are made durable every
+    /// [`flush_interval_secs`](Self::flush_interval_secs) instead, so a crash
+    /// loses at most that many seconds of writes.
     #[serde(default = "default_true")]
     pub fsync: bool,
+
+    /// With `fsync: false`, the longest a commit stays unpersisted, in seconds.
+    /// Ignored with `fsync: true`, where every commit is durable.
+    ///
+    /// This exists because redb has no "eventually durable" level: a non-durable
+    /// commit is not persisted *at all* until a durable one follows, and redb
+    /// holds memory for each one until then. Without a bound, an `fsync: false`
+    /// storage lost everything since startup to a crash and grew without limit
+    /// while it ran. `0` makes every commit durable, the same as `fsync: true`.
+    #[serde(default = "default_flush_interval_secs")]
+    pub flush_interval_secs: u64,
 
     /// Key expression prefix for this storage.
     /// Only keys matching this prefix will be stored.
@@ -321,6 +336,12 @@ impl RedbStorageConfig {
         self
     }
 
+    /// Set how long a commit may stay unpersisted with `fsync: false`.
+    pub fn with_flush_interval_secs(mut self, secs: u64) -> Self {
+        self.flush_interval_secs = secs;
+        self
+    }
+
     /// Set the key expression prefix.
     pub fn with_key_expr(mut self, key_expr: String) -> Self {
         self.key_expr = Some(key_expr);
@@ -384,6 +405,7 @@ impl Default for RedbStorageConfig {
             db_path: None,
             cache_size: default_cache_size(),
             fsync: default_true(),
+            flush_interval_secs: default_flush_interval_secs(),
             key_expr: None,
             strip_prefix: false,
             table_name: default_table_name(),
@@ -398,6 +420,13 @@ impl Default for RedbStorageConfig {
 // Default value functions for serde
 fn default_cache_size() -> usize {
     DEFAULT_CACHE_SIZE
+}
+
+/// Default bound on unpersisted writes with `fsync: false`: 5 seconds.
+pub const DEFAULT_FLUSH_INTERVAL_SECS: u64 = 5;
+
+fn default_flush_interval_secs() -> u64 {
+    DEFAULT_FLUSH_INTERVAL_SECS
 }
 
 fn default_base_dir() -> PathBuf {
@@ -440,6 +469,8 @@ mod tests {
         assert_eq!(parsed.create_db, default.create_db);
         assert_eq!(parsed.table_name, default.table_name);
         assert_eq!(parsed.read_only, default.read_only);
+        assert_eq!(parsed.flush_interval_secs, default.flush_interval_secs);
+        assert_eq!(default.flush_interval_secs, DEFAULT_FLUSH_INTERVAL_SECS);
         assert!(default.fsync, "fsync must default to on");
         assert!(default.create_db, "create_db must default to on");
     }

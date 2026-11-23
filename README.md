@@ -82,7 +82,8 @@ Each storage instance can be individually configured:
 | `dir` | String | required | Database directory name (creates `<name>.redb`) |
 | `db_file` | String | - | Alternative to `dir`, explicit database filename |
 | `cache_size` | Number | `67108864` (64 MiB) | redb page-cache budget in bytes. See [Why `cache_size` has a default](#why-cache_size-has-a-default). |
-| `fsync` | Boolean | `true` | Enable fsync for durability |
+| `fsync` | Boolean | `true` | Every commit reaches the disk before it returns. See [Durability](#durability). |
+| `flush_interval_secs` | Number | `5` | With `fsync: false`, the longest a write stays unpersisted. Ignored with `fsync: true`. |
 | `create_db` | Boolean | `true` | Create database if it doesn't exist |
 | `read_only` | Boolean | `false` | Read-only mode |
 
@@ -142,10 +143,22 @@ spare (read-heavy: 200 MiB+); lower it on an edge node (10–50 MiB).
 ### Durability
 
 `fsync: true` (the default) maps to redb's `Durability::Immediate`: when a commit
-returns, the data is on disk. `fsync: false` maps to `Durability::None` — redb 4 removed
-the intermediate `Eventual` level, so the trade is sharper than the name suggests:
-commits are **not persisted at all** until some later durable commit lands. Reasonable
-for a cache or a replayable stream; wrong for a system of record.
+returns, the data is on disk. Every sample is one commit, so every sample is one
+`fsync`.
+
+`fsync: false` trades that for throughput, and the trade has a bound:
+**a crash loses at most `flush_interval_secs` (default 5) of writes.**
+
+The bound is this backend's doing, not redb's. `fsync: false` maps to
+`Durability::None`, and redb 4 has no level in between: a non-durable commit is
+**not persisted at all** until a durable one follows, and redb holds memory for
+each one until then. Left alone, a storage that never issued a durable commit would
+lose *everything written since it started* to a kill, and grow without limit while
+it ran. So with `fsync: false` the backend makes a commit durable whenever
+`flush_interval_secs` has passed since the last durable one, and a background thread
+flushes the tail when writes stop.
+
+A clean shutdown always persists everything, in either mode.
 
 ## History: `latest` and `all`
 
@@ -356,15 +369,19 @@ the GUI's storage panel read it; so can any `GET`.
   capability: { persistence: "durable", history: "latest" },
   db_path: "/var/lib/zenoh/redb/telemetry.redb",
   stats: {
+    // Free to read, computed for every query:
     on_disk_bytes:    41947136,   // the real file, from the filesystem
+    key_count:           10240,
+    sample_count:            0,   // history rows; 0 on a `latest` volume
+    // Need the tables read; see below:
     stored_bytes:     33554432,   // keys + values actually inserted
     metadata_bytes:    1048576,   // btree branch keys and redb metadata
-    fragmented_bytes:  7344128,   // what a compaction could reclaim
-    key_count:           10240,
+    fragmented_bytes:  7344128,   // unused space inside pages
     live_keys:           10100,
     tombstones:            140,
     oldest_timestamp: "...",
     newest_timestamp: "...",
+    usage_age_secs:          0,   // how old those seven are
     cache: {
       size_bytes:     67108864,
       used_bytes:     41943040,
@@ -382,8 +399,20 @@ lengths. The gap between `stored_bytes` and `on_disk_bytes` *is* the overhead an
 operator needs to see, and an estimate would hide exactly that.
 
 The number to watch is `evictions` climbing while `hit_ratio` sits flat: that is
-`cache_size` being smaller than the working set. `fragmented_bytes` growing without
-bound is the case for a compaction.
+`cache_size` being smaller than the working set.
+
+`stored_bytes + metadata_bytes + fragmented_bytes` is the live data: what the file
+would be after a compaction. The gap from there to `on_disk_bytes` is freed pages
+waiting to be reused.
+
+**An admin query never reads the database.** The seven "usage" fields can only be
+computed by walking every page of every table, which on a multi-gigabyte storage is a
+multi-gigabyte read. So:
+
+- up to 64 MiB on disk, they are computed for the query and `usage_age_secs` is `0`;
+- above that, they come from a snapshot. A query that finds it missing or more than
+  60 s old asks a background thread for a new one and returns what it has, so the
+  first query after startup shows them as `null` and the next shows them filled in.
 
 ## Usage Examples
 

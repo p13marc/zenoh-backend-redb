@@ -59,8 +59,10 @@
             dir: "sensor_data",
             create_db: true,
 
-            // Disable fsync for better write performance (less durable)
+            // Do not fsync every commit. Writes are made durable every
+            // flush_interval_secs instead, so a crash loses at most that much.
             fsync: false,
+            flush_interval_secs: 5,
 
             // Set cache size to 100MB for better read performance
             cache_size: 104857600,
@@ -135,7 +137,9 @@
 //   - read_only (optional, default: false): Open in read-only mode
 //   - cache_size (optional, default 67108864 = 64 MiB): redb page-cache budget
 //     in bytes. Never redb's own default, which is 1 GiB — see README.
-//   - fsync (optional, default: true): Enable fsync for durability
+//   - fsync (optional, default: true): fsync every commit
+//   - flush_interval_secs (optional, default: 5): with fsync: false, the longest
+//     a write stays unpersisted. Ignored with fsync: true.
 //
 // Storage-level:
 //   - key_expr (required): Key expression pattern to subscribe to

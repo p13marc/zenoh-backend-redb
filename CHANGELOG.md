@@ -31,7 +31,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   retention for that storage without a word. Cutoffs now saturate, and a pass that
   panics is logged and does not stop the next one.
 
+- **`fsync: false` was never made durable, and leaked memory on every write**
+  (#35). It mapped every commit to `Durability::None` and nothing ever issued a
+  durable one, so a kill lost everything written since the storage was opened, and
+  redb's record of each non-durable commit (about 40 bytes) accumulated until
+  restart. A commit is now promoted to durable every `flush_interval_secs` (new,
+  default 5), and a background thread flushes the tail when writes stop. A crash
+  loses at most that interval; memory is flat.
+- **Every admin-space query read the entire database** (#36). `get_admin_status`
+  walked every page of all four tables and scanned the metadata table, synchronously,
+  per query. It now reports the free numbers (file size, key and sample counts, cache)
+  directly, and the rest from a snapshot computed on a background thread once the
+  file is over 64 MiB. `usage_age_secs` says how old that snapshot is.
+
 ### Changed
+- **Breaking (API):** `RedbStorage::stats()` is O(1) and `StorageStats` loses
+  `stored_bytes`, `metadata_bytes`, `fragmented_bytes`, `live_keys`, `tombstones`,
+  `oldest_timestamp` and `newest_timestamp`. They moved to `StorageUsage`, returned by
+  the new `RedbStorage::usage()`, which reads the whole database. The admin-space JSON
+  keeps the same keys, plus `usage_age_secs`; on a storage over 64 MiB they are `null`
+  until the first snapshot.
+- New: `RedbStorageConfig::flush_interval_secs` / `with_flush_interval_secs`,
+  `RedbStorage::flush`, `RedbStorage::has_unflushed_writes`, and the
+  `flush_interval_secs` storage property.
+- The table-creation commit when a storage is opened is always durable.
+- Every storage now has one background thread, not only `all`-mode ones.
 - **Breaking (config):** an unknown field inside `retention` or `retention.decimate`
   is now a startup error (#38). `max_byte: ...` used to parse as "no size limit".
   `interval_secs: 0` and `decimate.bucket_secs: 0` are rejected too.

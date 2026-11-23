@@ -184,6 +184,13 @@ zenohd. See the Version compatibility section of README.md.
 2. **RedbVolume** -> implements `Volume`, creates RedbStoragePlugin instances
 3. **RedbStoragePlugin** -> implements `Storage`, holds `Arc<RedbStorage>`
 
+One background OS thread per storage (`spawn_background` in plugin.rs) does everything
+that must not happen on the request path: retention passes, flushing an `fsync: false`
+storage, and computing `StorageUsage`. **`get_admin_status` must stay O(1)**: it is
+synchronous, it runs for every admin-space query, and redb's `Table::stats()` walks
+every page of the table. `RedbStorage::stats()` is the free half; `usage()` reads the
+whole database and is only called inline for files up to 64 MiB.
+
 Reads take no lock: every `RedbStorage` method takes `&self` and redb does its own
 concurrency control. An async mutex guards only the read-then-write in `put`/`delete`
 (the last-writer-wins comparison, which must be atomic), which is what lets the
@@ -226,7 +233,8 @@ Backend is configured through Zenoh's storage_manager plugin:
 | `create_db` | bool | true | Create database if missing |
 | `read_only` | bool | false | Read-only mode |
 | `cache_size` | number | `67108864` (64 MiB) | redb page-cache budget in bytes (never redb’s own 1 GiB default) |
-| `fsync` | bool | true | `Durability::Immediate` vs `Durability::None` (redb 4 dropped `Eventual`, so `false` means *not persisted* until a later durable commit) |
+| `fsync` | bool | true | `Durability::Immediate` vs `Durability::None`. redb 4 has no level between, and a non-durable commit is not persisted *at all* until a durable one follows, so with `false` the backend promotes a commit to durable every `flush_interval_secs` |
+| `flush_interval_secs` | number | `5` | With `fsync: false`, the longest a write stays unpersisted (and the longest redb accumulates per-commit memory). Ignored with `fsync: true` |
 | `retention` | object | - | Required for `all`-mode storages. `max_age_secs`, `max_bytes`, `max_samples_per_key`, `decimate`, `interval_secs` |
 
 Volume-level:

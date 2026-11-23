@@ -10,8 +10,9 @@ use redb::{
 };
 use std::cell::RefCell;
 use std::path::Path;
-use std::sync::RwLock;
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{debug, info, trace, warn};
 use zenoh::bytes::{Encoding, ZBytes};
 use zenoh::internal::buffers::ZSlice;
@@ -246,39 +247,28 @@ pub struct RetentionPass {
     pub compacted: bool,
 }
 
-/// A point-in-time report of what a storage costs.
+/// What a storage costs right now, from numbers that are free to read.
 ///
 /// Returned by [`RedbStorage::stats`] and rendered onto the Zenoh admin space, where
 /// `zenctl storage list` and the GUI's storage panel can read it. An operator could
 /// previously see that a storage *existed* but not what it was consuming — and three
 /// of the four things that went wrong on the target fleet this year were "something
 /// grew and nobody was watching the number".
+///
+/// Everything here is O(1): a `stat` of the file, counts redb keeps in its tree
+/// roots, and the cache counters. What needs the tables read is in
+/// [`StorageUsage`].
 #[derive(Debug, Clone)]
 pub struct StorageStats {
     /// Size of the database file on disk, from the filesystem. `None` if the path is
     /// not known or cannot be stat'ed.
     pub on_disk_bytes: Option<u64>,
-    /// Bytes of keys and values actually inserted, excluding indexing overhead.
-    pub stored_bytes: u64,
-    /// Bytes of btree branch keys and other redb metadata.
-    pub metadata_bytes: u64,
-    /// Bytes lost to fragmentation. The gap between this plus the two above and
-    /// `on_disk_bytes` is what a compaction could reclaim.
-    pub fragmented_bytes: u64,
     /// Rows in the metadata table, tombstones included. One per key.
     pub key_count: u64,
     /// Individual samples retained. Zero in [`HistoryMode::Latest`], where a key
     /// *is* its only sample; in [`HistoryMode::All`] this is the number that
     /// actually grows, and the one retention bounds.
     pub sample_count: u64,
-    /// Keys with a live value.
-    pub live_keys: u64,
-    /// Keys holding a deletion tombstone.
-    pub tombstones: u64,
-    /// Oldest timestamp held, tombstones included.
-    pub oldest_timestamp: Option<Timestamp>,
-    /// Newest timestamp held, tombstones included.
-    pub newest_timestamp: Option<Timestamp>,
     /// Configured page-cache budget.
     pub cache_size_bytes: usize,
     /// Bytes currently held in the page cache.
@@ -298,6 +288,33 @@ impl StorageStats {
         let total = self.cache_read_hits + self.cache_read_misses;
         (total > 0).then(|| self.cache_read_hits as f64 / total as f64)
     }
+}
+
+/// What a storage's tables hold, which can only be learned by reading them.
+///
+/// Returned by [`RedbStorage::usage`]. **Computing it reads the whole database**:
+/// redb's table statistics walk every page of every table, and the key counts scan
+/// the metadata table. On a multi-gigabyte storage that is a multi-gigabyte read,
+/// so the plugin computes it on a background thread and serves a snapshot rather
+/// than doing it inside an admin-space query.
+#[derive(Debug, Clone)]
+pub struct StorageUsage {
+    /// Bytes of keys and values actually inserted, excluding indexing overhead.
+    pub stored_bytes: u64,
+    /// Bytes of btree branch keys and other redb metadata.
+    pub metadata_bytes: u64,
+    /// Bytes lost to fragmentation inside pages. These three together are the live
+    /// data: what the file would be after a compaction. The gap from there to
+    /// `on_disk_bytes` is what a compaction would reclaim.
+    pub fragmented_bytes: u64,
+    /// Keys with a live value.
+    pub live_keys: u64,
+    /// Keys holding a deletion tombstone.
+    pub tombstones: u64,
+    /// Oldest timestamp held, tombstones included.
+    pub oldest_timestamp: Option<Timestamp>,
+    /// Newest timestamp held, tombstones included.
+    pub newest_timestamp: Option<Timestamp>,
 }
 
 /// Metadata associated with a stored value.
@@ -433,6 +450,15 @@ pub struct RedbStorage {
 
     /// Storage name for logging
     name: String,
+
+    /// When the last durable commit landed. Only consulted with `fsync: false`,
+    /// where it decides which commits are promoted to durable; see
+    /// [`RedbStorage::commit`].
+    last_durable: Mutex<Instant>,
+
+    /// Whether anything has been committed non-durably since then, i.e. whether a
+    /// [`RedbStorage::flush`] has work to do.
+    unflushed: AtomicBool,
 }
 
 impl RedbStorage {
@@ -503,31 +529,74 @@ impl RedbStorage {
         Ok(self.db().begin_read()?)
     }
 
-    /// Apply the configured durability to a write transaction.
+    /// Begin a write transaction. Its durability is decided when it is committed,
+    /// by [`RedbStorage::commit`].
+    fn begin_write(&self) -> Result<redb::WriteTransaction> {
+        Ok(self.db().begin_write()?)
+    }
+
+    /// Commit a write transaction with the configured durability.
     ///
     /// `fsync: true` (the default) is `Durability::Immediate`: a commit that returns
-    /// has reached the disk. `fsync: false` is `Durability::None` — redb 4 removed
-    /// the intermediate `Eventual` level, so the trade is sharper than the config
-    /// name suggests: commits are not persisted at all until some later durable
-    /// commit lands. Fine for a cache or a replayable stream, wrong for a system of
-    /// record.
-    fn apply_durability(
-        txn: &mut redb::WriteTransaction,
-        config: &RedbStorageConfig,
-    ) -> Result<()> {
-        txn.set_durability(if config.fsync {
+    /// has reached the disk.
+    ///
+    /// `fsync: false` is `Durability::None`, and redb 4 has no level in between: a
+    /// non-durable commit is visible to every later read but is **not persisted at
+    /// all** until some later durable commit lands. Left at that, a storage that
+    /// never issued one would lose everything written since it was opened to a
+    /// crash — and would leak memory while it ran, because redb keeps a record of
+    /// every non-durable commit until the next durable one.
+    ///
+    /// So with `fsync: false` this promotes a commit to durable whenever
+    /// `flush_interval_secs` has passed since the last durable one. That bounds
+    /// both: a crash loses at most that many seconds of writes, and redb's pending
+    /// state is cleared that often. [`RedbStorage::flush`] covers the tail when
+    /// writes stop.
+    fn commit(&self, mut txn: redb::WriteTransaction) -> Result<()> {
+        let durable = self.config.fsync || self.flush_is_due();
+        txn.set_durability(if durable {
             Durability::Immediate
         } else {
             Durability::None
         })?;
+        txn.commit()?;
+
+        if durable {
+            self.mark_durable();
+        } else {
+            self.unflushed.store(true, Ordering::Release);
+        }
         Ok(())
     }
 
-    /// Begin a write transaction with the configured durability applied.
-    fn begin_write(&self) -> Result<redb::WriteTransaction> {
-        let mut txn = self.db().begin_write()?;
-        Self::apply_durability(&mut txn, &self.config)?;
-        Ok(txn)
+    /// Has `flush_interval_secs` passed since the last durable commit?
+    fn flush_is_due(&self) -> bool {
+        let last = *self.last_durable.lock().unwrap_or_else(|e| e.into_inner());
+        last.elapsed() >= Duration::from_secs(self.config.flush_interval_secs)
+    }
+
+    fn mark_durable(&self) {
+        *self.last_durable.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        self.unflushed.store(false, Ordering::Release);
+    }
+
+    /// Make everything committed so far durable.
+    ///
+    /// Only does anything on an `fsync: false` storage with commits that have not
+    /// reached the disk yet; returns whether it had to. The plugin calls this on a
+    /// timer, so that the last writes before a quiet period do not stay
+    /// unpersisted until the next write happens to come along.
+    pub fn flush(&self) -> Result<bool> {
+        if self.config.read_only || !self.unflushed.load(Ordering::Acquire) {
+            return Ok(false);
+        }
+        // An empty durable commit publishes every non-durable one before it.
+        let mut txn = self.begin_write()?;
+        txn.set_durability(Durability::Immediate)?;
+        txn.commit()?;
+        self.mark_durable();
+        trace!("Flushed '{}'", self.name);
+        Ok(true)
     }
 
     /// Create a new RedbStorage instance.
@@ -537,8 +606,11 @@ impl RedbStorage {
         let db = Self::open_database(path.as_ref(), &config)?;
 
         // Initialize both tables
+        // Durable whatever `fsync` says: this runs once, and it gives an
+        // `fsync: false` storage a durable starting point to count its flush
+        // interval from.
         let mut write_txn = db.begin_write()?;
-        Self::apply_durability(&mut write_txn, &config)?;
+        write_txn.set_durability(Durability::Immediate)?;
         {
             // Create both tables if they don't exist
             write_txn.open_table(PAYLOADS_TABLE)?;
@@ -557,6 +629,8 @@ impl RedbStorage {
             db: RwLock::new(db),
             config,
             name,
+            last_durable: Mutex::new(Instant::now()),
+            unflushed: AtomicBool::new(false),
         })
     }
 
@@ -643,7 +717,7 @@ impl RedbStorage {
                     WriteOutcome::Inserted
                 };
             }
-            write_txn.commit()?;
+            self.commit(write_txn)?;
 
             debug!("Stored key: {}", key);
             Ok(outcome)
@@ -785,7 +859,7 @@ impl RedbStorage {
                     WriteOutcome::Inserted
                 };
             }
-            write_txn.commit()?;
+            self.commit(write_txn)?;
 
             debug!("Deleted key: {}", key);
             Ok(outcome)
@@ -1216,7 +1290,7 @@ impl RedbStorage {
                     }
                 }
             }
-            write_txn.commit()?;
+            self.commit(write_txn)?;
         }
 
         Ok(dropped)
@@ -1468,19 +1542,38 @@ impl RedbStorage {
         Ok(Some(NTP64(hi)))
     }
 
-    /// What this storage costs, for the admin space.
+    /// What this storage costs, from numbers that are free to read.
     ///
-    /// Sizes come from redb and the filesystem, never from adding up key and value
-    /// lengths: the gap between "bytes I stored" and "bytes on disk" is exactly the
-    /// fragmentation and metadata overhead an operator needs to see, and an
-    /// estimate would hide it. `on_disk_bytes` is the real file.
+    /// Cheap enough to call from inside an admin-space query, which is where it is
+    /// called from. See [`RedbStorage::usage`] for the rest.
     pub fn stats(&self) -> Result<StorageStats> {
-        let read_txn = self.begin_read()?;
-        let payloads_table = read_txn.open_table(PAYLOADS_TABLE)?;
-        let data_info_table = read_txn.open_table(DATA_INFO_TABLE)?;
+        let cache = self.db().cache_stats();
 
-        let history_payloads = read_txn.open_table(HISTORY_PAYLOADS_TABLE)?;
-        let history_info = read_txn.open_table(HISTORY_INFO_TABLE)?;
+        let read_txn = self.begin_read()?;
+        let key_count = read_txn.open_table(DATA_INFO_TABLE)?.len()?;
+        let sample_count = read_txn.open_table(HISTORY_INFO_TABLE)?.len()?;
+
+        Ok(StorageStats {
+            on_disk_bytes: self.on_disk_bytes(),
+            key_count,
+            sample_count,
+            cache_size_bytes: self.config.cache_size,
+            cache_used_bytes: cache.used_bytes(),
+            cache_read_hits: cache.read_hits(),
+            cache_read_misses: cache.read_misses(),
+            cache_evictions: cache.evictions(),
+        })
+    }
+
+    /// What the tables hold. **Reads the whole database** — see [`StorageUsage`].
+    ///
+    /// Sizes come from redb, never from adding up key and value lengths: the gap
+    /// between "bytes I stored" and "bytes on disk" is exactly the fragmentation
+    /// and metadata overhead an operator needs to see, and an estimate would hide
+    /// it.
+    pub fn usage(&self) -> Result<StorageUsage> {
+        let read_txn = self.begin_read()?;
+        let data_info_table = read_txn.open_table(DATA_INFO_TABLE)?;
 
         // All four tables, not just the latest-value pair. An `all`-mode storage
         // keeps almost everything in the history tables, so counting only the
@@ -1489,16 +1582,14 @@ impl RedbStorage {
         // what a compaction could reclaim, it would claim nearly the whole file is
         // reclaimable when almost none of it is.
         let table_stats = [
-            payloads_table.stats()?,
+            read_txn.open_table(PAYLOADS_TABLE)?.stats()?,
             data_info_table.stats()?,
-            history_payloads.stats()?,
-            history_info.stats()?,
+            read_txn.open_table(HISTORY_PAYLOADS_TABLE)?.stats()?,
+            read_txn.open_table(HISTORY_INFO_TABLE)?.stats()?,
         ];
         let stored_bytes: u64 = table_stats.iter().map(|s| s.stored_bytes()).sum();
         let metadata_bytes: u64 = table_stats.iter().map(|s| s.metadata_bytes()).sum();
         let fragmented_bytes: u64 = table_stats.iter().map(|s| s.fragmented_bytes()).sum();
-
-        let cache = self.db().cache_stats();
 
         // Scan the metadata table for the timestamp span and the live/tombstone
         // split. This is the one number that cannot come from redb.
@@ -1522,30 +1613,21 @@ impl RedbStorage {
             }
         }
 
-        let on_disk_bytes = self
-            .config
-            .db_path
-            .as_ref()
-            .and_then(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len());
-
-        Ok(StorageStats {
-            on_disk_bytes,
+        Ok(StorageUsage {
             stored_bytes,
             metadata_bytes,
             fragmented_bytes,
-            key_count: data_info_table.len()?,
-            sample_count: history_info.len()?,
             live_keys,
             tombstones,
             oldest_timestamp: oldest,
             newest_timestamp: newest,
-            cache_size_bytes: self.config.cache_size,
-            cache_used_bytes: cache.used_bytes(),
-            cache_read_hits: cache.read_hits(),
-            cache_read_misses: cache.read_misses(),
-            cache_evictions: cache.evictions(),
         })
+    }
+
+    /// Whether an `fsync: false` storage holds commits that have not reached the
+    /// disk yet.
+    pub fn has_unflushed_writes(&self) -> bool {
+        self.unflushed.load(Ordering::Acquire)
     }
 
     /// Every live key and its timestamp, without reading a single payload.
@@ -1716,7 +1798,7 @@ impl RedbStorage {
             write_txn.open_table(HISTORY_PAYLOADS_TABLE)?;
             write_txn.open_table(HISTORY_INFO_TABLE)?;
         }
-        write_txn.commit()?;
+        self.commit(write_txn)?;
 
         info!("Storage cleared");
         Ok(())
@@ -2048,13 +2130,14 @@ mod tests {
         }
 
         let stats = storage.stats().unwrap();
+        let usage = storage.usage().unwrap();
 
         assert_eq!(stats.key_count, 1, "one key");
         assert_eq!(stats.sample_count, 20, "twenty samples under it");
         assert!(
-            stats.stored_bytes >= 20 * 1024,
+            usage.stored_bytes >= 20 * 1024,
             "stored_bytes must cover the history, not just the latest value: {}",
-            stats.stored_bytes
+            usage.stored_bytes
         );
     }
 
@@ -2748,6 +2831,62 @@ mod tests {
             assert_eq!(pass.samples_dropped, 0, "max_age_secs: {huge}");
             assert_eq!(storage.get_range("k", &full_range()).unwrap().len(), 100);
         }
+    }
+
+    /// #35: which commits of an `fsync: false` storage are durable.
+    #[test]
+    fn fsync_false_commits_are_made_durable_on_an_interval() {
+        let temp = TempDir::new().unwrap();
+        let id = TimestampId::rand();
+        let open = |name: &str, fsync: bool, flush_interval_secs: u64| {
+            let path = temp.path().join(name);
+            let config = RedbStorageConfig::default()
+                .with_db_path(path.clone())
+                .with_fsync(fsync)
+                .with_flush_interval_secs(flush_interval_secs);
+            RedbStorage::new(path, config, name.to_string()).unwrap()
+        };
+        let put = |storage: &RedbStorage, n: u64| {
+            storage
+                .put(
+                    &format!("k/{n}"),
+                    StoredValue::new(b"v".to_vec(), at(100 + n, id), Encoding::ZENOH_BYTES),
+                )
+                .unwrap();
+        };
+
+        // `fsync: true`: every commit is durable, there is never anything to flush.
+        let durable = open("durable.redb", true, 3600);
+        put(&durable, 1);
+        assert!(!durable.has_unflushed_writes());
+        assert!(!durable.flush().unwrap());
+
+        // `fsync: false` inside the interval: not durable until flushed.
+        let lazy = open("lazy.redb", false, 3600);
+        assert!(!lazy.has_unflushed_writes(), "opening is durable");
+        put(&lazy, 1);
+        put(&lazy, 2);
+        assert!(lazy.has_unflushed_writes());
+        assert!(lazy.flush().unwrap());
+        assert!(!lazy.has_unflushed_writes());
+        assert!(!lazy.flush().unwrap(), "a second flush has nothing to do");
+        assert_eq!(lazy.count().unwrap(), 2, "a flush changes nothing visible");
+
+        // An interval of 0 has always passed: every commit is promoted.
+        let eager = open("eager.redb", false, 0);
+        put(&eager, 1);
+        assert!(!eager.has_unflushed_writes());
+
+        // And once a real interval has passed, the next commit is the durable one.
+        let timed = open("timed.redb", false, 1);
+        put(&timed, 1);
+        assert!(timed.has_unflushed_writes());
+        std::thread::sleep(Duration::from_millis(1100));
+        put(&timed, 2);
+        assert!(
+            !timed.has_unflushed_writes(),
+            "the first commit after the interval carries the earlier ones to disk"
+        );
     }
 
     /// A policy that bounds nothing is not a policy.

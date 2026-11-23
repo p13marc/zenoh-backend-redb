@@ -6,13 +6,15 @@
 use crate::backend::RedbBackend;
 use crate::config::{HistoryMode, RedbBackendConfig, RedbStorageConfig, RetentionPolicy};
 
-use crate::storage::{RedbStorage, RetentionPass, StoredValue, WriteOutcome};
+use crate::storage::{RedbStorage, RetentionPass, StorageUsage, StoredValue, WriteOutcome};
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{debug, info, warn};
 use zenoh::{
     Result as ZResult,
@@ -44,6 +46,7 @@ pub const PROP_STORAGE_CREATE_DB: &str = "create_db";
 pub const PROP_STORAGE_READ_ONLY: &str = "read_only";
 pub const PROP_STORAGE_CACHE_SIZE: &str = "cache_size";
 pub const PROP_STORAGE_FSYNC: &str = "fsync";
+pub const PROP_STORAGE_FLUSH_INTERVAL: &str = "flush_interval_secs";
 pub const PROP_STORAGE_RETENTION: &str = "retention";
 
 // Volume configuration properties
@@ -52,10 +55,41 @@ pub const PROP_VOLUME_HISTORY: &str = "history";
 // Special key for None (when the prefix being stripped exactly matches the key)
 pub const NONE_KEY: &str = "@@none_key@@";
 
-/// Run retention on an interval until the storage is dropped.
+/// A storage whose file is at most this big has its [`StorageUsage`] computed
+/// inside the admin query that asks for it: the walk fits in the default page
+/// cache and takes milliseconds. Above it, the query is served a snapshot.
+const INLINE_USAGE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// How old a usage snapshot may get before an admin query asks for a new one.
+const USAGE_MAX_AGE: Duration = Duration::from_secs(60);
+
+/// What the storage and its background thread both touch.
+#[derive(Default)]
+struct Shared {
+    /// Result of the most recent retention pass, for the admin space.
+    last_pass: Mutex<RetentionPass>,
+    /// The most recent [`StorageUsage`], and when it was taken.
+    usage: Mutex<Option<(StorageUsage, Instant)>>,
+    /// A refresh has been asked for and not finished. Keeps a dashboard polling
+    /// the admin space from queueing a tree walk per poll.
+    usage_refresh_pending: AtomicBool,
+}
+
+/// What the storage asks its background thread to do.
+enum Request {
+    /// Recompute the usage snapshot.
+    RefreshUsage,
+}
+
+/// Everything a storage does off the request path, on one thread, until the
+/// storage is dropped:
 ///
-/// Enforcement is periodic rather than per-write: a scan on the PUT path would make
-/// every write pay for a policy that only needs checking occasionally.
+/// * **retention**, every `retention_interval` — a scan on the PUT path would make
+///   every write pay for a policy that only needs checking occasionally;
+/// * **flushing** an `fsync: false` storage, every `flush_interval`, so the last
+///   writes before a quiet period reach the disk without waiting for the next one;
+/// * **usage statistics**, when an admin query asks — computing them reads the
+///   whole database, which is not something to do inside that query.
 ///
 /// This is a plain OS thread, deliberately. The obvious implementation —
 /// `tokio::task::spawn` — panics: `Volume::create_storage` is not called from
@@ -65,40 +99,79 @@ pub const NONE_KEY: &str = "@@none_key@@";
 /// a runtime is always present.) A thread also suits the work, which is blocking
 /// by nature — it scans tables and compacts the file.
 ///
-/// `recv_timeout` doubles as the interval and the shutdown wait, so `Drop` stops
-/// the thread promptly instead of leaving it sleeping out its interval.
-fn spawn_retention_task(
+/// `recv_timeout` doubles as the timer and the shutdown wait, so dropping the
+/// storage (and with it the sender) stops the thread promptly instead of leaving it
+/// sleeping out an interval.
+fn spawn_background(
     storage: Arc<RedbStorage>,
-    last_pass: Arc<std::sync::Mutex<RetentionPass>>,
-    shutdown: std::sync::mpsc::Receiver<()>,
-    interval: Duration,
+    shared: Arc<Shared>,
+    requests: Receiver<Request>,
+    retention_interval: Option<Duration>,
+    flush_interval: Option<Duration>,
     name: String,
 ) {
     std::thread::Builder::new()
-        .name(format!("redb-retention-{name}"))
+        .name(format!("redb-{name}"))
         .spawn(move || {
-            info!(
-                "Retention task for '{}' running every {}s",
-                name,
-                interval.as_secs()
-            );
+            if let Some(interval) = retention_interval {
+                info!(
+                    "Retention for '{}' running every {}s",
+                    name,
+                    interval.as_secs()
+                );
+            }
+            let started = Instant::now();
+            let mut next_retention = retention_interval.map(|i| started + i);
+            let mut next_flush = flush_interval.map(|i| started + i);
+
             loop {
-                match shutdown.recv_timeout(interval) {
-                    // Told to stop, or the storage was dropped and the sender with
-                    // it. Either way there is nothing left to retain.
-                    Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        debug!("Retention task for '{}' stopping", name);
+                let request = match [next_retention, next_flush].into_iter().flatten().min() {
+                    Some(deadline) => {
+                        requests.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    }
+                    // Nothing on a timer: sleep until asked, or until dropped.
+                    None => requests.recv().map_err(|_| RecvTimeoutError::Disconnected),
+                };
+                match request {
+                    Ok(Request::RefreshUsage) => {
+                        match storage.usage() {
+                            Ok(usage) => {
+                                *shared.usage.lock().unwrap_or_else(|e| e.into_inner()) =
+                                    Some((usage, Instant::now()));
+                            }
+                            Err(e) => warn!("Failed to collect usage of '{}': {}", name, e),
+                        }
+                        shared.usage_refresh_pending.store(false, Ordering::Release);
+                    }
+                    // The storage was dropped and the sender with it. There is
+                    // nothing left to maintain.
+                    Err(RecvTimeoutError::Disconnected) => {
+                        debug!("Background thread for '{}' stopping", name);
                         return;
                     }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Timeout) => {}
                 }
 
-                if let Some(pass) = run_pass(&name, || storage.enforce_retention()) {
-                    *last_pass.lock().unwrap_or_else(|e| e.into_inner()) = pass;
+                let now = Instant::now();
+                if let Some(interval) = flush_interval
+                    && next_flush.is_some_and(|at| now >= at)
+                {
+                    if let Err(e) = storage.flush() {
+                        warn!("Flushing '{}' failed: {}", name, e);
+                    }
+                    next_flush = Some(Instant::now() + interval);
+                }
+                if let Some(interval) = retention_interval
+                    && next_retention.is_some_and(|at| now >= at)
+                {
+                    if let Some(pass) = run_pass(&name, || storage.enforce_retention()) {
+                        *shared.last_pass.lock().unwrap_or_else(|e| e.into_inner()) = pass;
+                    }
+                    next_retention = Some(Instant::now() + interval);
                 }
             }
         })
-        .expect("spawn retention thread");
+        .expect("spawn storage background thread");
 }
 
 /// Run one retention pass, containing whatever goes wrong in it.
@@ -318,6 +391,19 @@ impl Volume for RedbVolume {
             }
         };
 
+        // Parse flush_interval_secs property
+        let flush_interval_secs = match volume_cfg.get(PROP_STORAGE_FLUSH_INTERVAL) {
+            None => None,
+            Some(serde_json::Value::Number(n)) if n.as_u64().is_some() => n.as_u64(),
+            _ => {
+                bail!(
+                    "Optional property `{}` of redb storage configurations must be a \
+                     non-negative whole number of seconds",
+                    PROP_STORAGE_FLUSH_INTERVAL
+                )
+            }
+        };
+
         // Parse cache_size property
         let cache_size = match volume_cfg.get(PROP_STORAGE_CACHE_SIZE) {
             None => None,
@@ -372,6 +458,9 @@ impl Volume for RedbVolume {
 
         if let Some(size) = cache_size {
             storage_config = storage_config.with_cache_size(size);
+        }
+        if let Some(secs) = flush_interval_secs {
+            storage_config = storage_config.with_flush_interval_secs(secs);
         }
         storage_config = storage_config.with_history(self.history);
 
@@ -449,30 +538,11 @@ impl Volume for RedbVolume {
 
         info!("Created redb storage '{}' at {:?}", storage_name, db_path);
 
-        let storage = Arc::new(redb_storage);
-        let last_pass = Arc::new(std::sync::Mutex::new(RetentionPass::default()));
-        // Dropping this sender stops the retention thread, so the storage owns its
-        // task's lifetime without needing an explicit shutdown handshake.
-        let (shutdown, shutdown_rx) = std::sync::mpsc::channel();
-
-        if let Some(policy) = &retention {
-            spawn_retention_task(
-                storage.clone(),
-                last_pass.clone(),
-                shutdown_rx,
-                Duration::from_secs(policy.interval_secs.max(1)),
-                storage_name.clone(),
-            );
-        }
-
-        Ok(Box::new(RedbStoragePlugin {
+        Ok(Box::new(RedbStoragePlugin::new(
             config,
-            storage,
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            Arc::new(redb_storage),
             storage_config,
-            last_retention_pass: last_pass,
-            shutdown,
-        }))
+        )))
     }
 }
 
@@ -489,14 +559,105 @@ struct RedbStoragePlugin {
     /// has to be atomic or two concurrent writers can each decide they are newer.
     write_lock: Arc<tokio::sync::Mutex<()>>,
     storage_config: RedbStorageConfig,
-    /// Result of the most recent retention pass, for the admin space. A std mutex
-    /// because `get_admin_status` is synchronous and the critical section is a
-    /// struct copy.
-    last_retention_pass: Arc<std::sync::Mutex<RetentionPass>>,
-    /// Stops the retention thread: dropping this sender disconnects the channel it
-    /// is waiting on.
-    #[allow(dead_code)]
-    shutdown: std::sync::mpsc::Sender<()>,
+    /// What the background thread reports back: the last retention pass and the
+    /// usage snapshot. Std mutexes inside, because `get_admin_status` is
+    /// synchronous and each critical section is a struct copy.
+    shared: Arc<Shared>,
+    /// Requests to the background thread. Dropping it — which happens when this
+    /// struct drops — is what stops the thread.
+    requests: Sender<Request>,
+    /// File size up to which usage is computed inside the admin query. A field
+    /// only so a test can exercise the snapshot path without a 64 MiB database.
+    inline_usage_max_bytes: u64,
+}
+
+impl RedbStoragePlugin {
+    /// Wrap an open storage and start its background thread.
+    fn new(
+        config: StorageConfig,
+        storage: Arc<RedbStorage>,
+        storage_config: RedbStorageConfig,
+    ) -> Self {
+        let shared = Arc::new(Shared::default());
+        let (requests, requests_rx) = std::sync::mpsc::channel();
+
+        let writable = !storage_config.read_only;
+        let retention_interval = storage_config
+            .retention
+            .as_ref()
+            .filter(|_| writable)
+            .map(|policy| Duration::from_secs(policy.interval_secs.max(1)));
+        // Only an `fsync: false` storage has anything to flush. At least a second
+        // between flushes: `flush_interval_secs: 0` already makes every commit
+        // durable, so the timer would find nothing and need not spin.
+        let flush_interval = (writable && !storage_config.fsync)
+            .then(|| Duration::from_secs(storage_config.flush_interval_secs.max(1)));
+
+        spawn_background(
+            storage.clone(),
+            shared.clone(),
+            requests_rx,
+            retention_interval,
+            flush_interval,
+            config.name.clone(),
+        );
+
+        Self {
+            config,
+            storage,
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            storage_config,
+            shared,
+            requests,
+            inline_usage_max_bytes: INLINE_USAGE_MAX_BYTES,
+        }
+    }
+
+    /// The storage's [`StorageUsage`] and its age, without ever making an admin
+    /// query wait for a large database to be read.
+    ///
+    /// A small file is walked here and now: it fits in the page cache and the
+    /// answer is exact. A large one is served from the last snapshot, and a
+    /// snapshot that is missing or stale is recomputed on the background thread —
+    /// so the first query after startup reports no usage yet, and the next one
+    /// does.
+    fn usage(&self, on_disk_bytes: Option<u64>) -> Option<(StorageUsage, Duration)> {
+        if on_disk_bytes.is_none_or(|bytes| bytes <= self.inline_usage_max_bytes) {
+            return match self.storage.usage() {
+                Ok(usage) => Some((usage, Duration::ZERO)),
+                Err(e) => {
+                    warn!("Failed to collect usage of '{}': {}", self.config.name, e);
+                    None
+                }
+            };
+        }
+
+        let snapshot = self
+            .shared
+            .usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .map(|(usage, taken)| (usage, taken.elapsed()));
+
+        let stale = snapshot
+            .as_ref()
+            .is_none_or(|(_, age)| *age >= USAGE_MAX_AGE);
+        if stale
+            && !self
+                .shared
+                .usage_refresh_pending
+                .swap(true, Ordering::AcqRel)
+            && self.requests.send(Request::RefreshUsage).is_err()
+        {
+            // The thread is gone; do not leave the flag claiming one is coming.
+            self.shared
+                .usage_refresh_pending
+                .store(false, Ordering::Release);
+        }
+
+        snapshot
+    }
 }
 
 #[async_trait]
@@ -532,18 +693,33 @@ impl Storage for RedbStoragePlugin {
                     cache["hit_ratio"] = json!(ratio);
                 }
 
+                // The half that needs the tables read. `null` until there is a
+                // snapshot, never a number that was not measured.
+                let usage = self.usage(stats.on_disk_bytes);
+                let (usage, usage_age) = match &usage {
+                    Some((usage, age)) => (Some(usage), Some(age.as_secs())),
+                    None => (None, None),
+                };
+
                 json!({
                     "on_disk_bytes": stats.on_disk_bytes,
-                    "stored_bytes": stats.stored_bytes,
-                    "metadata_bytes": stats.metadata_bytes,
-                    "fragmented_bytes": stats.fragmented_bytes,
                     "key_count": stats.key_count,
                     "sample_count": stats.sample_count,
-                    "live_keys": stats.live_keys,
-                    "tombstones": stats.tombstones,
-                    "oldest_timestamp": stats.oldest_timestamp.map(|t| t.to_string()),
-                    "newest_timestamp": stats.newest_timestamp.map(|t| t.to_string()),
                     "cache": cache,
+                    "stored_bytes": usage.map(|u| u.stored_bytes),
+                    "metadata_bytes": usage.map(|u| u.metadata_bytes),
+                    "fragmented_bytes": usage.map(|u| u.fragmented_bytes),
+                    "live_keys": usage.map(|u| u.live_keys),
+                    "tombstones": usage.map(|u| u.tombstones),
+                    "oldest_timestamp": usage
+                        .and_then(|u| u.oldest_timestamp)
+                        .map(|t| t.to_string()),
+                    "newest_timestamp": usage
+                        .and_then(|u| u.newest_timestamp)
+                        .map(|t| t.to_string()),
+                    // How old the seven fields above are. 0 when they were
+                    // computed for this very query; null when not computed yet.
+                    "usage_age_secs": usage_age,
                 })
             }
             Err(e) => {
@@ -558,7 +734,8 @@ impl Storage for RedbStoragePlugin {
         // second half is the point — a declared policy is not evidence that anything
         // is being reclaimed.
         let pass = self
-            .last_retention_pass
+            .shared
+            .last_pass
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
@@ -783,7 +960,7 @@ impl Storage for RedbStoragePlugin {
 
 impl Drop for RedbStoragePlugin {
     fn drop(&mut self) {
-        // The retention thread stops when `shutdown` drops with this struct.
+        // The background thread stops when `requests` drops with this struct.
         // Without that it would outlive the storage and go on compacting a database
         // nobody is serving from.
         debug!("Dropping redb storage plugin '{}'", self.config.name);
@@ -826,6 +1003,7 @@ mod tests {
         assert_eq!(PROP_STORAGE_READ_ONLY, "read_only");
         assert_eq!(PROP_STORAGE_CACHE_SIZE, "cache_size");
         assert_eq!(PROP_STORAGE_FSYNC, "fsync");
+        assert_eq!(PROP_STORAGE_FLUSH_INTERVAL, "flush_interval_secs");
     }
 
     #[test]
@@ -865,23 +1043,11 @@ mod tests {
         let redb_storage =
             RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
-        let storage_plugin = RedbStoragePlugin {
-            config: StorageConfig {
-                name: "test".to_string(),
-                key_expr: "test/**".parse().unwrap(),
-                strip_prefix: None,
-                volume_cfg: serde_json::Value::Object(Default::default()).into(),
-                volume_id: "test_volume".to_string(),
-                complete: false,
-                garbage_collection_config: Default::default(),
-                replication: None,
-            },
-            storage: Arc::new(redb_storage),
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        let storage_plugin = RedbStoragePlugin::new(
+            test_storage_config("test"),
+            Arc::new(redb_storage),
             storage_config,
-            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
-            shutdown: std::sync::mpsc::channel().0,
-        };
+        );
 
         // Drop should work without panic
         drop(storage_plugin);
@@ -899,23 +1065,11 @@ mod tests {
         let redb_storage =
             RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
-        let storage_plugin = RedbStoragePlugin {
-            config: StorageConfig {
-                name: "test_storage".to_string(),
-                key_expr: "test/**".parse().unwrap(),
-                strip_prefix: None,
-                volume_cfg: serde_json::Value::Object(Default::default()).into(),
-                volume_id: "test_volume".to_string(),
-                complete: false,
-                garbage_collection_config: Default::default(),
-                replication: None,
-            },
-            storage: Arc::new(redb_storage),
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        let storage_plugin = RedbStoragePlugin::new(
+            test_storage_config("test_storage"),
+            Arc::new(redb_storage),
             storage_config,
-            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
-            shutdown: std::sync::mpsc::channel().0,
-        };
+        );
 
         let admin_status = storage_plugin.get_admin_status();
 
@@ -936,23 +1090,11 @@ mod tests {
         let redb_storage =
             RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
-        let mut storage_plugin = RedbStoragePlugin {
-            config: StorageConfig {
-                name: "test".to_string(),
-                key_expr: "test/**".parse().unwrap(),
-                strip_prefix: None,
-                volume_cfg: serde_json::Value::Object(Default::default()).into(),
-                volume_id: "test_volume".to_string(),
-                complete: false,
-                garbage_collection_config: Default::default(),
-                replication: None,
-            },
-            storage: Arc::new(redb_storage),
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        let mut storage_plugin = RedbStoragePlugin::new(
+            test_storage_config("test"),
+            Arc::new(redb_storage),
             storage_config,
-            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
-            shutdown: std::sync::mpsc::channel().0,
-        };
+        );
 
         // Put data
         let key = OwnedKeyExpr::new("test/key1").unwrap();
@@ -972,6 +1114,20 @@ mod tests {
         let data = result.unwrap();
         assert_eq!(data.len(), 1);
         assert_eq!(data[0].payload.to_bytes(), payload.to_bytes());
+    }
+
+    /// The storage-manager side of a storage's config, for a plugin built by hand.
+    fn test_storage_config(name: &str) -> StorageConfig {
+        StorageConfig {
+            name: name.to_string(),
+            key_expr: "test/**".parse().unwrap(),
+            strip_prefix: None,
+            volume_cfg: serde_json::Value::Object(Default::default()).into(),
+            volume_id: "test_volume".to_string(),
+            complete: false,
+            garbage_collection_config: Default::default(),
+            replication: None,
+        }
     }
 
     fn storage_config_for(volume_cfg: serde_json::Value, dir: &TempDir) -> StorageConfig {
@@ -1194,23 +1350,11 @@ mod tests {
         let redb_storage =
             RedbStorage::new(&db_path, storage_config.clone(), "history".to_string()).unwrap();
 
-        let mut plugin = RedbStoragePlugin {
-            config: StorageConfig {
-                name: "history".to_string(),
-                key_expr: "test/**".parse().unwrap(),
-                strip_prefix: None,
-                volume_cfg: serde_json::Value::Object(Default::default()).into(),
-                volume_id: "redb-history".to_string(),
-                complete: false,
-                garbage_collection_config: Default::default(),
-                replication: None,
-            },
-            storage: Arc::new(redb_storage),
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        let mut plugin = RedbStoragePlugin::new(
+            test_storage_config("history"),
+            Arc::new(redb_storage),
             storage_config,
-            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
-            shutdown: std::sync::mpsc::channel().0,
-        };
+        );
 
         let key = OwnedKeyExpr::new("test/cpu").unwrap();
         let id = zenoh::time::TimestampId::rand();
@@ -1287,23 +1431,11 @@ mod tests {
         let redb_storage =
             RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
-        let mut storage_plugin = RedbStoragePlugin {
-            config: StorageConfig {
-                name: "test".to_string(),
-                key_expr: "test/**".parse().unwrap(),
-                strip_prefix: None,
-                volume_cfg: serde_json::Value::Object(Default::default()).into(),
-                volume_id: "test_volume".to_string(),
-                complete: false,
-                garbage_collection_config: Default::default(),
-                replication: None,
-            },
-            storage: Arc::new(redb_storage),
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        let mut storage_plugin = RedbStoragePlugin::new(
+            test_storage_config("test"),
+            Arc::new(redb_storage),
             storage_config,
-            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
-            shutdown: std::sync::mpsc::channel().0,
-        };
+        );
 
         let id = zenoh::time::TimestampId::rand();
         for i in 0..5 {
@@ -1347,6 +1479,143 @@ mod tests {
         assert!(stats["newest_timestamp"].is_string());
     }
 
+    /// #36: on a storage too big to read inside an admin query, the query must
+    /// not read it. It reports what is free to know, asks the background thread
+    /// for the rest, and the next query has it.
+    #[tokio::test]
+    async fn test_admin_status_of_a_large_storage_serves_a_snapshot() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("big.redb");
+        let storage_config = RedbStorageConfig::new().with_db_path(db_path.clone());
+        let redb_storage =
+            RedbStorage::new(&db_path, storage_config.clone(), "big".to_string()).unwrap();
+
+        let mut plugin = RedbStoragePlugin::new(
+            test_storage_config("big"),
+            Arc::new(redb_storage),
+            storage_config,
+        );
+        // Every file is "large": nothing may be computed inline.
+        plugin.inline_usage_max_bytes = 0;
+
+        let id = zenoh::time::TimestampId::rand();
+        for i in 0..5 {
+            plugin
+                .put(
+                    Some(OwnedKeyExpr::new(format!("test/k{i}")).unwrap()),
+                    ZBytes::from(vec![0u8; 1024]),
+                    Encoding::ZENOH_BYTES,
+                    Timestamp::new(NTP64(100 + i), id),
+                )
+                .await
+                .unwrap();
+        }
+
+        // First query: the free numbers are there, the expensive ones are not —
+        // and are `null`, not a zero that was never measured.
+        let first: serde_json::Value = serde_json::to_value(plugin.get_admin_status()).unwrap();
+        assert_eq!(first["stats"]["key_count"], 5);
+        assert!(first["stats"]["on_disk_bytes"].as_u64().unwrap() > 0);
+        assert!(first["stats"]["stored_bytes"].is_null(), "{first}");
+        assert!(first["stats"]["live_keys"].is_null());
+        assert!(first["stats"]["usage_age_secs"].is_null());
+
+        // The background thread computes it; a later query serves it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stats = loop {
+            let status: serde_json::Value =
+                serde_json::to_value(plugin.get_admin_status()).unwrap();
+            if !status["stats"]["usage_age_secs"].is_null() {
+                break status["stats"].clone();
+            }
+            assert!(Instant::now() < deadline, "no usage snapshot after 10s");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(stats["live_keys"], 5);
+        assert_eq!(stats["tombstones"], 0);
+        assert!(stats["stored_bytes"].as_u64().unwrap() >= 5 * 1024);
+        assert!(stats["usage_age_secs"].as_u64().unwrap() < 10);
+    }
+
+    /// #35: an `fsync: false` storage must reach the disk when writes stop, not
+    /// only when the next write happens to come along.
+    #[tokio::test]
+    async fn test_an_idle_fsync_false_storage_is_flushed_in_the_background() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("lazy.redb");
+        let storage_config = RedbStorageConfig::new()
+            .with_db_path(db_path.clone())
+            .with_fsync(false)
+            .with_flush_interval_secs(1);
+        let storage = Arc::new(
+            RedbStorage::new(&db_path, storage_config.clone(), "lazy".to_string()).unwrap(),
+        );
+
+        let mut plugin =
+            RedbStoragePlugin::new(test_storage_config("lazy"), storage.clone(), storage_config);
+        plugin
+            .put(
+                Some(OwnedKeyExpr::new("test/k").unwrap()),
+                ZBytes::from("v"),
+                Encoding::ZENOH_STRING,
+                Timestamp::new(NTP64(100), zenoh::time::TimestampId::rand()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            storage.has_unflushed_writes(),
+            "an fsync: false commit inside the flush interval is not durable yet"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while storage.has_unflushed_writes() {
+            assert!(
+                Instant::now() < deadline,
+                "nothing flushed an idle storage within 10s"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// `flush_interval_secs` must be a whole number of seconds.
+    #[tokio::test]
+    async fn test_flush_interval_must_be_a_number() {
+        let dir = TempDir::new().unwrap();
+        let backend = RedbBackend::new(
+            RedbBackendConfig::new()
+                .with_base_dir(dir.path().to_path_buf())
+                .with_create_dir(true),
+        )
+        .unwrap();
+        let volume = RedbVolume {
+            history: HistoryMode::Latest,
+            admin_status: serde_json::Value::Object(Default::default()),
+            backend: Arc::new(backend),
+        };
+
+        for bad in [json!("5"), json!(-1), json!(1.5)] {
+            let Err(err) = volume
+                .create_storage(storage_config_for(
+                    json!({ "dir": "bad", "fsync": false, "flush_interval_secs": bad }),
+                    &dir,
+                ))
+                .await
+            else {
+                panic!("flush_interval_secs: {bad} must be rejected");
+            };
+            assert!(err.to_string().contains("flush_interval_secs"), "{err}");
+        }
+
+        volume
+            .create_storage(storage_config_for(
+                json!({ "dir": "good", "fsync": false, "flush_interval_secs": 30 }),
+                &dir,
+            ))
+            .await
+            .map(|_| ())
+            .expect("a whole number of seconds is accepted");
+    }
+
     /// A tombstone must be visible in the counts, distinctly from a live key.
     #[tokio::test]
     async fn test_admin_status_counts_are_not_estimates() {
@@ -1360,23 +1629,11 @@ mod tests {
         let redb_storage =
             RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
-        let mut storage_plugin = RedbStoragePlugin {
-            config: StorageConfig {
-                name: "test".to_string(),
-                key_expr: "test/**".parse().unwrap(),
-                strip_prefix: None,
-                volume_cfg: serde_json::Value::Object(Default::default()).into(),
-                volume_id: "test_volume".to_string(),
-                complete: false,
-                garbage_collection_config: Default::default(),
-                replication: None,
-            },
-            storage: Arc::new(redb_storage),
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        let mut storage_plugin = RedbStoragePlugin::new(
+            test_storage_config("test"),
+            Arc::new(redb_storage),
             storage_config,
-            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
-            shutdown: std::sync::mpsc::channel().0,
-        };
+        );
 
         let id = zenoh::time::TimestampId::rand();
         let key = OwnedKeyExpr::new("test/gone").unwrap();
@@ -1416,23 +1673,11 @@ mod tests {
         let redb_storage =
             RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
-        let mut storage_plugin = RedbStoragePlugin {
-            config: StorageConfig {
-                name: "test".to_string(),
-                key_expr: "test/**".parse().unwrap(),
-                strip_prefix: None,
-                volume_cfg: serde_json::Value::Object(Default::default()).into(),
-                volume_id: "test_volume".to_string(),
-                complete: false,
-                garbage_collection_config: Default::default(),
-                replication: None,
-            },
-            storage: Arc::new(redb_storage),
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        let mut storage_plugin = RedbStoragePlugin::new(
+            test_storage_config("test"),
+            Arc::new(redb_storage),
             storage_config,
-            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
-            shutdown: std::sync::mpsc::channel().0,
-        };
+        );
 
         let key = OwnedKeyExpr::new("test/ordered").unwrap();
         let id = zenoh::time::TimestampId::rand();
@@ -1498,23 +1743,11 @@ mod tests {
         let redb_storage =
             RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
-        let mut storage_plugin = RedbStoragePlugin {
-            config: StorageConfig {
-                name: "test".to_string(),
-                key_expr: "test/**".parse().unwrap(),
-                strip_prefix: None,
-                volume_cfg: serde_json::Value::Object(Default::default()).into(),
-                volume_id: "test_volume".to_string(),
-                complete: false,
-                garbage_collection_config: Default::default(),
-                replication: None,
-            },
-            storage: Arc::new(redb_storage),
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        let mut storage_plugin = RedbStoragePlugin::new(
+            test_storage_config("test"),
+            Arc::new(redb_storage),
             storage_config,
-            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
-            shutdown: std::sync::mpsc::channel().0,
-        };
+        );
 
         let key = OwnedKeyExpr::new("test/tombstone").unwrap();
         let id = zenoh::time::TimestampId::rand();
@@ -1564,23 +1797,11 @@ mod tests {
         let redb_storage =
             RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
-        let mut storage_plugin = RedbStoragePlugin {
-            config: StorageConfig {
-                name: "test".to_string(),
-                key_expr: "test/**".parse().unwrap(),
-                strip_prefix: None,
-                volume_cfg: serde_json::Value::Object(Default::default()).into(),
-                volume_id: "test_volume".to_string(),
-                complete: false,
-                garbage_collection_config: Default::default(),
-                replication: None,
-            },
-            storage: Arc::new(redb_storage),
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        let mut storage_plugin = RedbStoragePlugin::new(
+            test_storage_config("test"),
+            Arc::new(redb_storage),
             storage_config,
-            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
-            shutdown: std::sync::mpsc::channel().0,
-        };
+        );
 
         // Put with None key
         let payload = ZBytes::from("none_value");
@@ -1613,23 +1834,11 @@ mod tests {
         let redb_storage =
             RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
-        let mut storage_plugin = RedbStoragePlugin {
-            config: StorageConfig {
-                name: "test".to_string(),
-                key_expr: "test/**".parse().unwrap(),
-                strip_prefix: None,
-                volume_cfg: serde_json::Value::Object(Default::default()).into(),
-                volume_id: "test_volume".to_string(),
-                complete: false,
-                garbage_collection_config: Default::default(),
-                replication: None,
-            },
-            storage: Arc::new(redb_storage),
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        let mut storage_plugin = RedbStoragePlugin::new(
+            test_storage_config("test"),
+            Arc::new(redb_storage),
             storage_config,
-            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
-            shutdown: std::sync::mpsc::channel().0,
-        };
+        );
 
         // Put data
         let key = OwnedKeyExpr::new("test/key1").unwrap();
@@ -1688,23 +1897,8 @@ mod tests {
 
         let ro_storage = RedbStorage::new(&db_path, ro_config.clone(), "test".to_string()).unwrap();
 
-        let mut storage_plugin = RedbStoragePlugin {
-            config: StorageConfig {
-                name: "test".to_string(),
-                key_expr: "test/**".parse().unwrap(),
-                strip_prefix: None,
-                volume_cfg: serde_json::Value::Object(Default::default()).into(),
-                volume_id: "test_volume".to_string(),
-                complete: false,
-                garbage_collection_config: Default::default(),
-                replication: None,
-            },
-            storage: Arc::new(ro_storage),
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            storage_config: ro_config,
-            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
-            shutdown: std::sync::mpsc::channel().0,
-        };
+        let mut storage_plugin =
+            RedbStoragePlugin::new(test_storage_config("test"), Arc::new(ro_storage), ro_config);
 
         // Try to put - should fail
         let new_payload = ZBytes::from("new_value");
@@ -1749,23 +1943,8 @@ mod tests {
 
         let ro_storage = RedbStorage::new(&db_path, ro_config.clone(), "test".to_string()).unwrap();
 
-        let mut storage_plugin = RedbStoragePlugin {
-            config: StorageConfig {
-                name: "test".to_string(),
-                key_expr: "test/**".parse().unwrap(),
-                strip_prefix: None,
-                volume_cfg: serde_json::Value::Object(Default::default()).into(),
-                volume_id: "test_volume".to_string(),
-                complete: false,
-                garbage_collection_config: Default::default(),
-                replication: None,
-            },
-            storage: Arc::new(ro_storage),
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
-            storage_config: ro_config,
-            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
-            shutdown: std::sync::mpsc::channel().0,
-        };
+        let mut storage_plugin =
+            RedbStoragePlugin::new(test_storage_config("test"), Arc::new(ro_storage), ro_config);
 
         // Try to delete - should fail
         let result = storage_plugin.delete(Some(key), timestamp).await;
@@ -1784,23 +1963,11 @@ mod tests {
         let redb_storage =
             RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
-        let mut storage_plugin = RedbStoragePlugin {
-            config: StorageConfig {
-                name: "test".to_string(),
-                key_expr: "test/**".parse().unwrap(),
-                strip_prefix: None,
-                volume_cfg: serde_json::Value::Object(Default::default()).into(),
-                volume_id: "test_volume".to_string(),
-                complete: false,
-                garbage_collection_config: Default::default(),
-                replication: None,
-            },
-            storage: Arc::new(redb_storage),
-            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        let mut storage_plugin = RedbStoragePlugin::new(
+            test_storage_config("test"),
+            Arc::new(redb_storage),
             storage_config,
-            last_retention_pass: Arc::new(std::sync::Mutex::new(RetentionPass::default())),
-            shutdown: std::sync::mpsc::channel().0,
-        };
+        );
 
         // Put multiple entries
         for i in 1..=3 {
