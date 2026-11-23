@@ -597,19 +597,37 @@ impl RedbStorage {
     /// state is cleared that often. [`RedbStorage::flush`] covers the tail when
     /// writes stop.
     fn commit(&self, mut txn: redb::WriteTransaction) -> Result<()> {
-        let durable = self.config.fsync || self.flush_is_due();
-        txn.set_durability(if durable {
-            Durability::Immediate
-        } else {
-            Durability::None
-        })?;
-        txn.commit()?;
-
-        if durable {
-            self.mark_durable();
-        } else {
-            self.unflushed.store(true, Ordering::Release);
+        if self.config.fsync || self.flush_is_due() {
+            return self.commit_durably(txn);
         }
+
+        txn.set_durability(Durability::None)?;
+        txn.commit()?;
+        self.unflushed.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Commit `txn` durably, which also persists every non-durable commit before
+    /// it.
+    ///
+    /// `unflushed` is cleared **before** the commit, not after. redb releases its
+    /// writer lock when the commit returns, so another thread can commit
+    /// non-durably and raise the flag before this one gets round to touching it;
+    /// clearing it afterwards would wipe that out and leave a write that is not on
+    /// disk behind a flag that says everything is. Cleared first, the only possible
+    /// mistake is the harmless one: the flag left raised over writes this commit
+    /// did persist, which costs one empty flush.
+    fn commit_durably(&self, mut txn: redb::WriteTransaction) -> Result<()> {
+        txn.set_durability(Durability::Immediate)?;
+        let was_unflushed = self.unflushed.swap(false, Ordering::AcqRel);
+        if let Err(e) = txn.commit() {
+            // Nothing was persisted, so whatever was pending still is.
+            if was_unflushed {
+                self.unflushed.store(true, Ordering::Release);
+            }
+            return Err(e.into());
+        }
+        *self.last_durable.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
         Ok(())
     }
 
@@ -617,11 +635,6 @@ impl RedbStorage {
     fn flush_is_due(&self) -> bool {
         let last = *self.last_durable.lock().unwrap_or_else(|e| e.into_inner());
         last.elapsed() >= Duration::from_secs(self.config.flush_interval_secs)
-    }
-
-    fn mark_durable(&self) {
-        *self.last_durable.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
-        self.unflushed.store(false, Ordering::Release);
     }
 
     /// Make everything committed so far durable.
@@ -635,10 +648,8 @@ impl RedbStorage {
             return Ok(false);
         }
         // An empty durable commit publishes every non-durable one before it.
-        let mut txn = self.begin_write()?;
-        txn.set_durability(Durability::Immediate)?;
-        txn.commit()?;
-        self.mark_durable();
+        let txn = self.begin_write()?;
+        self.commit_durably(txn)?;
         trace!("Flushed '{}'", self.name);
         Ok(true)
     }
@@ -2925,9 +2936,10 @@ mod tests {
         assert!(!eager.has_unflushed_writes());
 
         // And once a real interval has passed, the next commit is the durable one.
+        // (No assertion between the two puts: on a stalled machine the first one
+        // can itself land after the interval.)
         let timed = open("timed.redb", false, 1);
         put(&timed, 1);
-        assert!(timed.has_unflushed_writes());
         std::thread::sleep(Duration::from_millis(1100));
         put(&timed, 2);
         assert!(

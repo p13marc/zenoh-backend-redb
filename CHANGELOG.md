@@ -49,9 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It now reads only the rows of the window.
 - **A dot in `dir` was truncated** (#39). `dir: "telemetry.v1"` and
   `dir: "telemetry.v2"` both became `telemetry.redb`, and the second storage failed
-  to open a file the first had locked. `.redb` is now appended. A deployment that
-  already ran with a dotted `dir` keeps opening its existing (truncated-name) file,
-  with a warning, until the correctly named file exists.
+  to open a file the first had locked. `.redb` is now appended.
+  **If you already run a storage with a dot in `dir`**, its data is in the truncated
+  file and this version will start an empty one beside it, with a warning that names
+  both. Stop the router and rename the old file, or point the storage at it with
+  `db_file`. (It is not adopted automatically: `telemetry.redb` is also exactly what
+  `dir: "telemetry"` names, so guessing could hand one storage another's database.)
 
 ### Removed
 - `bin/act` (a 20 MB GitHub-Actions runner binary) and `just ci-act`. `ci-local.sh`

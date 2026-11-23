@@ -43,10 +43,10 @@ re-runs the test binary as a child that writes and then `abort()`s — a crash c
 be simulated in-process, because the file lock is only released by a dead process.
 
 ### `retention_memory.rs`
-The heap growth of a retention pass over 100 000 samples, measured with a counting
-global allocator. It asserts a pass does not hold the history in memory. Ignored in a
-debug build (it takes minutes unoptimised): `just test-memory`, or
-`cargo test --release --test retention_memory`. CI runs it.
+The heap growth of a retention pass over 60 000 samples, measured with a counting
+global allocator. It asserts a pass does not hold the history in memory. It is the
+slowest test here (about 15 s) and the reason `Cargo.toml` optimises redb in debug
+builds. `just test-memory` prints the numbers.
 
 ### `integration_zenohd.rs` 🚀 **End-to-End Test**
 Full integration test that spawns a real `zenohd` daemon with the redb backend plugin loaded.

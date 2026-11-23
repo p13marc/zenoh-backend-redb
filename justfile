@@ -42,9 +42,9 @@ test:
 nextest:
     cargo nextest run --all-features -E 'not test(test_zenohd) and not test(test_plugin_library_exists)'
 
-# Measure the heap growth of a retention pass (release only: minutes unoptimised)
+# Measure the heap growth of a retention pass, and print it
 test-memory:
-    cargo test --release --all-features --test retention_memory -- --nocapture
+    cargo test --all-features --test retention_memory -- --nocapture
 
 # Run specific test
 test-one TEST:

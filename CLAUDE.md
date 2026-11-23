@@ -139,7 +139,7 @@ way:
   `SCAN_ROWS_PER_TXN` rows (a long-lived read transaction stops redb reusing pages,
   so a slow scan makes concurrent PUTs grow the file), and deletes go out in
   `DELETE_BATCH`-row commits. `tests/retention_memory.rs` measures this with a
-  counting allocator; it only runs in a release build.
+  counting allocator.
 - **Cutoffs saturate** (`ntp_before`). `NTP64 - NTP64` is a bare `u64` subtraction:
   a window longer than the clock wraps in a release build and condemns every sample.
 

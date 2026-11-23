@@ -120,9 +120,12 @@ fn spawn_background(
                     interval.as_secs()
                 );
             }
+            // `checked_add`, here and below: an interval too long for an `Instant`
+            // to hold means "never", not a panic that ends this thread — and with
+            // it retention and flushing, silently.
             let started = Instant::now();
-            let mut next_retention = retention_interval.map(|i| started + i);
-            let mut next_flush = flush_interval.map(|i| started + i);
+            let mut next_retention = retention_interval.and_then(|i| started.checked_add(i));
+            let mut next_flush = flush_interval.and_then(|i| started.checked_add(i));
 
             loop {
                 let request = match [next_retention, next_flush].into_iter().flatten().min() {
@@ -134,12 +137,11 @@ fn spawn_background(
                 };
                 match request {
                     Ok(Request::RefreshUsage) => {
-                        match storage.usage() {
-                            Ok(usage) => {
-                                *shared.usage.lock().unwrap_or_else(|e| e.into_inner()) =
-                                    Some((usage, Instant::now()));
-                            }
-                            Err(e) => warn!("Failed to collect usage of '{}': {}", name, e),
+                        if let Some(usage) =
+                            contained(&name, "Collecting usage", || storage.usage())
+                        {
+                            *shared.usage.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some((usage, Instant::now()));
                         }
                         shared.usage_refresh_pending.store(false, Ordering::Release);
                     }
@@ -156,18 +158,18 @@ fn spawn_background(
                 if let Some(interval) = flush_interval
                     && next_flush.is_some_and(|at| now >= at)
                 {
-                    if let Err(e) = storage.flush() {
-                        warn!("Flushing '{}' failed: {}", name, e);
-                    }
-                    next_flush = Some(Instant::now() + interval);
+                    contained(&name, "Flush", || storage.flush());
+                    next_flush = Instant::now().checked_add(interval);
                 }
                 if let Some(interval) = retention_interval
                     && next_retention.is_some_and(|at| now >= at)
                 {
-                    if let Some(pass) = run_pass(&name, || storage.enforce_retention()) {
+                    if let Some(pass) =
+                        contained(&name, "Retention pass", || storage.enforce_retention())
+                    {
                         *shared.last_pass.lock().unwrap_or_else(|e| e.into_inner()) = pass;
                     }
-                    next_retention = Some(Instant::now() + interval);
+                    next_retention = Instant::now().checked_add(interval);
                 }
             }
         })
@@ -182,9 +184,10 @@ fn spawn_background(
 /// first had locked.
 ///
 /// A deployment that already ran with a dotted `dir` has its data in the truncated
-/// file. That file is still opened — when it exists and the correct one does not —
-/// so an upgrade does not silently start an empty database; the log says how to
-/// move off it.
+/// file. That file is **not** opened in its place. It cannot be told apart from the
+/// rightful file of another storage — `telemetry.redb` is exactly what
+/// `dir: "telemetry"` names — so guessing would hand one storage another's
+/// database. The log says what was found and the two ways to adopt it.
 fn db_path_for_dir(base: &std::path::Path, dir: &str, storage: &str) -> PathBuf {
     // Somebody who wrote the extension out meant the file, not `x.redb.redb`.
     let path = if dir.ends_with(".redb") {
@@ -193,38 +196,46 @@ fn db_path_for_dir(base: &std::path::Path, dir: &str, storage: &str) -> PathBuf 
         base.join(format!("{dir}.redb"))
     };
 
-    let mut legacy = base.join(dir);
-    legacy.set_extension("redb");
-    if legacy != path && legacy.exists() && !path.exists() {
+    let mut truncated = base.join(dir);
+    truncated.set_extension("redb");
+    if truncated != path && truncated.exists() && !path.exists() {
         warn!(
-            "Storage '{}': `dir: \"{}\"` names {:?}, but an earlier version of this backend \
-             dropped everything after the last dot and put its data in {:?}. Opening that \
-             file. To move to the correct name, stop the router and rename it.",
-            storage, dir, path, legacy
+            "Storage '{}': `dir: \"{}\"` is {:?}, which does not exist yet and will be \
+             created empty. {:?} does exist: versions before 0.5.0 dropped everything \
+             after the last dot in `dir`, so that file may hold this storage's data. If it \
+             does, stop the router and rename it to {:?}, or point this storage at it with \
+             `db_file` instead of `dir`. If it belongs to another storage, ignore this.",
+            storage,
+            dir,
+            path,
+            truncated,
+            path.file_name().unwrap_or_default()
         );
-        return legacy;
     }
     path
 }
 
-/// Run one retention pass, containing whatever goes wrong in it.
+/// Run one piece of background work, containing whatever goes wrong in it.
 ///
-/// A failed pass is logged and skipped. So is a *panicking* one, which matters
-/// more: without this the thread would be gone, the storage would keep serving, and
-/// the disk would fill behind a policy that still shows on the admin space.
-fn run_pass(
+/// A failure is logged and skipped. So is a *panic*, which matters more: without
+/// this the thread would be gone, the storage would keep serving, and the disk
+/// would fill behind a retention policy that still shows on the admin space — or
+/// an `fsync: false` storage would quietly stop being flushed.
+fn contained<T>(
     name: &str,
-    pass: impl FnOnce() -> crate::error::Result<RetentionPass>,
-) -> Option<RetentionPass> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(pass)) {
-        Ok(Ok(pass)) => Some(pass),
+    what: &str,
+    work: impl FnOnce() -> crate::error::Result<T>,
+) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+        Ok(Ok(done)) => Some(done),
         Ok(Err(e)) => {
-            warn!("Retention pass on '{}' failed: {}", name, e);
+            warn!("{} on '{}' failed: {}", what, name, e);
             None
         }
         Err(panic) => {
             tracing::error!(
-                "Retention pass on '{}' panicked: {}. Retention continues with the next pass.",
+                "{} on '{}' panicked: {}. The storage's background thread carries on.",
+                what,
                 name,
                 panic
                     .downcast_ref::<String>()
@@ -1244,18 +1255,21 @@ mod tests {
         assert!(err.to_string().contains("latest"), "{err}");
     }
 
-    /// A pass that panics must not take the retention thread with it: the next
+    /// Background work that panics must not take the thread with it: the next
     /// pass has to run, or retention ends silently for that storage.
     #[test]
-    fn test_a_panicking_pass_is_contained() {
-        let panicked = run_pass("s", || panic!("a bug in one pass"));
+    fn test_panicking_background_work_is_contained() {
+        let panicked: Option<RetentionPass> =
+            contained("s", "Retention pass", || panic!("a bug in one pass"));
         assert!(panicked.is_none());
 
-        let failed = run_pass("s", || Err(crate::error::RedbBackendError::other("io")));
+        let failed: Option<RetentionPass> = contained("s", "Retention pass", || {
+            Err(crate::error::RedbBackendError::other("io"))
+        });
         assert!(failed.is_none());
 
         // ...and the thread is still here to run the next one.
-        let ok = run_pass("s", || {
+        let ok = contained("s", "Retention pass", || {
             Ok(RetentionPass {
                 samples_dropped: 7,
                 ..Default::default()
@@ -1327,27 +1341,25 @@ mod tests {
             base.join("named.redb")
         );
 
-        // A deployment that already ran with a dotted dir has its data under the
-        // truncated name. Keep using it rather than starting empty...
+        // A file under the truncated name is never opened in a dotted dir's place:
+        // it is just as likely to be the rightful file of `dir: "telemetry"`.
         std::fs::write(base.join("telemetry.redb"), b"").unwrap();
-        assert_eq!(
-            db_path_for_dir(base, "telemetry.v1", "s"),
-            base.join("telemetry.redb")
-        );
-        // ...until the correctly named file exists.
-        std::fs::write(base.join("telemetry.v1.redb"), b"").unwrap();
         assert_eq!(
             db_path_for_dir(base, "telemetry.v1", "s"),
             base.join("telemetry.v1.redb")
         );
-        // An undotted dir never looks anywhere else.
+        assert_eq!(
+            db_path_for_dir(base, "telemetry.v2", "s"),
+            base.join("telemetry.v2.redb")
+        );
         assert_eq!(
             db_path_for_dir(base, "telemetry", "s"),
             base.join("telemetry.redb")
         );
     }
 
-    /// Two storages whose `dir`s differ only after a dot both start.
+    /// Storages whose `dir`s differ only after a dot all start, each on its own
+    /// file, including next to one whose file is the truncated name.
     #[tokio::test]
     async fn test_two_dotted_dirs_do_not_collide() {
         let dir = TempDir::new().unwrap();
@@ -1373,11 +1385,20 @@ mod tests {
             replication: None,
         };
 
+        // An undotted storage first: its file is exactly what a dotted `dir` used
+        // to be truncated to, and it must stay that storage's alone.
+        let _plain = volume
+            .create_storage(cfg("telemetry"))
+            .await
+            .map_err(|e| e.to_string())
+            .expect("undotted storage");
+        assert!(dir.path().join("telemetry.redb").exists());
+
         let _v1 = volume
             .create_storage(cfg("telemetry.v1"))
             .await
             .map_err(|e| e.to_string())
-            .expect("first storage");
+            .expect("first dotted storage must not land on the undotted one's file");
         let _v2 = volume
             .create_storage(cfg("telemetry.v2"))
             .await
@@ -1644,22 +1665,73 @@ mod tests {
         assert!(stats["usage_age_secs"].as_u64().unwrap() < 10);
     }
 
+    /// Intervals too long for an `Instant` to hold mean "never". They used to
+    /// overflow and panic the background thread at startup, which ended retention,
+    /// flushing and usage snapshots for that storage without a word.
+    #[tokio::test]
+    async fn test_an_absurd_interval_does_not_kill_the_background_thread() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("forever.redb");
+        let storage_config = RedbStorageConfig::new()
+            .with_db_path(db_path.clone())
+            .with_history(HistoryMode::All)
+            .with_fsync(false)
+            .with_flush_interval_secs(u64::MAX)
+            .with_retention(RetentionPolicy {
+                max_age_secs: Some(60),
+                interval_secs: u64::MAX,
+                ..Default::default()
+            });
+        let redb_storage =
+            RedbStorage::new(&db_path, storage_config.clone(), "forever".to_string()).unwrap();
+
+        let mut plugin = RedbStoragePlugin::new(
+            test_storage_config("forever"),
+            Arc::new(redb_storage),
+            storage_config,
+        );
+        plugin.inline_usage_max_bytes = 0;
+
+        // The thread is alive if it still answers: a usage snapshot only ever
+        // comes from it.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let status: serde_json::Value =
+                serde_json::to_value(plugin.get_admin_status()).unwrap();
+            if !status["stats"]["usage_age_secs"].is_null() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the background thread did not answer; it probably panicked"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// #35: an `fsync: false` storage must reach the disk when writes stop, not
     /// only when the next write happens to come along.
     #[tokio::test]
     async fn test_an_idle_fsync_false_storage_is_flushed_in_the_background() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("lazy.redb");
+        // The storage itself is given an interval that never passes, so no commit
+        // is ever promoted to durable on the write path. Only the background
+        // thread, which takes its timer from the config handed to the plugin, can
+        // be what flushes it.
         let storage_config = RedbStorageConfig::new()
             .with_db_path(db_path.clone())
             .with_fsync(false)
-            .with_flush_interval_secs(1);
+            .with_flush_interval_secs(3600);
         let storage = Arc::new(
             RedbStorage::new(&db_path, storage_config.clone(), "lazy".to_string()).unwrap(),
         );
 
-        let mut plugin =
-            RedbStoragePlugin::new(test_storage_config("lazy"), storage.clone(), storage_config);
+        let mut plugin = RedbStoragePlugin::new(
+            test_storage_config("lazy"),
+            storage.clone(),
+            storage_config.with_flush_interval_secs(1),
+        );
         plugin
             .put(
                 Some(OwnedKeyExpr::new("test/k").unwrap()),

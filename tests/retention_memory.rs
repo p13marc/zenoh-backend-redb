@@ -9,8 +9,8 @@
 //! This file has its own global allocator so it can measure that, and exactly one
 //! test so nothing else allocates while it does.
 //!
-//! It writes 200 000 samples, which takes minutes unoptimised, so it only runs in
-//! a release build: `cargo test --release --test retention_memory` (CI does).
+//! It writes 120 000 samples, one commit each. That is tolerable in a debug build
+//! only because `Cargo.toml` optimises redb there (`profile.dev.package.redb`).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -54,16 +54,16 @@ fn peak_growth<T>(f: impl FnOnce() -> T) -> (T, usize) {
     (out, PEAK.load(Ordering::Relaxed).saturating_sub(baseline))
 }
 
-const SAMPLES: u64 = 100_000;
-/// A long key, so that holding every key in memory is unmistakable: 100 000 of
-/// these is over 30 MB of keys alone.
+const SAMPLES: u64 = 60_000;
+/// A long key, so that holding every key in memory is unmistakable: 60 000 of
+/// these is about 19 MB of keys alone.
 const KEY_LEN: usize = 300;
 /// redb's page cache. Part of what a pass may legitimately use.
 const CACHE: usize = 2 * 1024 * 1024;
 /// What a pass may add to the heap: the page cache, one batch of keys (about
-/// 1.3 MB), one write transaction's dirty pages, and slack. A quarter of what the
+/// 1.3 MB), one write transaction's dirty pages, and slack. A third of what the
 /// keys alone come to.
-const BUDGET: usize = 8 * 1024 * 1024;
+const BUDGET: usize = 6 * 1024 * 1024;
 
 fn key(i: u64) -> String {
     format!("v1/h-{:04}/telemetry/{}", i % 50, "x".repeat(KEY_LEN))
@@ -101,10 +101,6 @@ fn fill(storage: &RedbStorage, age_secs: u64) {
 }
 
 #[test]
-#[cfg_attr(
-    debug_assertions,
-    ignore = "minutes in a debug build; run with --release"
-)]
 fn a_retention_pass_does_not_hold_the_history_in_memory() {
     let dir = tempfile::tempdir().unwrap();
 
@@ -139,7 +135,7 @@ fn a_retention_pass_does_not_hold_the_history_in_memory() {
         let storage = open(
             &dir.path().join("size.redb"),
             RetentionPolicy {
-                max_bytes: Some(32 * 1024 * 1024),
+                max_bytes: Some(20 * 1024 * 1024),
                 ..Default::default()
             },
         );

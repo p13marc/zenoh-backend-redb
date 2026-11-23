@@ -61,6 +61,12 @@ harness = false
 name = "backend_benchmarks"
 harness = false
 
+# redb optimised in debug builds too. The retention and durability tests write
+# hundreds of thousands of samples, one commit each, and nearly all of that time is
+# spent inside redb: unoptimised, the memory test alone takes minutes.
+[profile.dev.package.redb]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 lto = true

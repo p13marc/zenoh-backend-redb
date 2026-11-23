@@ -17,7 +17,6 @@ step "test"
 cargo build --all-features --locked
 cargo build --release --features plugin --locked
 cargo test --all-features --locked -- --skip test_zenohd
-cargo test --release --all-features --locked --test retention_memory
 
 step "deny"
 if command -v cargo-deny >/dev/null; then
