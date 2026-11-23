@@ -142,7 +142,7 @@ LABEL org.opencontainers.image.title="Zenoh Backend redb"
 LABEL org.opencontainers.image.description="Zenoh storage backend using redb embedded database"
 LABEL org.opencontainers.image.url="https://git.marcpardo.eu/marcpardo/zenoh-backend-redb"
 LABEL org.opencontainers.image.source="https://git.marcpardo.eu/marcpardo/zenoh-backend-redb"
-LABEL org.opencontainers.image.version="0.4.0"
+LABEL org.opencontainers.image.version="0.5.0"
 LABEL org.opencontainers.image.licenses="Apache-2.0 OR MIT"
 
 # Test stage - the builder itself, with a test entrypoint.
