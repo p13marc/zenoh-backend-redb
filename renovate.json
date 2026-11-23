@@ -3,13 +3,13 @@
   "extends": ["local>marcpardo/myserver//renovate/default"],
   "packageRules": [
     {
-      "description": "The plugin is a cdylib loaded by zenohd, and zenoh rejects a plugin built with a different rustc. The toolchain follows zenoh's own rust-toolchain.toml and moves only with a zenoh upgrade, by hand.",
-      "matchManagers": ["rust-toolchain"],
+      "description": "The plugin is a cdylib loaded by zenohd, and zenoh rejects a plugin built with a different rustc. The toolchain follows zenoh's own rust-toolchain.toml and moves only with a zenoh upgrade, by hand. Matched by file, so it holds whichever manager reads it.",
+      "matchFileNames": ["rust-toolchain.toml"],
       "enabled": false
     },
     {
       "description": "Same constraint for the image the Dockerfile builds zenohd and the plugin in.",
-      "matchManagers": ["dockerfile"],
+      "matchFileNames": ["Dockerfile"],
       "matchPackageNames": ["rust"],
       "enabled": false
     }
