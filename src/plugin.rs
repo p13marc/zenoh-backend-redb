@@ -93,13 +93,42 @@ fn spawn_retention_task(
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 }
 
-                match storage.enforce_retention() {
-                    Ok(pass) => *last_pass.lock().unwrap_or_else(|e| e.into_inner()) = pass,
-                    Err(e) => warn!("Retention pass on '{}' failed: {}", name, e),
+                if let Some(pass) = run_pass(&name, || storage.enforce_retention()) {
+                    *last_pass.lock().unwrap_or_else(|e| e.into_inner()) = pass;
                 }
             }
         })
         .expect("spawn retention thread");
+}
+
+/// Run one retention pass, containing whatever goes wrong in it.
+///
+/// A failed pass is logged and skipped. So is a *panicking* one, which matters
+/// more: without this the thread would be gone, the storage would keep serving, and
+/// the disk would fill behind a policy that still shows on the admin space.
+fn run_pass(
+    name: &str,
+    pass: impl FnOnce() -> crate::error::Result<RetentionPass>,
+) -> Option<RetentionPass> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(pass)) {
+        Ok(Ok(pass)) => Some(pass),
+        Ok(Err(e)) => {
+            warn!("Retention pass on '{}' failed: {}", name, e);
+            None
+        }
+        Err(panic) => {
+            tracing::error!(
+                "Retention pass on '{}' panicked: {}. Retention continues with the next pass.",
+                name,
+                panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("(no message)")
+            );
+            None
+        }
+    }
 }
 
 /// The selector parameter Zenoh reserves for a time range.
@@ -361,14 +390,12 @@ impl Volume for RedbVolume {
                             e
                         )
                     })?;
-                if !policy.is_bounded() {
+                if let Err(reason) = policy.validate() {
                     bail!(
-                        "Storage '{}': `{}` sets no limit. Give it at least one of \
-                         max_age_secs, max_bytes, max_samples_per_key or decimate — \
-                         an empty policy is almost certainly a mistake, and it reads \
-                         as protection that is not there.",
+                        "Storage '{}': `{}` {}",
                         config.name,
-                        PROP_STORAGE_RETENTION
+                        PROP_STORAGE_RETENTION,
+                        reason
                     )
                 }
                 Some(policy)
@@ -539,8 +566,14 @@ impl Storage for RedbStoragePlugin {
             "policy": self.storage_config.retention,
             "last_pass": pass.ran_at.map(|_| json!({
                 "samples_dropped": pass.samples_dropped,
+                "samples_evicted_for_size": pass.samples_evicted_for_size,
+                "samples_before": pass.samples_before,
+                "samples_after": pass.samples_after,
+                // The file. It only shrinks when `compacted` is true: redb reuses
+                // freed pages but does not return them to the filesystem.
                 "bytes_before": pass.bytes_before,
                 "bytes_after": pass.bytes_after,
+                "compacted": pass.compacted,
                 "duration_ms": pass.duration.map(|d| d.as_millis() as u64),
             })),
         });
@@ -1030,6 +1063,66 @@ mod tests {
             panic!("a retention policy on a latest-mode volume must be rejected");
         };
         assert!(err.to_string().contains("latest"), "{err}");
+    }
+
+    /// A pass that panics must not take the retention thread with it: the next
+    /// pass has to run, or retention ends silently for that storage.
+    #[test]
+    fn test_a_panicking_pass_is_contained() {
+        let panicked = run_pass("s", || panic!("a bug in one pass"));
+        assert!(panicked.is_none());
+
+        let failed = run_pass("s", || Err(crate::error::RedbBackendError::other("io")));
+        assert!(failed.is_none());
+
+        // ...and the thread is still here to run the next one.
+        let ok = run_pass("s", || {
+            Ok(RetentionPass {
+                samples_dropped: 7,
+                ..Default::default()
+            })
+        });
+        assert_eq!(ok.map(|p| p.samples_dropped), Some(7));
+    }
+
+    /// Values that parse but cannot mean what they say stop the storage starting.
+    #[tokio::test]
+    async fn test_a_retention_policy_with_a_typo_or_a_zero_is_rejected() {
+        let dir = TempDir::new().unwrap();
+        let backend = RedbBackend::new(
+            RedbBackendConfig::new()
+                .with_base_dir(dir.path().to_path_buf())
+                .with_create_dir(true),
+        )
+        .unwrap();
+        let volume = RedbVolume {
+            history: HistoryMode::All,
+            admin_status: serde_json::Value::Object(Default::default()),
+            backend: Arc::new(backend),
+        };
+
+        for (retention, names) in [
+            (json!({ "max_age_secs": 60, "max_byte": 1000 }), "max_byte"),
+            (
+                json!({ "max_age_secs": 60, "interval_secs": 0 }),
+                "interval_secs",
+            ),
+            (
+                json!({ "decimate": { "recent_secs": 60, "bucket_secs": 0 } }),
+                "bucket_secs",
+            ),
+        ] {
+            let Err(err) = volume
+                .create_storage(storage_config_for(
+                    json!({ "dir": "bad", "retention": retention }),
+                    &dir,
+                ))
+                .await
+            else {
+                panic!("a policy naming `{names}` wrongly must not start");
+            };
+            assert!(err.to_string().contains(names), "{err}");
+        }
     }
 
     /// A latest-mode storage needs no policy — it already keeps one value per key.

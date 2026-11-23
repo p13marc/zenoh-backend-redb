@@ -82,6 +82,10 @@ impl HistoryMode {
 /// says so. A policy with no limits at all is rejected, because it is almost
 /// certainly a mistake rather than a deliberate "keep everything forever".
 ///
+/// Unknown fields are rejected too. A misspelled limit (`max_byte`) that parsed as
+/// "no such limit" would start a storage that reports a policy on the admin space
+/// and has no bound.
+///
 /// ```json5
 /// retention: {
 ///   max_age_secs: 2592000,       // 30 d
@@ -91,15 +95,19 @@ impl HistoryMode {
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct RetentionPolicy {
     /// Drop samples older than this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_age_secs: Option<u64>,
 
-    /// Evict oldest samples until the database file is under this size.
+    /// Keep the database file under this size.
     ///
-    /// Measured against the real file, not an estimate. redb does not shrink the
-    /// file when rows are removed, so enforcing this also compacts.
+    /// The limit is on the real file. A pass that finds the file over it compacts,
+    /// because redb does not shrink the file when rows are removed; and it evicts
+    /// the oldest samples first only if the *data* — what the file would be once
+    /// compacted — is itself over the limit. A file that is over the limit merely
+    /// because it is full of freed pages loses no samples.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<u64>,
 
@@ -124,6 +132,7 @@ pub struct RetentionPolicy {
 /// only the backend can apply: the router's downsampling interceptor shapes
 /// *traffic*, not storage, so it cannot thin data that is already written.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DecimationPolicy {
     /// Keep every sample newer than this.
     pub recent_secs: u64,
@@ -138,6 +147,38 @@ impl RetentionPolicy {
             || self.max_bytes.is_some()
             || self.max_samples_per_key.is_some()
             || self.decimate.is_some()
+    }
+
+    /// Check the policy for values that parse but cannot mean what they say.
+    ///
+    /// Called when a storage is created, so a bad policy is a startup error rather
+    /// than something a pass quietly works around an hour later.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if !self.is_bounded() {
+            return Err(
+                "sets no limit. Give it at least one of max_age_secs, max_bytes, \
+                 max_samples_per_key or decimate — an empty policy is almost certainly a \
+                 mistake, and it reads as protection that is not there."
+                    .to_string(),
+            );
+        }
+        if self.interval_secs == 0 {
+            return Err(
+                "`interval_secs` is 0. A pass cannot run continuously; give the number \
+                 of seconds between passes (default 3600)."
+                    .to_string(),
+            );
+        }
+        if let Some(decimate) = &self.decimate
+            && decimate.bucket_secs == 0
+        {
+            return Err(
+                "`decimate.bucket_secs` is 0. It is the width of the bucket one sample \
+                 is kept from, so it must be at least 1."
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -401,6 +442,61 @@ mod tests {
         assert_eq!(parsed.read_only, default.read_only);
         assert!(default.fsync, "fsync must default to on");
         assert!(default.create_db, "create_db must default to on");
+    }
+
+    /// A misspelled limit must fail to parse, not parse as "no such limit".
+    #[test]
+    fn a_misspelled_retention_limit_is_rejected() {
+        let err = serde_json::from_str::<RetentionPolicy>(
+            r#"{ "max_age_secs": 86400, "max_byte": 10737418240 }"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("max_byte"), "{err}");
+
+        let err = serde_json::from_str::<RetentionPolicy>(
+            r#"{ "decimate": { "recent_secs": 60, "bucket_sec": 5 } }"#,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("bucket_sec"), "{err}");
+
+        // The documented shape still parses.
+        let policy: RetentionPolicy = serde_json::from_str(
+            r#"{ "max_age_secs": 2592000, "max_bytes": 10737418240,
+                 "max_samples_per_key": 100000,
+                 "decimate": { "recent_secs": 86400, "bucket_secs": 300 },
+                 "interval_secs": 3600 }"#,
+        )
+        .unwrap();
+        assert!(policy.validate().is_ok());
+    }
+
+    /// Values that parse but cannot mean what they say are startup errors.
+    #[test]
+    fn a_policy_with_impossible_values_does_not_validate() {
+        let empty = RetentionPolicy::default();
+        assert!(empty.validate().unwrap_err().contains("no limit"));
+
+        let no_interval = RetentionPolicy {
+            max_age_secs: Some(60),
+            interval_secs: 0,
+            ..Default::default()
+        };
+        assert!(
+            no_interval
+                .validate()
+                .unwrap_err()
+                .contains("interval_secs")
+        );
+
+        let no_bucket = RetentionPolicy {
+            decimate: Some(DecimationPolicy {
+                recent_secs: 60,
+                bucket_secs: 0,
+            }),
+            interval_secs: 60,
+            ..Default::default()
+        };
+        assert!(no_bucket.validate().unwrap_err().contains("bucket_secs"));
     }
 
     #[test]

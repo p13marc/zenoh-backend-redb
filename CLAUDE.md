@@ -123,8 +123,25 @@ Two features that are easy to miss and hard to rediscover:
 - **`retention`** is per-storage and **mandatory for `all`-mode storages**, which
   refuse to start without it. Zenoh has no TTL — the manager's `garbage_collection`
   prunes its own in-memory metadata, never stored values — so bounding the disk is
-  this backend's job. `max_bytes` compacts, because redb does not return space to
-  the filesystem on delete and the policy would otherwise never converge.
+  this backend's job.
+
+Three rules the retention code in `storage.rs` exists to keep, each learned the hard
+way:
+
+- **Never decide what to delete from the file length.** redb reuses freed pages but
+  does not return them to the filesystem, and every PUT is its own copy-on-write
+  commit, so a healthy file is two to three times its live data. `max_bytes` is a
+  limit on the file, but eviction is sized from the live data (`live_bytes`), and
+  compaction — not deletion — is what shrinks the file. The log line reports sample
+  counts for the same reason: "N -> N bytes" after a successful pass is normal.
+- **Never hold the history in memory.** No `Vec` of every key, no sort. Reads go
+  through `walk_history`, which reopens its read transaction every
+  `SCAN_ROWS_PER_TXN` rows (a long-lived read transaction stops redb reusing pages,
+  so a slow scan makes concurrent PUTs grow the file), and deletes go out in
+  `DELETE_BATCH`-row commits. `tests/retention_memory.rs` measures this with a
+  counting allocator; it only runs in a release build.
+- **Cutoffs saturate** (`ntp_before`). `NTP64 - NTP64` is a bare `u64` subtraction:
+  a window longer than the clock wraps in a release build and condemns every sample.
 
 Retention runs on a plain OS thread, **not** a tokio task: `Volume::create_storage`
 is not called from inside a tokio runtime in zenohd, and spawning one there panics

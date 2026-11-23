@@ -7,7 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`max_bytes` deleted samples from storages that fitted their budget** (#33). It
+  compared the limit against the file length and evicted before compacting, but a
+  redb file is routinely two to three times its live data. A pass now measures the
+  live data, evicts only if *that* is over the limit, and compacts to shrink the
+  file. If compaction cannot run, nothing is deleted on the strength of the file
+  length. In the reproduction (12 MB of live data, `max_bytes` 20 MB) the old code
+  kept 9 313 of 24 000 in-window samples; this keeps all of them.
+- **A retention pass no longer reads the history into memory** (#34). The age pass
+  built the full list of doomed keys before deleting any, and the size pass read and
+  sorted every history key, once per round. A pass now holds one 4096-row batch,
+  reads in short transactions, and with `max_age_secs` touches only the rows it
+  deletes plus one per key. 100 000 samples: about 1.8 MB of heap, down from over
+  30 MB.
+- **The retention log line and admin report could not show that a pass worked**
+  (#27). They reported the file size before and after, which is identical unless the
+  pass compacts. They now report the sample count before and after, how many samples
+  were evicted for size, and whether the pass compacted.
+- **A large `max_age_secs` deleted the whole history** (#38). A window longer than
+  the time since 1970 underflowed, and in a release build wrapped to a cutoff in the
+  far future. Past 2^32 seconds it panicked the retention thread instead, ending
+  retention for that storage without a word. Cutoffs now saturate, and a pass that
+  panics is logged and does not stop the next one.
+
 ### Changed
+- **Breaking (config):** an unknown field inside `retention` or `retention.decimate`
+  is now a startup error (#38). `max_byte: ...` used to parse as "no size limit".
+  `interval_secs: 0` and `decimate.bucket_secs: 0` are rejected too.
+- **Breaking (API):** `RetentionPass` gains `samples_before`, `samples_after`,
+  `samples_evicted_for_size` and `compacted`. `RetentionPolicy::validate` is new.
+- `max_bytes` eviction now stops at about 90 % of the limit rather than at it, so
+  ordinary writes do not put the data straight back over.
 - Updated to Zenoh 1.10.2 (pinned `=1.10.2`, now on all five zenoh crates: `zenoh`
   itself was `"1.10"`). The plugin must be rebuilt against a 1.10.2 `zenohd`; the
   toolchain stays at 1.97.

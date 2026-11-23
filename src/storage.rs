@@ -3,7 +3,7 @@
 //! This implementation separates payload and metadata (data_info) into different tables,
 //! similar to the RocksDB backend design using column families.
 
-use crate::config::{HistoryMode, RedbStorageConfig, RetentionPolicy};
+use crate::config::{HistoryMode, RedbStorageConfig};
 use crate::error::{RedbBackendError, Result};
 use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
@@ -84,20 +84,105 @@ fn encode_history_key(key: &str, timestamp: &Timestamp) -> Vec<u8> {
     out
 }
 
-/// The half-open byte range covering every sample of `key`.
-///
-/// The upper bound is `key || 0x01`: every composite key for `key` starts
-/// `key || 0x00`, and nothing else in the table can fall between the two.
-fn history_key_bounds(key: &str) -> (Vec<u8>, Vec<u8>) {
+/// The first possible composite key for `key`: `key || 0x00`.
+fn key_range_start(key: &[u8]) -> Vec<u8> {
     let mut start = Vec::with_capacity(key.len() + 1);
-    start.extend_from_slice(key.as_bytes());
+    start.extend_from_slice(key);
     start.push(KEY_TIME_SEPARATOR);
+    start
+}
 
+/// The exclusive end of `key`'s samples: `key || 0x01`.
+///
+/// Every composite key for `key` starts `key || 0x00`, and nothing else in the
+/// table can fall between that and `key || 0x01`. It is also where the next key's
+/// samples can begin, which is what lets a scan skip the rest of a key.
+fn key_range_end(key: &[u8]) -> Vec<u8> {
     let mut end = Vec::with_capacity(key.len() + 1);
-    end.extend_from_slice(key.as_bytes());
+    end.extend_from_slice(key);
     end.push(KEY_TIME_SEPARATOR + 1);
+    end
+}
 
-    (start, end)
+/// The half-open byte range covering every sample of `key`.
+fn history_key_bounds(key: &str) -> (Vec<u8>, Vec<u8>) {
+    (
+        key_range_start(key.as_bytes()),
+        key_range_end(key.as_bytes()),
+    )
+}
+
+/// Split a composite key into its key bytes and its time, without allocating.
+///
+/// Retention reads every row it considers through this, so unlike
+/// [`decode_history_key`] it builds neither a `String` nor a `Timestamp`.
+fn split_history_key(bytes: &[u8]) -> Result<(&[u8], NTP64)> {
+    if bytes.len() < TIMESTAMP_LEN + 1 {
+        return Err(RedbBackendError::key_encoding(format!(
+            "history key too short: {} bytes",
+            bytes.len()
+        )));
+    }
+    let split = bytes.len() - TIMESTAMP_LEN;
+    if bytes[split - 1] != KEY_TIME_SEPARATOR {
+        return Err(RedbBackendError::key_encoding(
+            "history key is missing its separator".to_string(),
+        ));
+    }
+    let mut ntp = [0u8; 8];
+    ntp.copy_from_slice(&bytes[split..split + 8]);
+    Ok((&bytes[..split - 1], NTP64(u64::from_be_bytes(ntp))))
+}
+
+/// The instant `secs` before `now`, saturating at the epoch.
+///
+/// Saturating matters. `NTP64 - NTP64` is a bare `u64` subtraction, so a window
+/// longer than the time since 1970 underflows — and in a release build that wraps
+/// to a cutoff in the far future, which condemns every sample in the storage. And
+/// `NTP64::from(Duration)` asserts that the seconds fit in 32 bits. A window that
+/// reaches back past the epoch simply means nothing is old enough.
+fn ntp_before(now: NTP64, secs: u64) -> NTP64 {
+    match u32::try_from(secs) {
+        Ok(secs) => NTP64(now.0.saturating_sub(u64::from(secs) << 32)),
+        Err(_) => NTP64(0),
+    }
+}
+
+/// `Some(n)` as `n`, `None` as `?`, for log lines.
+fn fmt_opt(value: Option<u64>) -> String {
+    value.map_or_else(|| "?".to_string(), |v| v.to_string())
+}
+
+/// History rows removed per write transaction. Bounds both how long retention
+/// holds the write lock and how many keys it holds in memory.
+///
+/// Small under test so that a few hundred rows cross many batch boundaries.
+#[cfg(not(test))]
+const DELETE_BATCH: usize = 4096;
+#[cfg(test)]
+const DELETE_BATCH: usize = 64;
+
+/// History rows read per read transaction before it is reopened; see
+/// [`RedbStorage::walk_history`].
+#[cfg(not(test))]
+const SCAN_ROWS_PER_TXN: usize = 65_536;
+#[cfg(test)]
+const SCAN_ROWS_PER_TXN: usize = 100;
+
+/// Counters in the timestamp histogram that picks a size-eviction cutoff.
+const EVICTION_BUCKETS: usize = 4096;
+
+/// How many times that histogram is re-read inside the bucket holding the cut.
+const EVICTION_REFINEMENTS: usize = 3;
+
+/// What a history visitor wants next.
+enum Step {
+    /// Go on to the next row.
+    Continue,
+    /// Jump to this position, skipping what lies between.
+    SeekTo(Vec<u8>),
+    /// End the walk here; it can be resumed.
+    Stop,
 }
 
 /// Inverse of [`encode_history_key`].
@@ -131,18 +216,34 @@ fn decode_history_key(bytes: &[u8]) -> Result<(String, Timestamp)> {
 /// Reported on the admin space so that a policy is verifiable from outside the
 /// process — "the storage says it is bounded" is not the same as "the storage is
 /// bounded".
+///
+/// The sample counts are the evidence that a pass worked. The file sizes are not:
+/// redb reuses the pages a delete frees but does not return them to the
+/// filesystem, so the file is the same length before and after a pass unless that
+/// pass [`compacted`](Self::compacted).
 #[derive(Debug, Clone, Default)]
 pub struct RetentionPass {
     /// When the pass ran. `None` if no pass has run yet.
     pub ran_at: Option<SystemTime>,
     /// How long it took.
     pub duration: Option<Duration>,
-    /// Samples removed.
+    /// Samples removed, by every rule together.
     pub samples_dropped: u64,
+    /// Of those, the ones evicted only because the data was over `max_bytes`.
+    /// Non-zero means the size limit, not age, is what is bounding this storage.
+    pub samples_evicted_for_size: u64,
+    /// Samples held before the pass.
+    pub samples_before: Option<u64>,
+    /// Samples held after the pass.
+    pub samples_after: Option<u64>,
     /// File size before the pass.
     pub bytes_before: Option<u64>,
-    /// File size after the pass, compaction included.
+    /// File size after the pass. Only differs from `bytes_before` when the pass
+    /// compacted (or when concurrent writes grew the file meanwhile).
     pub bytes_after: Option<u64>,
+    /// Whether the pass compacted the file, which is the only thing that shrinks
+    /// it. Only a pass that finds the file over `max_bytes` compacts.
+    pub compacted: bool,
 }
 
 /// A point-in-time report of what a storage costs.
@@ -794,8 +895,10 @@ impl RedbStorage {
     /// Apply the configured retention policy once.
     ///
     /// Enforcement is periodic rather than per-write: doing it on every PUT would
-    /// put a scan on the hot path. Deletions happen in bounded, committed batches
-    /// so a pass never holds a write transaction open across the whole database.
+    /// put a scan on the hot path. The pass never holds more than one batch of keys
+    /// in memory, never keeps a read transaction open across the whole table, and
+    /// deletes in bounded, committed batches — so its cost follows what it removes,
+    /// not what the storage holds.
     ///
     /// Returns what the pass did, which is reported on the admin space so retention
     /// is verifiable from outside the process.
@@ -808,9 +911,10 @@ impl RedbStorage {
         }
 
         let started = SystemTime::now();
-        let bytes_before = self.on_disk_bytes();
         let mut pass = RetentionPass {
             ran_at: Some(started),
+            bytes_before: self.on_disk_bytes(),
+            samples_before: Some(self.sample_count()?),
             ..RetentionPass::default()
         };
 
@@ -820,26 +924,53 @@ impl RedbStorage {
                 .map_err(|e| RedbBackendError::other(format!("system clock before epoch: {e}")))?,
         );
 
-        // Which rows must go. Decided in a read transaction over the ordered table,
-        // where every sample of a key is already contiguous and in time order, so
-        // age, per-key count and decimation are all answerable in one pass.
-        let doomed = self.select_expired(&policy, now)?;
-        pass.samples_dropped = self.drop_history_rows(&doomed)?;
-
-        // Size is enforced last, because the rules above may already have brought
-        // the file under the limit.
-        if let Some(max_bytes) = policy.max_bytes {
-            pass.samples_dropped += self.enforce_max_bytes(max_bytes)?;
+        // Age and decimation: both are decided by a sample's own timestamp, and a
+        // key's samples are stored oldest-first, so one forward walk answers both.
+        let age_cutoff = policy.max_age_secs.map(|secs| ntp_before(now, secs));
+        let decimate = policy
+            .decimate
+            .as_ref()
+            .map(|d| (ntp_before(now, d.recent_secs), d.bucket_secs.max(1)));
+        if age_cutoff.is_some() || decimate.is_some() {
+            pass.samples_dropped += self.prune_by_time(age_cutoff, decimate)?;
         }
 
-        pass.bytes_before = bytes_before;
+        // Per-key count, applied to what the rules above left.
+        if let Some(max) = policy.max_samples_per_key {
+            pass.samples_dropped += self.prune_by_count(max)?;
+        }
+
+        // Size is enforced last, because the rules above may already have brought
+        // the data under the limit.
+        if let Some(max_bytes) = policy.max_bytes {
+            let (evicted, compacted) = self.enforce_max_bytes(max_bytes)?;
+            pass.samples_evicted_for_size = evicted;
+            pass.samples_dropped += evicted;
+            pass.compacted = compacted;
+        }
+
         pass.bytes_after = self.on_disk_bytes();
+        pass.samples_after = Some(self.sample_count()?);
         pass.duration = started.elapsed().ok();
 
-        if pass.samples_dropped > 0 {
+        if pass.samples_dropped > 0 || pass.compacted {
+            // The sample counts are what show the pass working. The file length is
+            // reported too, but it only moves when the pass compacts: redb reuses
+            // the pages a delete frees and does not hand them back to the
+            // filesystem, so "N -> N bytes" after a successful pass is normal.
             info!(
-                "Retention pass on '{}': dropped {} samples, {:?} -> {:?} bytes",
-                self.name, pass.samples_dropped, pass.bytes_before, pass.bytes_after
+                "Retention pass on '{}': dropped {} samples ({} -> {}), file {} -> {} bytes ({})",
+                self.name,
+                pass.samples_dropped,
+                fmt_opt(pass.samples_before),
+                fmt_opt(pass.samples_after),
+                fmt_opt(pass.bytes_before),
+                fmt_opt(pass.bytes_after),
+                if pass.compacted {
+                    "compacted"
+                } else {
+                    "not compacted: freed pages are reused, the file only shrinks on compaction"
+                },
             );
         }
         Ok(pass)
@@ -854,74 +985,215 @@ impl RedbStorage {
             .map(|m| m.len())
     }
 
-    /// Composite keys that the age, per-key-count and decimation rules condemn.
-    fn select_expired(&self, policy: &RetentionPolicy, now: NTP64) -> Result<Vec<Vec<u8>>> {
+    /// Samples held in the history tables. O(1): redb keeps the count in the tree
+    /// root.
+    fn sample_count(&self) -> Result<u64> {
         let read_txn = self.begin_read()?;
-        let info_table = read_txn.open_table(HISTORY_INFO_TABLE)?;
+        Ok(read_txn.open_table(HISTORY_INFO_TABLE)?.len()?)
+    }
 
-        let min_age_keep = policy
-            .max_age_secs
-            .map(|secs| now - NTP64::from(Duration::from_secs(secs)));
-        let decimate_before = policy
-            .decimate
-            .as_ref()
-            .map(|d| now - NTP64::from(Duration::from_secs(d.recent_secs)));
+    /// Visit history keys in table order, starting at `pos`.
+    ///
+    /// This is the only way retention reads the history, and it exists to keep two
+    /// promises a plain `iter()` over the table cannot:
+    ///
+    /// * **No long-lived read transaction.** redb cannot reuse a page freed by a
+    ///   commit made while an older read transaction is still alive, so a scan that
+    ///   held one transaction across a multi-gigabyte table would make every
+    ///   concurrent PUT grow the file. The transaction is reopened every
+    ///   [`SCAN_ROWS_PER_TXN`] rows.
+    /// * **Resumable.** `pos` always holds the position to continue from, so the
+    ///   caller can stop, delete a batch, and call again.
+    ///
+    /// Returns `true` when the end of the table was reached, `false` when the
+    /// visitor stopped the walk.
+    fn walk_history(
+        &self,
+        pos: &mut Vec<u8>,
+        visit: &mut dyn FnMut(&[u8]) -> Result<Step>,
+    ) -> Result<bool> {
+        loop {
+            let read_txn = self.begin_read()?;
+            let info = read_txn.open_table(HISTORY_INFO_TABLE)?;
+            let mut examined = 0usize;
 
-        let mut doomed = Vec::new();
+            'txn: loop {
+                let from = pos.clone();
+                let mut seek = None;
+                for item in info.range(from.as_slice()..)? {
+                    let (key_bytes, _) = item?;
+                    let raw = key_bytes.value();
+                    examined += 1;
 
-        // Per-key state. The table is ordered by key then time, so a key's samples
-        // arrive together and oldest-first; that is what lets one linear pass answer
-        // all three rules without buffering a whole key's history.
-        let mut current_key: Option<String> = None;
-        let mut key_rows: Vec<(Vec<u8>, NTP64)> = Vec::new();
+                    // Resume strictly after this row: `raw || 0x00` is the smallest
+                    // key greater than `raw`.
+                    pos.clear();
+                    pos.extend_from_slice(raw);
+                    pos.push(0);
 
-        let flush = |key_rows: &mut Vec<(Vec<u8>, NTP64)>, doomed: &mut Vec<Vec<u8>>| {
-            if let Some(max) = policy.max_samples_per_key {
-                let excess = (key_rows.len() as u64).saturating_sub(max) as usize;
-                // Oldest first, so the excess is at the front.
-                for (raw, _) in key_rows.iter().take(excess) {
-                    doomed.push(raw.clone());
+                    match visit(raw)? {
+                        Step::Continue => {}
+                        Step::SeekTo(to) => {
+                            seek = Some(to);
+                            break;
+                        }
+                        Step::Stop => return Ok(false),
+                    }
+                    if examined >= SCAN_ROWS_PER_TXN {
+                        break 'txn;
+                    }
+                }
+                match seek {
+                    Some(to) => {
+                        *pos = to;
+                        if examined >= SCAN_ROWS_PER_TXN {
+                            break 'txn;
+                        }
+                    }
+                    // The range ran out: that was the end of the table.
+                    None => return Ok(true),
                 }
             }
-            key_rows.clear();
-        };
-
-        for item in info_table.iter()? {
-            let (key_bytes, _) = item?;
-            let raw = key_bytes.value().to_vec();
-            let (key, timestamp) = decode_history_key(&raw)?;
-            let time = *timestamp.get_time();
-
-            if current_key.as_deref() != Some(key.as_str()) {
-                flush(&mut key_rows, &mut doomed);
-                current_key = Some(key);
-            }
-
-            // Rule 1: too old outright.
-            if min_age_keep.is_some_and(|cutoff| time < cutoff) {
-                doomed.push(raw);
-                continue;
-            }
-
-            // Rule 2: beyond the full-resolution window, keep one per bucket.
-            if let (Some(cutoff), Some(d)) = (decimate_before, policy.decimate.as_ref())
-                && time < cutoff
-            {
-                let bucket = time.as_secs() as u64 / d.bucket_secs.max(1);
-                let already_kept_this_bucket = key_rows.last().is_some_and(|(_, kept)| {
-                    kept.as_secs() as u64 / d.bucket_secs.max(1) == bucket
-                });
-                if already_kept_this_bucket {
-                    doomed.push(raw);
-                    continue;
-                }
-            }
-
-            key_rows.push((raw, time));
         }
-        flush(&mut key_rows, &mut doomed);
+    }
 
-        Ok(doomed)
+    /// Drop samples that are too old, and thin out the ones beyond the
+    /// full-resolution window. Returns how many were removed.
+    ///
+    /// * `age_cutoff`: every sample older than this goes.
+    /// * `decimate`: `(before, bucket_secs)` — of the samples older than `before`,
+    ///   keep the first in each `bucket_secs` bucket.
+    ///
+    /// A key's samples are contiguous and oldest-first, so as soon as one is inside
+    /// the full-resolution window the rest of that key is too, and the walk seeks
+    /// straight to the next key. With only `max_age_secs` set, a pass therefore
+    /// reads the rows it deletes plus one row per key — not the whole history.
+    fn prune_by_time(
+        &self,
+        age_cutoff: Option<NTP64>,
+        decimate: Option<(NTP64, u64)>,
+    ) -> Result<u64> {
+        let mut dropped = 0u64;
+        let mut pos = Vec::new();
+        let mut doomed: Vec<Vec<u8>> = Vec::with_capacity(DELETE_BATCH);
+
+        // Decimation state for the key the walk is in. It survives across batches,
+        // because a key's samples can span several.
+        let mut current_key: Vec<u8> = Vec::new();
+        let mut last_kept_bucket: Option<u64> = None;
+
+        loop {
+            doomed.clear();
+            let reached_end = self.walk_history(&mut pos, &mut |raw| {
+                let (key, time) = split_history_key(raw)?;
+                if key != current_key.as_slice() {
+                    current_key.clear();
+                    current_key.extend_from_slice(key);
+                    last_kept_bucket = None;
+                }
+
+                let doom = if age_cutoff.is_some_and(|cutoff| time < cutoff) {
+                    true
+                } else if let Some((before, bucket_secs)) = decimate
+                    && time < before
+                {
+                    let bucket = u64::from(time.as_secs()) / bucket_secs;
+                    if last_kept_bucket == Some(bucket) {
+                        true
+                    } else {
+                        last_kept_bucket = Some(bucket);
+                        false
+                    }
+                } else {
+                    // Inside the full-resolution window, and so is every later
+                    // sample of this key.
+                    return Ok(Step::SeekTo(key_range_end(key)));
+                };
+
+                if doom {
+                    doomed.push(raw.to_vec());
+                    if doomed.len() >= DELETE_BATCH {
+                        return Ok(Step::Stop);
+                    }
+                }
+                Ok(Step::Continue)
+            })?;
+
+            dropped += self.drop_history_rows(&doomed)?;
+            if reached_end {
+                break;
+            }
+        }
+
+        Ok(dropped)
+    }
+
+    /// Trim every key to its newest `max` samples. Returns how many were removed.
+    ///
+    /// The cut is found by walking back `max` rows from the end of the key, so a
+    /// key is never buffered and a key under the limit costs at most its own length.
+    fn prune_by_count(&self, max: u64) -> Result<u64> {
+        let mut dropped = 0u64;
+        let mut pos: Vec<u8> = Vec::new();
+        let skip = usize::try_from(max).unwrap_or(usize::MAX);
+
+        loop {
+            // One short read transaction per key: find the key at `pos`, and the
+            // newest row that is beyond its limit, if there is one.
+            let excess = {
+                let read_txn = self.begin_read()?;
+                let info = read_txn.open_table(HISTORY_INFO_TABLE)?;
+
+                let Some(first) = info.range(pos.as_slice()..)?.next() else {
+                    break;
+                };
+                let (first_key, _) = first?;
+                let (key, _) = split_history_key(first_key.value())?;
+                let start = key_range_start(key);
+                let end = key_range_end(key);
+
+                // The row `max` places back from the newest: it, and everything
+                // older, is over the limit.
+                let cut = match info
+                    .range(start.as_slice()..end.as_slice())?
+                    .rev()
+                    .nth(skip)
+                {
+                    Some(row) => Some(row?.0.value().to_vec()),
+                    None => None,
+                };
+
+                pos = end;
+                cut.map(|cut| (start, cut))
+            };
+
+            if let Some((start, cut)) = excess {
+                dropped += self.drop_history_range(&start, &cut)?;
+            }
+        }
+
+        Ok(dropped)
+    }
+
+    /// Remove every history row in `start..=end_inclusive`, a batch at a time.
+    fn drop_history_range(&self, start: &[u8], end_inclusive: &[u8]) -> Result<u64> {
+        let mut dropped = 0u64;
+        loop {
+            let batch: Vec<Vec<u8>> = {
+                let read_txn = self.begin_read()?;
+                let info = read_txn.open_table(HISTORY_INFO_TABLE)?;
+                let mut batch = Vec::new();
+                for item in info.range(start..=end_inclusive)?.take(DELETE_BATCH) {
+                    batch.push(item?.0.value().to_vec());
+                }
+                batch
+            };
+            if batch.is_empty() {
+                break;
+            }
+            dropped += self.drop_history_rows(&batch)?;
+        }
+        Ok(dropped)
     }
 
     /// Remove history rows in committed batches.
@@ -930,10 +1202,9 @@ impl RedbStorage {
     /// millions of rows would hold the write lock for the whole pass, and retention
     /// must not block writes for minutes at a time.
     fn drop_history_rows(&self, keys: &[Vec<u8>]) -> Result<u64> {
-        const BATCH: usize = 4096;
         let mut dropped = 0u64;
 
-        for chunk in keys.chunks(BATCH) {
+        for chunk in keys.chunks(DELETE_BATCH) {
             let write_txn = self.begin_write()?;
             {
                 let mut payloads = write_txn.open_table(HISTORY_PAYLOADS_TABLE)?;
@@ -951,15 +1222,49 @@ impl RedbStorage {
         Ok(dropped)
     }
 
-    /// Drop the oldest samples until the file is under `max_bytes`.
+    /// Bytes the tables occupy: what the file would be after a compaction.
     ///
-    /// This has to compact. redb does not return space to the filesystem when rows
-    /// are removed, so without compaction the file size never falls, the policy
-    /// never converges, and every pass would delete more data while reporting no
-    /// improvement — silent, unbounded data loss dressed up as retention.
-    fn enforce_max_bytes(&self, max_bytes: u64) -> Result<u64> {
-        const MAX_ROUNDS: usize = 8;
-        let mut dropped = 0u64;
+    /// Returns `(all tables, history tables only)`. This walks every page of every
+    /// table, so it is only called once the file is already known to be over its
+    /// limit.
+    fn live_bytes(&self) -> Result<(u64, u64)> {
+        let read_txn = self.begin_read()?;
+        let bytes = |stats: redb::TableStats| {
+            stats.stored_bytes() + stats.metadata_bytes() + stats.fragmented_bytes()
+        };
+        let latest = bytes(read_txn.open_table(PAYLOADS_TABLE)?.stats()?)
+            + bytes(read_txn.open_table(DATA_INFO_TABLE)?.stats()?);
+        let history = bytes(read_txn.open_table(HISTORY_PAYLOADS_TABLE)?.stats()?)
+            + bytes(read_txn.open_table(HISTORY_INFO_TABLE)?.stats()?);
+        Ok((latest + history, history))
+    }
+
+    /// Bring the database file under `max_bytes`.
+    ///
+    /// Returns `(samples evicted, whether the file was compacted)`.
+    ///
+    /// The limit is on the **file**, but what gets deleted is decided from the
+    /// **data**. The two differ by a lot: every PUT is its own copy-on-write commit,
+    /// and the pages it frees stay in the file until a compaction, so a healthy
+    /// storage's file is routinely two or three times its live data. Evicting
+    /// against the file length — which this used to do — deleted samples from a
+    /// storage that fitted its budget, on every pass, for as long as write churn
+    /// kept re-inflating the file.
+    ///
+    /// So: when the file is over the limit, measure the live data. Only if *that*
+    /// is over budget are the oldest samples evicted, and only as many as the
+    /// excess calls for. Then compact, which is what actually shrinks the file. If
+    /// compaction cannot run, nothing is deleted on the strength of the file length.
+    fn enforce_max_bytes(&self, max_bytes: u64) -> Result<(u64, bool)> {
+        // Enough to converge when the first estimate falls short; each round is a
+        // full compaction, so this is not a loop to leave open-ended.
+        const MAX_ROUNDS: usize = 3;
+        // Evict to a little under the limit, so the next few minutes of ordinary
+        // writes do not put the data straight back over it.
+        let target = max_bytes - max_bytes / 10;
+
+        let mut evicted = 0u64;
+        let mut compacted = false;
 
         for _ in 0..MAX_ROUNDS {
             let Some(size) = self.on_disk_bytes() else {
@@ -970,73 +1275,197 @@ impl RedbStorage {
                      unknown, so size cannot be enforced",
                     self.name
                 );
-                return Ok(dropped);
+                break;
             };
             if size <= max_bytes {
                 break;
             }
 
-            // Oldest samples across all keys. Collected by timestamp rather than by
-            // table order, because table order is by key first.
-            let mut all: Vec<(NTP64, Vec<u8>)> = {
-                let read_txn = self.begin_read()?;
-                let info = read_txn.open_table(HISTORY_INFO_TABLE)?;
-                let mut v = Vec::new();
-                for item in info.iter()? {
-                    let (key_bytes, _) = item?;
-                    let raw = key_bytes.value().to_vec();
-                    let (_, ts) = decode_history_key(&raw)?;
-                    v.push((*ts.get_time(), raw));
+            let (live, history_live) = self.live_bytes()?;
+            let mut evicted_this_round = 0u64;
+
+            if live > target {
+                let samples = self.sample_count()?;
+                if samples == 0 || history_live == 0 {
+                    // Nothing left to evict, yet the data is still over the limit.
+                    // The remainder is latest values and redb's own overhead,
+                    // neither of which retention may touch — deleting current
+                    // values to satisfy a size budget would be data loss, not
+                    // retention. Say so loudly: this is a misconfiguration
+                    // (max_bytes below the storage's irreducible size), and silence
+                    // would look like the policy working.
+                    warn!(
+                        "Storage '{}' holds {} bytes of live data, over its max_bytes of {}, \
+                         but its history is already empty. The remainder is current values \
+                         and redb overhead, which retention will not delete. Raise \
+                         max_bytes or reduce what this storage holds.",
+                        self.name, live, max_bytes
+                    );
+                    break;
                 }
-                v
-            };
-            if all.is_empty() {
-                // Nothing left to evict, yet the file is still over the limit. The
-                // remainder is latest-value data and redb's own overhead, neither of
-                // which retention may touch — deleting current values to satisfy a
-                // size budget would be data loss, not retention. Say so loudly
-                // instead of looping: this is a misconfiguration (max_bytes below
-                // the storage's irreducible size), and silence would look like the
-                // policy working.
-                warn!(
-                    "Storage '{}' is {} bytes, over its max_bytes of {}, but its \
-                     history is already empty. The remainder is current values and \
-                     redb overhead, which retention will not delete. Raise \
-                     max_bytes or reduce what this storage holds.",
-                    self.name, size, max_bytes
-                );
+
+                // Assume samples are about the same size, and evict the share of
+                // them that the excess is of the history.
+                let share = (live - target) as f64 / history_live as f64;
+                let to_evict = ((samples as f64 * share).ceil() as u64).clamp(1, samples);
+                if let Some(cutoff) = self.eviction_cutoff(to_evict)? {
+                    evicted_this_round = self.prune_by_time(Some(cutoff), None)?;
+                    evicted += evicted_this_round;
+                }
+            }
+
+            // Hand the freed pages back to the filesystem.
+            let shrank = self.compact();
+            compacted |= shrank;
+
+            if evicted_this_round == 0 && !shrank {
+                // Neither lever moved anything, so another round cannot either.
+                if self.on_disk_bytes().is_some_and(|size| size > max_bytes) {
+                    warn!(
+                        "Storage '{}' is still over its max_bytes of {} and this pass could \
+                         not reduce it: {} bytes of live data, and the file could not be \
+                         compacted further.",
+                        self.name, max_bytes, live
+                    );
+                }
                 break;
             }
-            all.sort_by_key(|(ts, _)| *ts);
+        }
 
-            // Drop a proportional slice, so an over-limit file converges in a few
-            // rounds instead of one row at a time.
-            let over = size.saturating_sub(max_bytes) as f64 / size.max(1) as f64;
-            let take = ((all.len() as f64 * over).ceil() as usize).clamp(1, all.len());
-            let batch: Vec<Vec<u8>> = all.into_iter().take(take).map(|(_, raw)| raw).collect();
+        Ok((evicted, compacted))
+    }
 
-            dropped += self.drop_history_rows(&batch)?;
+    /// Compact the database file. Returns whether it got smaller.
+    ///
+    /// Compaction needs the database to itself, so every read and write on this
+    /// storage waits while it runs. redb refuses while any transaction is alive;
+    /// with new ones held off by the lock, the ones in flight finish in
+    /// milliseconds, so a refusal is retried briefly rather than given up on.
+    fn compact(&self) -> bool {
+        const ATTEMPTS: usize = 20;
+        const BACKOFF: Duration = Duration::from_millis(50);
 
-            // Reclaim the space to the filesystem. A compaction can legitimately
-            // refuse (redb declines while transactions are outstanding), and that
-            // must not fail the pass: the deletions above are already committed and
-            // correct. The next pass will try again.
-            let mut db = self.db.write().unwrap_or_else(|e| e.into_inner());
+        let mut db = self.db.write().unwrap_or_else(|e| e.into_inner());
+        for attempt in 1..=ATTEMPTS {
             match db.compact() {
-                Ok(true) => trace!("Compacted '{}' after retention", self.name),
-                Ok(false) => trace!("Nothing left to compact on '{}'", self.name),
+                Ok(true) => {
+                    debug!("Compacted '{}'", self.name);
+                    return true;
+                }
+                Ok(false) => {
+                    trace!("Nothing to compact on '{}'", self.name);
+                    return false;
+                }
+                Err(redb::CompactionError::TransactionInProgress) if attempt < ATTEMPTS => {
+                    std::thread::sleep(BACKOFF);
+                }
                 Err(e) => {
-                    warn!(
-                        "Compaction after retention on '{}' failed: {}",
-                        self.name, e
-                    );
-                    drop(db);
+                    // Not fatal: whatever was deleted is committed and correct, and
+                    // the next pass tries again.
+                    warn!("Compaction of '{}' failed: {}", self.name, e);
+                    return false;
+                }
+            }
+        }
+        false
+    }
+
+    /// A timestamp such that about `to_evict` samples are older than it, or `None`
+    /// if the history is empty.
+    ///
+    /// The history is ordered by key first, so "the oldest N samples across every
+    /// key" is not a range. Sorting every key to find them — which this used to do
+    /// — costs memory in proportion to the whole history. A histogram of timestamps
+    /// costs a fixed [`EVICTION_BUCKETS`] counters instead, and is refined by
+    /// re-reading inside the bucket the cut falls in until the overshoot is small.
+    fn eviction_cutoff(&self, to_evict: u64) -> Result<Option<NTP64>> {
+        // The time span held: the first and last row of every key.
+        let mut span: Option<(u64, u64)> = None;
+        {
+            let mut pos = Vec::new();
+            loop {
+                let read_txn = self.begin_read()?;
+                let info = read_txn.open_table(HISTORY_INFO_TABLE)?;
+                let mut keys_seen = 0usize;
+                let mut reached_end = false;
+                while keys_seen < SCAN_ROWS_PER_TXN {
+                    let Some(first) = info.range(pos.as_slice()..)?.next() else {
+                        reached_end = true;
+                        break;
+                    };
+                    let (first_key, _) = first?;
+                    let (key, oldest) = split_history_key(first_key.value())?;
+                    let start = key_range_start(key);
+                    let end = key_range_end(key);
+                    let newest = match info.range(start.as_slice()..end.as_slice())?.next_back() {
+                        Some(row) => split_history_key(row?.0.value())?.1,
+                        None => oldest,
+                    };
+                    span = Some(match span {
+                        None => (oldest.0, newest.0),
+                        Some((lo, hi)) => (lo.min(oldest.0), hi.max(newest.0)),
+                    });
+                    pos = end;
+                    keys_seen += 1;
+                }
+                if reached_end {
                     break;
                 }
             }
         }
+        let Some((oldest, newest)) = span else {
+            return Ok(None);
+        };
 
-        Ok(dropped)
+        // [lo, hi) always contains the cut; `need` is how many samples at or after
+        // `lo` still have to fall before it.
+        let mut lo = oldest;
+        let mut hi = newest.saturating_add(1);
+        let mut need = to_evict;
+
+        for _ in 0..EVICTION_REFINEMENTS {
+            let width = ((hi - lo) / EVICTION_BUCKETS as u64).max(1);
+            let mut counts = vec![0u64; EVICTION_BUCKETS];
+            let mut pos = Vec::new();
+            self.walk_history(&mut pos, &mut |raw| {
+                let (_, time) = split_history_key(raw)?;
+                if time.0 >= lo && time.0 < hi {
+                    let bucket = (((time.0 - lo) / width) as usize).min(EVICTION_BUCKETS - 1);
+                    counts[bucket] += 1;
+                }
+                Ok(Step::Continue)
+            })?;
+
+            // The bucket the cut falls in.
+            let mut before = 0u64;
+            let mut cut = EVICTION_BUCKETS - 1;
+            for (i, count) in counts.iter().enumerate() {
+                if before + count >= need {
+                    cut = i;
+                    break;
+                }
+                before += count;
+            }
+            let bucket_lo = lo + cut as u64 * width;
+            let bucket_hi = if cut == EVICTION_BUCKETS - 1 {
+                hi
+            } else {
+                (bucket_lo + width).min(hi)
+            };
+
+            // Cutting at the end of this bucket evicts all of it. Good enough once
+            // that overshoots the request by little, or the bucket cannot be split.
+            let overshoot = (before + counts[cut]).saturating_sub(need);
+            if overshoot <= need / 20 || bucket_hi - bucket_lo <= 1 {
+                return Ok(Some(NTP64(bucket_hi)));
+            }
+
+            need -= before;
+            lo = bucket_lo;
+            hi = bucket_hi;
+        }
+
+        Ok(Some(NTP64(hi)))
     }
 
     /// What this storage costs, for the admin space.
@@ -1357,7 +1786,7 @@ fn literal_prefix(pattern: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::DecimationPolicy;
+    use crate::config::{DecimationPolicy, RetentionPolicy};
     use tempfile::TempDir;
     use zenoh::time::TimestampId;
 
@@ -1905,6 +2334,420 @@ mod tests {
             storage.get("k").unwrap().is_some(),
             "retention must never delete the current value to chase a size budget"
         );
+    }
+
+    /// A storage for bulk retention tests: `fsync` off, so a few thousand PUTs do
+    /// not each wait for the disk.
+    fn bulk_storage(policy: RetentionPolicy, path: &std::path::Path) -> RedbStorage {
+        let config = RedbStorageConfig::default()
+            .with_db_path(path.to_path_buf())
+            .with_history(HistoryMode::All)
+            .with_fsync(false)
+            .with_retention(policy);
+        RedbStorage::new(path, config, "bulk".to_string()).unwrap()
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// Write `count` samples to `key`, one per second, the newest `age` seconds old.
+    fn put_aged(
+        storage: &RedbStorage,
+        key: &str,
+        count: u64,
+        age: u64,
+        payload: &[u8],
+        id: TimestampId,
+    ) {
+        let newest = now_secs() - age;
+        for i in 0..count {
+            storage
+                .put(
+                    key,
+                    StoredValue::new(
+                        payload.to_vec(),
+                        at(newest - (count - 1 - i), id),
+                        Encoding::ZENOH_BYTES,
+                    ),
+                )
+                .unwrap();
+        }
+    }
+
+    /// #27: a pass must show that it worked. The file length cannot — it does not
+    /// move without a compaction — so the pass reports the sample counts, and says
+    /// whether it compacted.
+    #[test]
+    fn a_pass_reports_what_it_dropped_not_just_the_file_size() {
+        let dir = TempDir::new().unwrap();
+        let id = TimestampId::rand();
+        let storage = bulk_storage(
+            RetentionPolicy {
+                max_age_secs: Some(3600),
+                ..Default::default()
+            },
+            &dir.path().join("report.redb"),
+        );
+
+        put_aged(&storage, "k", 300, 7200, b"old", id);
+        put_aged(&storage, "k", 50, 10, b"new", id);
+
+        let pass = storage.enforce_retention().unwrap();
+        assert_eq!(pass.samples_dropped, 300);
+        assert_eq!(pass.samples_before, Some(350));
+        assert_eq!(pass.samples_after, Some(50));
+        assert_eq!(pass.samples_evicted_for_size, 0);
+        assert!(
+            !pass.compacted,
+            "nothing compacts without a max_bytes that the file exceeds"
+        );
+        assert!(
+            pass.bytes_after >= pass.bytes_before,
+            "without compaction the file does not shrink, which is exactly why the \
+             sample counts are reported"
+        );
+
+        // And a second pass finds nothing: the first one's deletes were real.
+        let again = storage.enforce_retention().unwrap();
+        assert_eq!(again.samples_dropped, 0);
+        assert_eq!(again.samples_before, Some(50));
+    }
+
+    /// #33: a file over `max_bytes` only because it is full of freed pages must be
+    /// compacted, not have its samples evicted.
+    #[test]
+    fn max_bytes_compacts_instead_of_evicting_when_the_data_fits() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("inflated.redb");
+        let id = TimestampId::rand();
+        let payload = vec![7u8; 1024];
+
+        // Inflate the file: write 3000 samples that are already expired, drop them
+        // without compacting. What is left is 200 live samples in a file sized for
+        // 3200.
+        {
+            let storage = bulk_storage(
+                RetentionPolicy {
+                    max_age_secs: Some(3600),
+                    ..Default::default()
+                },
+                &path,
+            );
+            put_aged(&storage, "k", 3000, 7200, &payload, id);
+            put_aged(&storage, "k", 200, 10, &payload, id);
+            assert_eq!(storage.enforce_retention().unwrap().samples_dropped, 3000);
+        }
+        let inflated = std::fs::metadata(&path).unwrap().len();
+
+        // A limit the 200 live samples fit under with room to spare, but the file
+        // does not.
+        let max_bytes = 1024 * 1024;
+        assert!(
+            inflated > max_bytes,
+            "test needs the file over the limit, was {inflated}"
+        );
+        let storage = bulk_storage(
+            RetentionPolicy {
+                max_age_secs: Some(3600),
+                max_bytes: Some(max_bytes),
+                ..Default::default()
+            },
+            &path,
+        );
+        let (live, _) = storage.live_bytes().unwrap();
+        assert!(
+            live < max_bytes / 2,
+            "test needs the data well under the limit, was {live}"
+        );
+
+        let pass = storage.enforce_retention().unwrap();
+
+        assert_eq!(
+            pass.samples_dropped, 0,
+            "the data fits the budget; only the file was over it"
+        );
+        assert_eq!(storage.get_range("k", &full_range()).unwrap().len(), 200);
+        assert!(pass.compacted);
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            after <= max_bytes,
+            "compaction must bring the file under the limit ({inflated} -> {after})"
+        );
+    }
+
+    /// #33: when compaction cannot run, the file length alone must not cost any
+    /// samples. redb refuses to compact while a read transaction is alive.
+    #[test]
+    fn max_bytes_does_not_evict_when_compaction_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("pinned.redb");
+        let id = TimestampId::rand();
+        let payload = vec![7u8; 1024];
+
+        {
+            let storage = bulk_storage(
+                RetentionPolicy {
+                    max_age_secs: Some(3600),
+                    ..Default::default()
+                },
+                &path,
+            );
+            put_aged(&storage, "k", 3000, 7200, &payload, id);
+            put_aged(&storage, "k", 200, 10, &payload, id);
+            storage.enforce_retention().unwrap();
+        }
+
+        let storage = bulk_storage(
+            RetentionPolicy {
+                max_age_secs: Some(3600),
+                max_bytes: Some(1024 * 1024),
+                ..Default::default()
+            },
+            &path,
+        );
+
+        // A reader that outlives the pass.
+        let reader = storage.begin_read().unwrap();
+        let pass = storage.enforce_retention().unwrap();
+        drop(reader);
+
+        assert!(!pass.compacted);
+        assert_eq!(
+            pass.samples_dropped, 0,
+            "a file that could not be compacted is not a reason to delete data"
+        );
+        assert_eq!(storage.get_range("k", &full_range()).unwrap().len(), 200);
+    }
+
+    /// #33: when the data itself is over the limit, the oldest samples go — about
+    /// as many as the excess calls for, not all of them.
+    #[test]
+    fn max_bytes_evicts_the_oldest_when_the_data_itself_is_too_big() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("toobig.redb");
+        let id = TimestampId::rand();
+
+        // 2000 samples of 1 KiB across four keys, all inside any age window.
+        let storage = bulk_storage(
+            RetentionPolicy {
+                max_bytes: Some(1024 * 1024),
+                ..Default::default()
+            },
+            &path,
+        );
+        let payload = vec![7u8; 1024];
+        for key in ["a", "b", "c", "d"] {
+            put_aged(&storage, key, 500, 10, &payload, id);
+        }
+        let (live_before, _) = storage.live_bytes().unwrap();
+        assert!(live_before > 1024 * 1024, "was {live_before}");
+
+        let pass = storage.enforce_retention().unwrap();
+
+        assert!(pass.samples_evicted_for_size > 0);
+        assert_eq!(pass.samples_dropped, pass.samples_evicted_for_size);
+        assert!(pass.compacted);
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(after <= 1024 * 1024, "file is {after}");
+
+        // Not everything: a storage holding about twice its budget keeps a real
+        // share of its samples.
+        let kept = pass.samples_after.unwrap();
+        assert!(
+            kept >= 400,
+            "eviction must be proportional to the excess, kept only {kept} of 2000"
+        );
+
+        // And what went is the oldest of every key, so each key keeps its newest.
+        for key in ["a", "b", "c", "d"] {
+            let samples = storage.get_range(key, &full_range()).unwrap();
+            assert!(!samples.is_empty(), "key {key} lost everything");
+            let newest = samples.last().unwrap().timestamp.get_time().as_secs();
+            assert!(u64::from(newest) >= now_secs() - 15);
+        }
+    }
+
+    /// The size-eviction cutoff must land near the requested count even when the
+    /// samples are bunched up in time, which a single coarse histogram gets wrong:
+    /// with a year-old outlier, the last hour is one bucket.
+    #[test]
+    fn the_eviction_cutoff_is_not_fooled_by_an_outlier() {
+        let dir = TempDir::new().unwrap();
+        let id = TimestampId::rand();
+        let storage = bulk_storage(
+            RetentionPolicy {
+                max_bytes: Some(u64::MAX),
+                ..Default::default()
+            },
+            &dir.path().join("skew.redb"),
+        );
+
+        put_aged(&storage, "ancient", 1, 365 * 86400, b"x", id);
+        put_aged(&storage, "busy", 1000, 10, b"x", id);
+
+        // Ask for the oldest 101: the outlier and the first 100 of the busy key.
+        let cutoff = storage.eviction_cutoff(101).unwrap().unwrap();
+        let evicted = storage.prune_by_time(Some(cutoff), None).unwrap();
+        assert!(
+            (101..=110).contains(&evicted),
+            "asked for 101, a coarse cutoff evicted {evicted}"
+        );
+    }
+
+    /// #34: a pass that removes many batches' worth must remove exactly the expired
+    /// rows of every key. (`DELETE_BATCH` and `SCAN_ROWS_PER_TXN` are small under
+    /// test, so these few hundred rows cross both boundaries many times.)
+    #[test]
+    fn a_pass_spanning_many_batches_drops_exactly_the_expired_rows() {
+        let dir = TempDir::new().unwrap();
+        let id = TimestampId::rand();
+        let storage = bulk_storage(
+            RetentionPolicy {
+                max_age_secs: Some(3600),
+                ..Default::default()
+            },
+            &dir.path().join("batches.redb"),
+        );
+
+        // `a/b` and `a/b/c` share a prefix, which is what the separator exists to
+        // keep apart; `quiet` has nothing to expire, `gone` has nothing to keep.
+        put_aged(&storage, "a/b", 333, 7200, b"old", id);
+        put_aged(&storage, "a/b", 40, 10, b"new", id);
+        put_aged(&storage, "a/b/c", 250, 7200, b"old", id);
+        put_aged(&storage, "a/b/c", 7, 10, b"new", id);
+        put_aged(&storage, "gone", 130, 7200, b"old", id);
+        put_aged(&storage, "quiet", 25, 10, b"new", id);
+
+        let pass = storage.enforce_retention().unwrap();
+        assert_eq!(pass.samples_dropped, 333 + 250 + 130);
+
+        for (key, kept) in [("a/b", 40), ("a/b/c", 7), ("gone", 0), ("quiet", 25)] {
+            let samples = storage.get_range(key, &full_range()).unwrap();
+            assert_eq!(samples.len(), kept, "key {key}");
+            assert!(samples.iter().all(|s| s.payload == b"new"), "key {key}");
+        }
+    }
+
+    /// #34: decimation carries "which bucket did I last keep" across batches. If
+    /// that state were lost at a batch boundary, a bucket straddling one would keep
+    /// two samples.
+    #[test]
+    fn decimation_keeps_one_per_bucket_across_batch_boundaries() {
+        let dir = TempDir::new().unwrap();
+        let id = TimestampId::rand();
+        let storage = bulk_storage(
+            RetentionPolicy {
+                decimate: Some(DecimationPolicy {
+                    recent_secs: 600,
+                    bucket_secs: 50,
+                }),
+                ..Default::default()
+            },
+            &dir.path().join("decimate.redb"),
+        );
+
+        // 1000 samples a second apart, the newest 1000s old: all beyond the recent
+        // window, about 20 buckets. Then 30 inside the window.
+        put_aged(&storage, "k", 1000, 1000, b"old", id);
+        put_aged(&storage, "k", 30, 10, b"new", id);
+        put_aged(&storage, "other", 30, 10, b"new", id);
+
+        storage.enforce_retention().unwrap();
+
+        let kept = storage.get_range("k", &full_range()).unwrap();
+        let mut buckets = std::collections::HashMap::new();
+        for sample in kept.iter().filter(|s| s.payload == b"old") {
+            *buckets
+                .entry(u64::from(sample.timestamp.get_time().as_secs()) / 50)
+                .or_insert(0u32) += 1;
+        }
+        assert!(
+            (20..=21).contains(&buckets.len()),
+            "1000s of samples is 20 or 21 buckets of 50s, got {}",
+            buckets.len()
+        );
+        assert!(
+            buckets.values().all(|count| *count == 1),
+            "a bucket kept more than one sample: {buckets:?}"
+        );
+        assert_eq!(kept.iter().filter(|s| s.payload == b"new").count(), 30);
+        assert_eq!(storage.get_range("other", &full_range()).unwrap().len(), 30);
+
+        // Idempotent: a second pass has nothing left to thin.
+        assert_eq!(storage.enforce_retention().unwrap().samples_dropped, 0);
+    }
+
+    /// #34: `max_samples_per_key` with far more excess than one batch.
+    #[test]
+    fn max_samples_per_key_trims_an_excess_larger_than_a_batch() {
+        let dir = TempDir::new().unwrap();
+        let id = TimestampId::rand();
+        let storage = bulk_storage(
+            RetentionPolicy {
+                max_samples_per_key: Some(10),
+                ..Default::default()
+            },
+            &dir.path().join("count.redb"),
+        );
+
+        put_aged(&storage, "busy", 500, 10, b"x", id);
+        put_aged(&storage, "exact", 10, 10, b"x", id);
+        put_aged(&storage, "under", 3, 10, b"x", id);
+
+        let pass = storage.enforce_retention().unwrap();
+        assert_eq!(pass.samples_dropped, 490);
+
+        let busy = storage.get_range("busy", &full_range()).unwrap();
+        assert_eq!(busy.len(), 10);
+        // The newest ten: one per second, ending 10s ago.
+        let oldest_kept = u64::from(busy[0].timestamp.get_time().as_secs());
+        assert!(oldest_kept >= now_secs() - 25, "kept an old sample");
+        assert_eq!(storage.get_range("exact", &full_range()).unwrap().len(), 10);
+        assert_eq!(storage.get_range("under", &full_range()).unwrap().len(), 3);
+    }
+
+    /// #38: a window longer than the clock means "nothing is that old". It used to
+    /// underflow — which in a release build wrapped to a cutoff in the far future
+    /// and deleted the whole history — or, past 2^32 seconds, panic.
+    #[test]
+    fn a_window_longer_than_the_clock_drops_nothing() {
+        let now = NTP64::from(Duration::from_secs(now_secs()));
+        assert_eq!(ntp_before(now, 0), now);
+        assert_eq!(
+            ntp_before(now, 60),
+            NTP64::from(Duration::from_secs(now_secs() - 60))
+        );
+        // 100 years: more seconds than have passed since 1970.
+        assert_eq!(ntp_before(now, 3_153_600_000), NTP64(0));
+        // Past what an NTP64 can hold at all.
+        assert_eq!(ntp_before(now, u64::from(u32::MAX) + 1), NTP64(0));
+        assert_eq!(ntp_before(now, u64::MAX), NTP64(0));
+
+        for huge in [3_153_600_000, u64::from(u32::MAX) + 1, u64::MAX] {
+            let dir = TempDir::new().unwrap();
+            let id = TimestampId::rand();
+            let storage = bulk_storage(
+                RetentionPolicy {
+                    max_age_secs: Some(huge),
+                    decimate: Some(DecimationPolicy {
+                        recent_secs: huge,
+                        bucket_secs: 60,
+                    }),
+                    ..Default::default()
+                },
+                &dir.path().join("forever.redb"),
+            );
+            put_aged(&storage, "k", 50, 10, b"x", id);
+            put_aged(&storage, "k", 50, 86400 * 400, b"x", id);
+
+            let pass = storage.enforce_retention().unwrap();
+            assert_eq!(pass.samples_dropped, 0, "max_age_secs: {huge}");
+            assert_eq!(storage.get_range("k", &full_range()).unwrap().len(), 100);
+        }
     }
 
     /// A policy that bounds nothing is not a policy.

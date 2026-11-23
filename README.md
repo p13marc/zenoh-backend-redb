@@ -244,16 +244,23 @@ storages: {
 | Limit | Effect |
 |---|---|
 | `max_age_secs` | Drop samples older than this |
-| `max_bytes` | Evict oldest samples until the **file** is under this size |
+| `max_bytes` | Keep the **file** under this size: compact it, and evict the oldest samples if the data itself is too big |
 | `max_samples_per_key` | Cap one key's history so a pathological key cannot evict everyone else's |
 | `decimate` | Full resolution for `recent_secs`, then one sample per `bucket_secs` |
 | `interval_secs` | Seconds between passes (default 3600) |
 
 Every limit is optional and all of them apply — a sample goes if *any* rule says so.
-Two shapes are **rejected** rather than accepted quietly, because both read as
-protection that is not there: a `retention` block that sets no limit at all, and a
-`retention` block on a `latest`-mode volume, which has no history to prune and would
-report passes on the admin space while reclaiming nothing.
+Some shapes are **rejected at startup** rather than accepted quietly, because each
+reads as protection that is not there:
+
+- a `retention` block that sets no limit at all;
+- a `retention` block on a `latest`-mode volume, which has no history to prune and
+  would report passes on the admin space while reclaiming nothing;
+- an unknown field. `max_byte: 10737418240` is a typo, not "no size limit";
+- `interval_secs: 0` or `decimate.bucket_secs: 0`.
+
+A window longer than the clock (`max_age_secs: 3153600000`, "100 years") is fine and
+means what it says: nothing is that old, so nothing is dropped.
 
 `max_bytes` bounds the file, but retention only ever deletes *history*. If the
 current values and redb's own overhead already exceed the budget, a pass logs that
@@ -269,19 +276,74 @@ A background thread on `interval_secs`, not a check on every write — enforceme
 the PUT path would make every write pay for a scan. (A thread rather than an async
 task: `zenohd` does not call a volume's `create_storage` from inside a tokio
 runtime, and the work — scanning tables and compacting the file — is blocking
-anyway.) Deletions go out in bounded,
-committed batches, so a pass never holds the write lock across the whole database,
-and reads are never blocked.
+anyway.)
 
-`max_bytes` is measured against the **real file** and enforcing it **compacts**.
-This matters: redb does not return space to the filesystem when rows are removed, so
-without compaction the file size would never fall, the policy would never converge,
-and every pass would delete more data while reporting no improvement — silent data
-loss dressed up as retention.
+A pass costs what it removes, not what the storage holds:
 
-Each pass is reported on the admin space (`retention.last_pass`: samples dropped,
-bytes before and after, duration), so a policy is verifiable from outside the
-process. A storage claiming to be bounded is not the same as a storage that is.
+- It reads the history in short read transactions and deletes in committed batches
+  of 4096 rows, so it never holds more than one batch of keys in memory and never
+  holds the write lock across the whole database.
+- A key's samples are stored oldest-first, so with `max_age_secs` a pass reads the
+  rows it deletes plus one row per key, then skips to the next key.
+
+### What the file size does, and does not, tell you
+
+**redb does not return space to the filesystem when rows are removed.** It reuses the
+freed pages for later writes. So after a pass that dropped half a million samples the
+file is *exactly* as long as before, and the log line says so:
+
+```
+Retention pass on 'timeseries': dropped 453480 samples (1903211 -> 1449731),
+file 7877742592 -> 7877742592 bytes (not compacted: freed pages are reused, the
+file only shrinks on compaction)
+```
+
+The sample counts are the evidence that the pass worked. A storage at a steady
+ingest rate drops about the same number every pass — that is the rate at which
+samples age out, not the same samples being dropped again.
+
+For the same reason a healthy file is routinely two to three times its live data:
+every PUT is its own copy-on-write commit.
+
+### `max_bytes`
+
+`max_bytes` is a limit on the **real file**. A pass that finds the file over it:
+
+1. measures the **live data** — what the file would be once compacted;
+2. evicts the oldest samples, across all keys, **only if the live data itself is over
+   the limit**, and only as many as the excess calls for (to about 90 % of the limit,
+   so the next few minutes of writes do not put it straight back over);
+3. **compacts**, which is what shrinks the file.
+
+A file that is over the limit merely because it is full of freed pages loses no
+samples. If compaction cannot run, nothing is deleted on the strength of the file
+length.
+
+Compaction needs the database to itself: reads and writes on that storage wait while
+it runs. Leave headroom in `max_bytes` (twice the data you expect to hold is a
+reasonable start) so that a pass does not have to compact every time.
+
+Without `max_bytes` the file is never compacted. It stops growing once freed pages
+cover new writes, at its high-water mark.
+
+Each pass is reported on the admin space, so a policy is verifiable from outside the
+process — a storage claiming to be bounded is not the same as a storage that is:
+
+```json5
+retention: {
+  policy: { max_age_secs: 2592000, max_bytes: 10737418240, interval_secs: 3600 },
+  last_pass: {
+    samples_dropped:          453480,
+    samples_evicted_for_size:      0,   // non-zero: max_bytes, not age, is the bound
+    samples_before:          1903211,
+    samples_after:           1449731,
+    bytes_before:         7877742592,   // the file; only moves when `compacted`
+    bytes_after:          7877742592,
+    compacted:                 false,
+    duration_ms:                 812,
+  },
+}
+```
 
 ## What a storage reports about itself
 

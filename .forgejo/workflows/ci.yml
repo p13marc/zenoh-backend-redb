@@ -63,6 +63,9 @@ jobs:
       - run: cargo build --all-features --locked
       - run: cargo build --release --features plugin --locked
       - run: cargo test --all-features --locked -- --skip test_zenohd
+      # Heap growth of a retention pass over 100 000 samples, measured with a
+      # counting allocator. Release only: unoptimised it takes minutes.
+      - run: cargo test --release --all-features --locked --test retention_memory
 
   deny:
     runs-on: ubuntu-24.04
