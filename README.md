@@ -173,9 +173,13 @@ A database carries a format version (a `meta` table), and this build writes
 
 The migration is one transaction: after a crash the file is either still format 1 or
 fully format 2. It only moves the sample stored under a storage's bare `strip_prefix`
-(see below), so it is quick. **It is one-way**: 0.5 cannot read a format-2 file, so
-take a copy first if you may need to go back. A `read_only` storage cannot migrate; it
-asks for the database to be opened writable once.
+(see below), so it is quick. **It is one-way, and 0.5 will not tell you so**: 0.5
+knows nothing of the format stamp, so it opens a migrated file without complaint and
+then looks for that sample under the old name. It does not find it, and logs the
+empty key as invalid whenever it lists the storage. Everything else reads normally,
+which makes the loss easy to miss. Take a copy of the database before upgrading if
+you may need to go back. A `read_only` storage cannot migrate; it asks for the
+database to be opened writable once.
 
 What changed in format 2: a sample whose key is exactly the storage's `strip_prefix`
 has no key left after stripping. It used to be stored under `@@none_key@@`, which is

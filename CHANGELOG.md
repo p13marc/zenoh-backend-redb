@@ -32,9 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **On-disk format 2, with a version stamp** (#49). A database now says which
   layout it has. A 0.4 / 0.5 database (format 1) is **migrated in place the first time
-  0.6 opens it for writing**, in one transaction. The migration is one-way: 0.5 cannot
-  open a migrated file, so copy it first if you may need to roll back. A database
-  written by a later version is refused instead of guessed at.
+  0.6 opens it for writing**, in one transaction. The migration is one-way, and a
+  rollback fails silently rather than loudly: 0.5 has no format check, so it opens a
+  migrated file and simply no longer finds the keyless sample. Copy the database
+  first if you may need to roll back. From 0.6 on, a database written by a later
+  version is refused instead of guessed at.
 
 ### Fixed
 - **`max_bytes` evicted samples before reclaiming the free space inside pages**
