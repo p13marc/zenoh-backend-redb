@@ -22,7 +22,7 @@ dynamic_plugin = []
 
 [dependencies]
 # Core database
-redb = { version = "4.2", features = ["cache_metrics"] }
+redb = { version = "5.0", features = ["cache_metrics"] }
 
 # Zenoh dependencies
 zenoh = { version = "=1.10.2", features = ["plugins", "unstable", "internal"] }

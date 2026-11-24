@@ -108,7 +108,7 @@ time window into a single bounded range scan. `data_info` stays the latest-value
 index in both modes, which keeps `get_all_entries` O(keys) and a no-`_time` GET a
 point lookup.
 
-Thread-local buffers (`KEY_BUFFER`, `VALUE_BUFFER`) are used for zero-allocation PUT/GET operations.
+A thread-local `KEY_BUFFER` keeps PUT/GET/DELETE from allocating a key per call.
 
 ### History and retention
 
@@ -130,10 +130,14 @@ way:
 
 - **Never decide what to delete from the file length.** redb reuses freed pages but
   does not return them to the filesystem, and every PUT is its own copy-on-write
-  commit, so a healthy file is two to three times its live data. `max_bytes` is a
-  limit on the file, but eviction is sized from the live data (`live_bytes`), and
-  compaction — not deletion — is what shrinks the file. The log line reports sample
-  counts for the same reason: "N -> N bytes" after a successful pass is normal.
+  commit, so a healthy file is two to three times its data. `max_bytes` is a limit
+  on the file, but eviction is sized from the data (`table_bytes`), and compaction —
+  not deletion — is what shrinks the file: `Balanced` first (returns unused pages),
+  then `Maximum` (packs half-empty pages), and samples are evicted only if the file
+  is still over after that. A compaction that is *refused* proves nothing about how
+  small the file could be, so it never leads to eviction. The log line reports
+  sample counts for the same reason: "N -> N bytes" after a successful pass is
+  normal.
 - **Never hold the history in memory.** No `Vec` of every key, no sort. Reads go
   through `walk_history`, which reopens its read transaction every
   `SCAN_ROWS_PER_TXN` rows (a long-lived read transaction stops redb reusing pages,
@@ -233,7 +237,7 @@ Backend is configured through Zenoh's storage_manager plugin:
 | `create_db` | bool | true | Create database if missing |
 | `read_only` | bool | false | Read-only mode |
 | `cache_size` | number | `67108864` (64 MiB) | redb page-cache budget in bytes (never redb’s own 1 GiB default) |
-| `fsync` | bool | true | `Durability::Immediate` vs `Durability::None`. redb 4 has no level between, and a non-durable commit is not persisted *at all* until a durable one follows, so with `false` the backend promotes a commit to durable every `flush_interval_secs` |
+| `fsync` | bool | true | `Durability::Immediate` vs `Durability::None`. redb has no level between, and a non-durable commit is not persisted *at all* until a durable one follows, so with `false` the backend promotes a commit to durable every `flush_interval_secs` |
 | `flush_interval_secs` | number | `5` | With `fsync: false`, the longest a write stays unpersisted (and the longest redb accumulates per-commit memory). Ignored with `fsync: true` |
 | `retention` | object | - | Required for `all`-mode storages. `max_age_secs`, `max_bytes`, `max_samples_per_key`, `decimate`, `interval_secs` |
 

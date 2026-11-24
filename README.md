@@ -133,7 +133,7 @@ All three produce the identical symptom above.
 ### Why `cache_size` has a default
 
 `cache_size` defaults to **64 MiB** and is always passed to redb explicitly. This
-backend never inherits redb's own default, which is **1 GiB** in redb 4.
+backend never inherits redb's own default, which is **1 GiB**.
 
 That is a deliberate refusal, not a tuning preference. On a small guest an unbounded
 page cache presents as a slow multi-day RSS climb that ends at the OOM killer, with
@@ -150,7 +150,7 @@ returns, the data is on disk. Every sample is one commit, so every sample is one
 **a crash loses at most `flush_interval_secs` (default 5) of writes.**
 
 The bound is this backend's doing, not redb's. `fsync: false` maps to
-`Durability::None`, and redb 4 has no level in between: a non-durable commit is
+`Durability::None`, and redb has no level in between: a non-durable commit is
 **not persisted at all** until a durable one follows, and redb holds memory for
 each one until then. Left alone, a storage that never issued a durable commit would
 lose *everything written since it started* to a kill, and grow without limit while
@@ -320,21 +320,25 @@ every PUT is its own copy-on-write commit.
 
 ### `max_bytes`
 
-`max_bytes` is a limit on the **real file**. A pass that finds the file over it:
+`max_bytes` is a limit on the **real file**. A file is bigger than its data in two
+layers — pages nothing uses any more, and free space inside the pages that are used
+(a page that has just split is half empty) — so a pass that finds the file over the
+limit pulls its levers in order of what they cost, and deletes last:
 
-1. measures the **live data** — what the file would be once compacted;
-2. evicts the oldest samples, across all keys, **only if the live data itself is over
-   the limit**, and only as many as the excess calls for (to about 90 % of the limit,
-   so the next few minutes of writes do not put it straight back over);
-3. **compacts**, which is what shrinks the file.
+1. **compacts**, which returns the unused pages;
+2. if what is stored fits the limit, **compacts thoroughly**, which packs the
+   half-empty pages (redb's `CompactionMode::Maximum`);
+3. only if the file is still over, **evicts the oldest samples**, across all keys, as
+   many as the excess calls for (to about 90 % of the limit, so the next few minutes
+   of writes do not put it straight back over), and packs again.
 
-A file that is over the limit merely because it is full of freed pages loses no
-samples. If compaction cannot run, nothing is deleted on the strength of the file
-length.
+A file that is over the limit merely because it is loosely packed loses no samples.
+If compaction cannot run, nothing is deleted on the strength of the file length.
 
 Compaction needs the database to itself: reads and writes on that storage wait while
-it runs. Leave headroom in `max_bytes` (twice the data you expect to hold is a
-reasonable start) so that a pass does not have to compact every time.
+it runs. A thorough one also leaves pages full, so writes are a little slower until
+they split again. Leave headroom in `max_bytes` (twice the data you expect to hold is
+a reasonable start) so that a pass rarely has to do either.
 
 Without `max_bytes` the file is never compacted. It stops growing once freed pages
 cover new writes, at its high-water mark.

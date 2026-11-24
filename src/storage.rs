@@ -6,7 +6,8 @@
 use crate::config::{HistoryMode, RedbStorageConfig};
 use crate::error::{RedbBackendError, Result};
 use redb::{
-    Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+    CompactionMode, Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata,
+    TableDefinition,
 };
 use std::cell::RefCell;
 use std::path::Path;
@@ -219,6 +220,40 @@ const EVICTION_BUCKETS: usize = 4096;
 
 /// How many times that histogram is re-read inside the bucket holding the cut.
 const EVICTION_REFINEMENTS: usize = 3;
+
+/// Room the tables take, as [`RedbStorage::table_bytes`] measures it.
+#[derive(Debug, Default, Clone, Copy)]
+struct TableBytes {
+    /// Keys, values and B-tree metadata: what the tables would occupy if every
+    /// page were full, and so about what the file is after a thorough compaction.
+    packed: u64,
+    /// Free space inside the tables' pages. An ordinary compaction keeps it; a
+    /// thorough one reclaims it.
+    fragmented: u64,
+    /// The share of `packed` that is history, i.e. what retention may evict.
+    history_packed: u64,
+}
+
+impl TableBytes {
+    /// The pages the tables occupy: what the file is after an ordinary compaction.
+    #[cfg(test)]
+    fn allocated(&self) -> u64 {
+        self.packed + self.fragmented
+    }
+}
+
+/// How an attempt to compact went.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Compaction {
+    /// The file got smaller.
+    Shrunk,
+    /// It ran and found nothing to reclaim: the file is as small as this mode
+    /// makes it.
+    NothingToDo,
+    /// It could not run (a transaction was alive, or an error). Nothing is known
+    /// about how small the file could be.
+    Refused,
+}
 
 /// What a history visitor wants next.
 enum Step {
@@ -481,13 +516,13 @@ impl StoredValue {
 
 /// The main storage implementation using redb.
 pub struct RedbStorage {
-    /// The redb database instance.
+    /// The redb database instance. `None` only once the storage is being dropped.
     ///
     /// Behind an `RwLock` only so that retention can compact: `Database::compact`
     /// needs `&mut`, while every other operation needs `&`. Read guards are held
-    /// just long enough to begin a transaction — redb 4's transactions are owned,
-    /// not borrowed from the database — so concurrent readers do not contend.
-    db: RwLock<Database>,
+    /// just long enough to begin a transaction — redb's transactions are owned, not
+    /// borrowed from the database — so concurrent readers do not contend.
+    db: RwLock<Option<Database>>,
 
     /// Storage configuration
     config: RedbStorageConfig,
@@ -520,6 +555,21 @@ impl RedbStorage {
         let mut builder = Database::builder();
         builder.set_cache_size(config.cache_size);
 
+        // A database that was not closed cleanly is repaired when it is opened, and
+        // on a multi-gigabyte file that takes minutes during which the router looks
+        // hung. Say what is happening, every ten percent.
+        let repairing = path.to_path_buf();
+        let last_decile = std::cell::Cell::new(None);
+        builder.set_repair_callback(move |session| {
+            let percent = (session.progress() * 100.0) as u32;
+            if last_decile.replace(Some(percent / 10)) != Some(percent / 10) {
+                warn!(
+                    "{:?} was not closed cleanly; repairing before opening: {}%",
+                    repairing, percent
+                );
+            }
+        });
+
         // `read_only` and `create_db: false` both mean "this file must already exist".
         let result = if config.read_only || !config.create_db {
             builder.open(path)
@@ -549,9 +599,9 @@ impl RedbStorage {
             // corruption rather than as a version skew, so say what it really is.
             if matches!(e, redb::DatabaseError::UpgradeRequired(_)) {
                 RedbBackendError::other(format!(
-                    "{path:?} was written by an older redb file format that redb 4 \
-                     cannot open. Either delete it, or open it once with redb 2.6 and \
-                     call `Database::upgrade()` before using this version. ({e})"
+                    "{path:?} was written by an older redb file format that this \
+                     version cannot open. Either delete it, or open it once with redb 2.6 \
+                     and call `Database::upgrade()` before using this version. ({e})"
                 ))
             } else {
                 RedbBackendError::from(e)
@@ -559,24 +609,27 @@ impl RedbStorage {
         })
     }
 
-    /// Borrow the database for a single operation.
+    /// Run `f` against the database.
     ///
     /// A poisoned lock is recovered rather than propagated: the guard is only ever
     /// held to start a transaction, so a panic elsewhere cannot have left redb's own
     /// state torn — redb's transactions are atomic independently of this lock.
-    fn db(&self) -> std::sync::RwLockReadGuard<'_, Database> {
-        self.db.read().unwrap_or_else(|e| e.into_inner())
+    fn with_db<T>(&self, f: impl FnOnce(&Database) -> Result<T>) -> Result<T> {
+        match self.db.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some(db) => f(db),
+            None => Err(RedbBackendError::other("the database is closed")),
+        }
     }
 
     /// Begin a read transaction.
     fn begin_read(&self) -> Result<redb::ReadTransaction> {
-        Ok(self.db().begin_read()?)
+        self.with_db(|db| Ok(db.begin_read()?))
     }
 
     /// Begin a write transaction. Its durability is decided when it is committed,
     /// by [`RedbStorage::commit`].
     fn begin_write(&self) -> Result<redb::WriteTransaction> {
-        Ok(self.db().begin_write()?)
+        self.with_db(|db| Ok(db.begin_write()?))
     }
 
     /// Commit a write transaction with the configured durability.
@@ -584,7 +637,7 @@ impl RedbStorage {
     /// `fsync: true` (the default) is `Durability::Immediate`: a commit that returns
     /// has reached the disk.
     ///
-    /// `fsync: false` is `Durability::None`, and redb 4 has no level in between: a
+    /// `fsync: false` is `Durability::None`, and redb has no level in between: a
     /// non-durable commit is visible to every later read but is **not persisted at
     /// all** until some later durable commit lands. Left at that, a storage that
     /// never issued one would lose everything written since it was opened to a
@@ -681,7 +734,7 @@ impl RedbStorage {
         info!("Redb storage created successfully");
 
         Ok(Self {
-            db: RwLock::new(db),
+            db: RwLock::new(Some(db)),
             config,
             name,
             last_durable: Mutex::new(Instant::now()),
@@ -1354,21 +1407,24 @@ impl RedbStorage {
         Ok(dropped)
     }
 
-    /// Bytes the tables occupy: what the file would be after a compaction.
-    ///
-    /// Returns `(all tables, history tables only)`. This walks every page of every
-    /// table, so it is only called once the file is already known to be over its
-    /// limit.
-    fn live_bytes(&self) -> Result<(u64, u64)> {
+    /// How much room the tables take. Walks every page of every table, so it is
+    /// only called once the file is already known to be over its limit.
+    fn table_bytes(&self) -> Result<TableBytes> {
         let read_txn = self.begin_read()?;
-        let bytes = |stats: redb::TableStats| {
-            stats.stored_bytes() + stats.metadata_bytes() + stats.fragmented_bytes()
+        let mut bytes = TableBytes::default();
+        let mut add = |stats: redb::TableStats, history: bool| {
+            let packed = stats.stored_bytes() + stats.metadata_bytes();
+            bytes.packed += packed;
+            bytes.fragmented += stats.fragmented_bytes();
+            if history {
+                bytes.history_packed += packed;
+            }
         };
-        let latest = bytes(read_txn.open_table(PAYLOADS_TABLE)?.stats()?)
-            + bytes(read_txn.open_table(DATA_INFO_TABLE)?.stats()?);
-        let history = bytes(read_txn.open_table(HISTORY_PAYLOADS_TABLE)?.stats()?)
-            + bytes(read_txn.open_table(HISTORY_INFO_TABLE)?.stats()?);
-        Ok((latest + history, history))
+        add(read_txn.open_table(PAYLOADS_TABLE)?.stats()?, false);
+        add(read_txn.open_table(DATA_INFO_TABLE)?.stats()?, false);
+        add(read_txn.open_table(HISTORY_PAYLOADS_TABLE)?.stats()?, true);
+        add(read_txn.open_table(HISTORY_INFO_TABLE)?.stats()?, true);
+        Ok(bytes)
     }
 
     /// Bring the database file under `max_bytes`.
@@ -1376,90 +1432,143 @@ impl RedbStorage {
     /// Returns `(samples evicted, whether the file was compacted)`.
     ///
     /// The limit is on the **file**, but what gets deleted is decided from the
-    /// **data**. The two differ by a lot: every PUT is its own copy-on-write commit,
-    /// and the pages it frees stay in the file until a compaction, so a healthy
-    /// storage's file is routinely two or three times its live data. Evicting
-    /// against the file length — which this used to do — deleted samples from a
-    /// storage that fitted its budget, on every pass, for as long as write churn
-    /// kept re-inflating the file.
+    /// **data**. The two differ by a lot, in two layers:
     ///
-    /// So: when the file is over the limit, measure the live data. Only if *that*
-    /// is over budget are the oldest samples evicted, and only as many as the
-    /// excess calls for. Then compact, which is what actually shrinks the file. If
-    /// compaction cannot run, nothing is deleted on the strength of the file length.
+    /// * **Free pages.** Every PUT is its own copy-on-write commit, and the pages it
+    ///   frees stay in the file until a compaction, so a healthy storage's file is
+    ///   routinely two or three times the pages its tables occupy.
+    /// * **Free space inside pages.** A B-tree page that has just split is half
+    ///   empty, and samples arrive in key order, so the pages themselves are about
+    ///   half air.
+    ///
+    /// Evicting against the file length — which this used to do — deleted samples
+    /// from a storage that fitted its budget, on every pass. So the levers are
+    /// pulled in order of what they cost, and data goes last:
+    ///
+    /// 1. compact, which returns the free pages;
+    /// 2. if what is *stored* fits the budget, compact thoroughly
+    ///    ([`CompactionMode::Maximum`]), which packs the pages;
+    /// 3. only if the file is still over, evict the oldest samples — as many as
+    ///    the excess calls for — and pack again.
+    ///
+    /// If compaction cannot run, nothing is deleted on the strength of the file
+    /// length.
     fn enforce_max_bytes(&self, max_bytes: u64) -> Result<(u64, bool)> {
-        // Enough to converge when the first estimate falls short; each round is a
-        // full compaction, so this is not a loop to leave open-ended.
-        const MAX_ROUNDS: usize = 3;
+        // Enough to converge when the first estimate falls short; each round can be
+        // a full compaction, so this is not a loop to leave open-ended.
+        const MAX_ROUNDS: usize = 4;
         // Evict to a little under the limit, so the next few minutes of ordinary
         // writes do not put the data straight back over it.
         let target = max_bytes - max_bytes / 10;
 
+        let over_limit = |storage: &Self| storage.on_disk_bytes().is_some_and(|b| b > max_bytes);
+
         let mut evicted = 0u64;
         let mut compacted = false;
 
+        if self.on_disk_bytes().is_none() {
+            // Without a path we cannot measure, and guessing would be worse than
+            // doing nothing.
+            warn!(
+                "Storage '{}': max_bytes is configured but the database path is \
+                 unknown, so size cannot be enforced",
+                self.name
+            );
+            return Ok((0, false));
+        }
+
         for _ in 0..MAX_ROUNDS {
-            let Some(size) = self.on_disk_bytes() else {
-                // Without a path we cannot measure, and guessing would be worse
-                // than doing nothing.
-                warn!(
-                    "Storage '{}': max_bytes is configured but the database path is \
-                     unknown, so size cannot be enforced",
-                    self.name
-                );
-                break;
-            };
-            if size <= max_bytes {
+            if !over_limit(self) {
                 break;
             }
 
-            let (live, history_live) = self.live_bytes()?;
-            let mut evicted_this_round = 0u64;
+            // The cheap lever: hand back the pages nothing uses.
+            let mut progress = false;
+            if self.compact(CompactionMode::Balanced) == Compaction::Shrunk {
+                compacted = true;
+                progress = true;
+            }
+            if !over_limit(self) {
+                break;
+            }
 
-            if live > target {
-                let samples = self.sample_count()?;
-                if samples == 0 || history_live == 0 {
-                    // Nothing left to evict, yet the data is still over the limit.
-                    // The remainder is latest values and redb's own overhead,
-                    // neither of which retention may touch — deleting current
-                    // values to satisfy a size budget would be data loss, not
-                    // retention. Say so loudly: this is a misconfiguration
-                    // (max_bytes below the storage's irreducible size), and silence
-                    // would look like the policy working.
-                    warn!(
-                        "Storage '{}' holds {} bytes of live data, over its max_bytes of {}, \
-                         but its history is already empty. The remainder is current values \
-                         and redb overhead, which retention will not delete. Raise \
-                         max_bytes or reduce what this storage holds.",
-                        self.name, live, max_bytes
-                    );
+            // Still over. Is the data itself too big, or only loosely packed?
+            let bytes = self.table_bytes()?;
+
+            // If what is stored fits, packing the pages may be all it takes. This
+            // is the expensive lever: it leaves pages full, so inserts are slower
+            // until they split again — a price only a storage that would otherwise
+            // lose samples pays.
+            let mut size_when_packed = None;
+            if bytes.packed <= target {
+                match self.compact(CompactionMode::Maximum) {
+                    Compaction::Shrunk => {
+                        compacted = true;
+                        progress = true;
+                    }
+                    Compaction::NothingToDo => {}
+                    // The file may be nothing but loose pages, and there is no
+                    // telling without compacting it. Its length alone is not a
+                    // reason to delete anything; the next pass tries again.
+                    Compaction::Refused => break,
+                }
+                if !over_limit(self) {
                     break;
                 }
-
-                // Assume samples are about the same size, and evict the share of
-                // them that the excess is of the history.
-                let share = (live - target) as f64 / history_live as f64;
-                let to_evict = ((samples as f64 * share).ceil() as u64).clamp(1, samples);
-                if let Some(cutoff) = self.eviction_cutoff(to_evict)? {
-                    evicted_this_round = self.prune_by_time(Some(cutoff), None)?;
-                    evicted += evicted_this_round;
-                }
+                // Packed as tightly as it goes, and still over: pages are never
+                // quite full (a 1 KiB value leaves a quarter of a 4 KiB page that
+                // no fourth one fits in), so this, not the sum of the bytes, is
+                // what the data really comes to.
+                size_when_packed = self.on_disk_bytes();
             }
 
-            // Hand the freed pages back to the filesystem.
-            let shrank = self.compact();
-            compacted |= shrank;
+            // The data is too big. Evict the oldest samples.
+            let samples = self.sample_count()?;
+            if samples == 0 || bytes.history_packed == 0 {
+                // Nothing left to evict, yet the data is still over the limit. The
+                // remainder is latest values and redb's own overhead, neither of
+                // which retention may touch — deleting current values to satisfy a
+                // size budget would be data loss, not retention. Say so loudly:
+                // this is a misconfiguration (max_bytes below the storage's
+                // irreducible size), and silence would look like the policy
+                // working.
+                warn!(
+                    "Storage '{}' is over its max_bytes of {} with {} bytes of data, but \
+                     its history is already empty. The remainder is current values and \
+                     redb overhead, which retention will not delete. Raise max_bytes or \
+                     reduce what this storage holds.",
+                    self.name, max_bytes, bytes.packed
+                );
+                break;
+            }
 
-            if evicted_this_round == 0 && !shrank {
-                // Neither lever moved anything, so another round cannot either.
-                if self.on_disk_bytes().is_some_and(|size| size > max_bytes) {
-                    warn!(
-                        "Storage '{}' is still over its max_bytes of {} and this pass could \
-                         not reduce it: {} bytes of live data, and the file could not be \
-                         compacted further.",
-                        self.name, max_bytes, live
-                    );
-                }
+            // Assume samples are about the same size and that history packs like
+            // the rest, and evict the share of it that the excess comes to.
+            let size = size_when_packed.unwrap_or(bytes.packed);
+            let history_size = size as f64 * bytes.history_packed as f64 / bytes.packed as f64;
+            let share = size.saturating_sub(target) as f64 / history_size;
+            let to_evict = ((samples as f64 * share).ceil() as u64).clamp(1, samples);
+            if let Some(cutoff) = self.eviction_cutoff(to_evict)? {
+                let evicted_now = self.prune_by_time(Some(cutoff), None)?;
+                evicted += evicted_now;
+                progress |= evicted_now > 0;
+            }
+
+            // Deleting leaves pages half empty; pack them, or the file would stay
+            // over the limit and the next pass would evict again for nothing.
+            if self.compact(CompactionMode::Maximum) == Compaction::Shrunk {
+                compacted = true;
+                progress = true;
+            }
+
+            if !progress {
+                // No lever moved anything, so another round cannot either.
+                warn!(
+                    "Storage '{}' is still over its max_bytes of {} and this pass could \
+                     not reduce it: {} bytes of data, and the file could not be compacted \
+                     further.",
+                    self.name, max_bytes, bytes.packed
+                );
                 break;
             }
         }
@@ -1467,26 +1576,29 @@ impl RedbStorage {
         Ok((evicted, compacted))
     }
 
-    /// Compact the database file. Returns whether it got smaller.
+    /// Compact the database file.
     ///
     /// Compaction needs the database to itself, so every read and write on this
     /// storage waits while it runs. redb refuses while any transaction is alive;
     /// with new ones held off by the lock, the ones in flight finish in
     /// milliseconds, so a refusal is retried briefly rather than given up on.
-    fn compact(&self) -> bool {
+    fn compact(&self, mode: CompactionMode) -> Compaction {
         const ATTEMPTS: usize = 20;
         const BACKOFF: Duration = Duration::from_millis(50);
 
-        let mut db = self.db.write().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.db.write().unwrap_or_else(|e| e.into_inner());
+        let Some(db) = guard.as_mut() else {
+            return Compaction::Refused;
+        };
         for attempt in 1..=ATTEMPTS {
-            match db.compact() {
+            match db.compact(mode) {
                 Ok(true) => {
-                    debug!("Compacted '{}'", self.name);
-                    return true;
+                    debug!("Compacted '{}' ({:?})", self.name, mode);
+                    return Compaction::Shrunk;
                 }
                 Ok(false) => {
-                    trace!("Nothing to compact on '{}'", self.name);
-                    return false;
+                    trace!("Nothing to compact on '{}' ({:?})", self.name, mode);
+                    return Compaction::NothingToDo;
                 }
                 Err(redb::CompactionError::TransactionInProgress) if attempt < ATTEMPTS => {
                     std::thread::sleep(BACKOFF);
@@ -1495,11 +1607,11 @@ impl RedbStorage {
                     // Not fatal: whatever was deleted is committed and correct, and
                     // the next pass tries again.
                     warn!("Compaction of '{}' failed: {}", self.name, e);
-                    return false;
+                    return Compaction::Refused;
                 }
             }
         }
-        false
+        Compaction::Refused
     }
 
     /// A timestamp such that about `to_evict` samples are older than it, or `None`
@@ -1605,7 +1717,7 @@ impl RedbStorage {
     /// Cheap enough to call from inside an admin-space query, which is where it is
     /// called from. See [`RedbStorage::usage`] for the rest.
     pub fn stats(&self) -> Result<StorageStats> {
-        let cache = self.db().cache_stats();
+        let cache = self.with_db(|db| Ok(db.cache_stats()))?;
 
         let read_txn = self.begin_read()?;
         let key_count = read_txn.open_table(DATA_INFO_TABLE)?.len()?;
@@ -1895,6 +2007,26 @@ impl RedbStorage {
         match (keyexpr::new(key), keyexpr::new(pattern)) {
             (Ok(key), Ok(pattern)) => pattern.intersects(key),
             _ => false,
+        }
+    }
+}
+
+impl Drop for RedbStorage {
+    /// Close the database, and say so if that fails.
+    ///
+    /// Dropping a `Database` closes it too, but swallows the error — and a close
+    /// that could not write its final state means the next open has to repair the
+    /// file, which on a large one is minutes of a router that looks hung.
+    fn drop(&mut self) {
+        let db = self.db.get_mut().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(db) = db
+            && let Err(e) = db.close()
+        {
+            warn!(
+                "Closing '{}' failed: {}. The database will be checked and repaired the \
+                 next time it is opened.",
+                self.name, e
+            );
         }
     }
 }
@@ -2599,7 +2731,7 @@ mod tests {
             },
             &path,
         );
-        let (live, _) = storage.live_bytes().unwrap();
+        let live = storage.table_bytes().unwrap().allocated();
         assert!(
             live < max_bytes / 2,
             "test needs the data well under the limit, was {live}"
@@ -2617,6 +2749,84 @@ mod tests {
         assert!(
             after <= max_bytes,
             "compaction must bring the file under the limit ({inflated} -> {after})"
+        );
+    }
+
+    /// #46: pages that are half empty are not data. A storage whose samples would
+    /// fit under `max_bytes` once its pages are packed must be packed, not have its
+    /// oldest samples evicted.
+    #[test]
+    fn max_bytes_packs_half_empty_pages_before_evicting() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("loose.redb");
+        let id = TimestampId::rand();
+
+        // Samples arriving for 200 keys in turn land all over the tables, so pages
+        // split wherever they fill and end up about a third air.
+        let keys: Vec<String> = (0..200).map(|i| format!("k/{i:03}")).collect();
+        let now = now_secs();
+        let (packed, allocated) = {
+            let storage = bulk_storage(
+                RetentionPolicy {
+                    max_age_secs: Some(u64::MAX),
+                    ..Default::default()
+                },
+                &path,
+            );
+            for i in 0..6000u64 {
+                storage
+                    .put(
+                        &keys[(i % 200) as usize],
+                        StoredValue::new(
+                            vec![7u8; 100],
+                            at(now - 6000 + i, id),
+                            Encoding::ZENOH_BYTES,
+                        ),
+                    )
+                    .unwrap();
+            }
+            let bytes = storage.table_bytes().unwrap();
+            (bytes.packed, bytes.allocated())
+        };
+        assert!(
+            packed * 10 < allocated * 8,
+            "test needs loosely packed pages: {packed} stored in {allocated}"
+        );
+
+        // A limit the stored bytes fit under with the 10% margin to spare, but the
+        // pages they sit in do not.
+        let max_bytes = (packed * 10 / 9 + allocated) / 2;
+        let storage = bulk_storage(
+            RetentionPolicy {
+                max_age_secs: Some(u64::MAX),
+                max_bytes: Some(max_bytes),
+                ..Default::default()
+            },
+            &path,
+        );
+
+        let pass = storage.enforce_retention().unwrap();
+
+        assert_eq!(
+            pass.samples_dropped, 0,
+            "{packed} bytes of samples fit a {max_bytes} byte limit; only the pages were loose"
+        );
+        assert_eq!(pass.samples_after, Some(6000));
+        assert!(pass.compacted);
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert!(
+            after <= max_bytes,
+            "packing the pages must bring the file under the limit, it is {after} of {max_bytes}"
+        );
+        for key in &keys {
+            assert_eq!(storage.get_range(key, &full_range()).unwrap().len(), 30);
+        }
+
+        // And the storage still takes writes afterwards, into pages that are full.
+        put_aged(&storage, "k/000", 100, 10, &[7u8; 100], id);
+        assert_eq!(
+            storage.get_range("k/000", &full_range()).unwrap().len(),
+            130
         );
     }
 
@@ -2684,8 +2894,8 @@ mod tests {
         for key in ["a", "b", "c", "d"] {
             put_aged(&storage, key, 500, 10, &payload, id);
         }
-        let (live_before, _) = storage.live_bytes().unwrap();
-        assert!(live_before > 1024 * 1024, "was {live_before}");
+        let stored_before = storage.table_bytes().unwrap().packed;
+        assert!(stored_before > 1024 * 1024, "was {stored_before}");
 
         let pass = storage.enforce_retention().unwrap();
 

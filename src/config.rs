@@ -104,10 +104,10 @@ pub struct RetentionPolicy {
     /// Keep the database file under this size.
     ///
     /// The limit is on the real file. A pass that finds the file over it compacts,
-    /// because redb does not shrink the file when rows are removed; and it evicts
-    /// the oldest samples first only if the *data* — what the file would be once
-    /// compacted — is itself over the limit. A file that is over the limit merely
-    /// because it is full of freed pages loses no samples.
+    /// because redb does not shrink the file when rows are removed, and packs
+    /// half-empty pages if that is what it takes. It evicts the oldest samples
+    /// only if the file is still over the limit after that. A file that is over
+    /// the limit merely because it is loosely packed loses no samples.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<u64>,
 
@@ -456,7 +456,7 @@ fn default_table_name() -> String {
 mod tests {
     use super::*;
 
-    /// The cache budget must never fall back to redb's own default (1 GiB in redb 4).
+    /// The cache budget must never fall back to redb's own default (1 GiB).
     /// An unbounded page cache on a small guest is a slow RSS climb that ends at the
     /// OOM killer, and nothing in the logs points back at a storage setting.
     #[test]

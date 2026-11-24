@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **redb 4.2 → 5.0** (#45). Databases written by 0.5 open as they are. redb changed
+  its file locking: on Linux, do not run a 0.5 router and a 0.6 router against the
+  same storage directory at the same time. Besides the new compaction mode used
+  below, this picks up redb's fix for unbounded page-cache growth under write
+  workloads (4.4), a third candidate for the memory growth in #27.
+- A database is closed explicitly when its storage is dropped, and a failure to close
+  is logged instead of ignored.
+- Opening a database that was not closed cleanly logs the progress of the repair. On
+  a large file that takes minutes, during which the router used to look hung.
+
+### Fixed
+- **`max_bytes` evicted samples before reclaiming the free space inside pages**
+  (#46). A B-tree page that has just split is half empty, and that space was counted
+  as data. A pass now compacts, then packs the pages with redb 5's
+  `CompactionMode::Maximum` if what is stored fits the limit, and evicts only if the
+  file is still over. It also converges when values are large enough that pages can
+  never be full.
+- A compaction that is refused (a transaction was alive) no longer counts as "the
+  file is as small as it gets".
+
 ## [0.5.0] - 2026-11-23
 
 ### Fixed
