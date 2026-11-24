@@ -49,7 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   storage creation. **Breaking** for a config that used an absolute `db_file` on
   purpose: move the root with `ZENOH_BACKEND_REDB_ROOT` instead. A name with
   directories in it (`dir: "fleet/telemetry"`) works, and the directories are
-  created.
+  created. A `dir` that is not a string is now an error even when a
+  `db_file` is also given; it used to be skipped in favour of the `db_file`.
 
 ## [0.5.0] - 2026-11-23
 

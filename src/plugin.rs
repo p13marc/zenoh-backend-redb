@@ -1484,7 +1484,11 @@ mod tests {
                 .await
             {
                 Ok(storage) => break storage,
-                Err(e) => assert!(Instant::now() < deadline, "never opened: {e}"),
+                // Only the one reason that goes away by waiting.
+                Err(e) if e.to_string().contains("already open") => {
+                    assert!(Instant::now() < deadline, "the writer never let go: {e}")
+                }
+                Err(e) => panic!("the read-only storage failed to open: {e}"),
             }
             std::thread::sleep(Duration::from_millis(20));
         };

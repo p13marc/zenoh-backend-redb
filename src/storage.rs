@@ -515,7 +515,15 @@ impl StoredValue {
 }
 
 /// The four tables a database of this backend holds, by name.
-const TABLE_NAMES: [&str; 4] = ["payloads", "data_info", "history_payloads", "history_info"];
+fn table_names() -> [&'static str; 4] {
+    use redb::TableHandle;
+    [
+        PAYLOADS_TABLE.name(),
+        DATA_INFO_TABLE.name(),
+        HISTORY_PAYLOADS_TABLE.name(),
+        HISTORY_INFO_TABLE.name(),
+    ]
+}
 
 /// An open database: writable, or — for a `read_only` storage — not.
 ///
@@ -603,7 +611,7 @@ impl Handle {
             .list_tables()?
             .map(|table| table.name().to_string())
             .collect();
-        let missing: Vec<&str> = TABLE_NAMES
+        let missing: Vec<&str> = table_names()
             .into_iter()
             .filter(|name| !present.iter().any(|p| p == name))
             .collect();
@@ -3555,6 +3563,41 @@ mod tests {
             "{err}"
         );
         drop(writer);
+    }
+
+    /// #47: a database that was not closed cleanly needs a repair, and a repair is
+    /// a write. A read-only storage must say so, not fail with redb's bare
+    /// "repair aborted".
+    #[test]
+    fn a_read_only_storage_refuses_a_database_that_needs_repair() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("live.redb");
+        let copy = dir.path().join("unclean.redb");
+        let id = TimestampId::rand();
+
+        // A database is marked "in use" on disk for as long as a writer has it
+        // open. A copy taken then is what a crash leaves behind.
+        let writer = RedbStorage::open(&path, RedbStorageConfig::default(), "live").unwrap();
+        writer
+            .put(
+                "k",
+                StoredValue::new(b"v".to_vec(), at(100, id), Encoding::ZENOH_BYTES),
+            )
+            .unwrap();
+        std::fs::copy(&path, &copy).unwrap();
+        drop(writer);
+
+        let Err(err) = read_only(&copy) else {
+            panic!("a read-only storage must not open a database that needs repair");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("not closed cleanly"), "{msg}");
+        assert!(msg.contains("read_only: false"), "{msg}");
+
+        // Opened writable once, it is repaired, and then serves read-only.
+        drop(RedbStorage::open(&copy, RedbStorageConfig::default(), "repair").unwrap());
+        let storage = read_only(&copy).expect("repaired, it opens read-only");
+        assert_eq!(storage.get("k").unwrap().unwrap().payload, b"v");
     }
 
     /// #47: a read-only open cannot create tables, and must not pretend a file that
