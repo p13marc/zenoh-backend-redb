@@ -331,6 +331,34 @@ pub(crate) mod faults {
     }
 }
 
+/// Lets something through at most once per `period`.
+///
+/// For warnings about what a client does: a dashboard that asks for too wide a
+/// window asks again every few seconds, for every key.
+struct RateLimit {
+    period: Duration,
+    last: Mutex<Option<Instant>>,
+}
+
+impl RateLimit {
+    fn new(period: Duration) -> Self {
+        Self {
+            period,
+            last: Mutex::new(None),
+        }
+    }
+
+    /// Whether this occurrence may go through; if so, the period starts again.
+    fn allow(&self) -> bool {
+        let mut last = self.last.lock().unwrap_or_else(|e| e.into_inner());
+        if last.is_some_and(|at| at.elapsed() < self.period) {
+            return false;
+        }
+        *last = Some(Instant::now());
+        true
+    }
+}
+
 /// Whether a storage is serving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum HealthState {
@@ -469,6 +497,9 @@ pub struct RetentionPass {
     /// Whether the pass compacted the file, which is the only thing that shrinks
     /// it. Only a pass that finds the file over `max_bytes` compacts.
     pub compacted: bool,
+    /// Keys forgotten entirely, because `expire_keys` is set and their latest
+    /// sample was older than `max_age_secs`.
+    pub keys_expired: u64,
 }
 
 /// What a storage costs right now, from numbers that are free to read.
@@ -493,6 +524,10 @@ pub struct StorageStats {
     /// *is* its only sample; in [`HistoryMode::All`] this is the number that
     /// actually grows, and the one retention bounds.
     pub sample_count: u64,
+    /// `_time` GETs that matched more than `max_samples_per_get` and were cut to
+    /// the newest that many. Non-zero means clients are asking for windows wider
+    /// than this storage will answer in one reply.
+    pub truncated_gets: u64,
     /// Configured page-cache budget.
     pub cache_size_bytes: usize,
     /// Bytes currently held in the page cache.
@@ -1051,6 +1086,12 @@ pub struct RedbStorage {
     /// failure be attributed to the handle it came from.
     generation: std::sync::atomic::AtomicU64,
 
+    /// How many `_time` GETs were cut short by `max_samples_per_get`.
+    truncated_gets: std::sync::atomic::AtomicU64,
+
+    /// Keeps that from being a log line per GET.
+    truncation_warning: RateLimit,
+
     /// Set once the database file has failed underneath redb. Every operation
     /// checks it first and fails fast; [`RedbStorage::try_recover`] clears it.
     failed: AtomicBool,
@@ -1337,6 +1378,8 @@ impl RedbStorage {
             last_durable: Mutex::new(Instant::now()),
             unflushed: AtomicBool::new(false),
             generation: std::sync::atomic::AtomicU64::new(0),
+            truncated_gets: std::sync::atomic::AtomicU64::new(0),
+            truncation_warning: RateLimit::new(Duration::from_secs(60)),
             failed: AtomicBool::new(false),
             health: Mutex::new(Health::default()),
         })
@@ -1589,6 +1632,10 @@ impl RedbStorage {
     /// Tombstones inside the window are **skipped**, not returned: a deletion has
     /// no value to reply with, and `StoredData` has nowhere to say "this one is a
     /// deletion".
+    ///
+    /// At most `max_samples_per_get` samples are returned — the newest ones. The
+    /// whole reply is built in memory before any of it is sent, so without a bound
+    /// one query for a year of a busy key is an out-of-memory kill.
     pub fn get_range(&self, key: &str, range: &TimeRange<SystemTime>) -> Result<Vec<StoredValue>> {
         let read_txn = self.begin_read()?;
         let payloads_table = read_txn.open_table(HISTORY_PAYLOADS_TABLE)?;
@@ -1597,9 +1644,15 @@ impl RedbStorage {
         // Bounded to the window, not just to the key: a five-minute query on a key
         // holding a year of samples reads five minutes of rows.
         let (start, end) = history_window_bounds(key, range);
+        let cap = usize::try_from(self.config.max_samples_per_get)
+            .ok()
+            .filter(|cap| *cap > 0);
         let mut results = Vec::new();
+        let mut truncated = false;
 
-        for item in info_table.range(start.as_slice()..=end.as_slice())? {
+        // Newest first, so that a window holding more than the cap yields its most
+        // recent samples and the scan stops there instead of walking the rest.
+        for item in info_table.range(start.as_slice()..=end.as_slice())?.rev() {
             let (key_bytes, info_bytes) = item?;
             let (_, timestamp) = decode_history_key(key_bytes.value())?;
 
@@ -1615,6 +1668,14 @@ impl RedbStorage {
                 continue;
             }
 
+            if cap.is_some_and(|cap| results.len() >= cap) {
+                // One more sample than fits: that is all there is to know. How
+                // many more is not counted, since counting is the very scan the
+                // cap exists to avoid.
+                truncated = true;
+                break;
+            }
+
             if let Some(payload) = payloads_table.get(key_bytes.value())? {
                 results.push(StoredValue::new(
                     payload.value().to_vec(),
@@ -1624,6 +1685,25 @@ impl RedbStorage {
             }
         }
 
+        if truncated {
+            self.truncated_gets.fetch_add(1, Ordering::Relaxed);
+            if self.truncation_warning.allow() {
+                warn!(
+                    "Storage '{}': a `_time` GET on '{}' matched more than \
+                     max_samples_per_get ({}); returned the newest {} and left the older \
+                     ones out. Narrow the window, or raise the limit. ({} such GETs so \
+                     far; this is logged at most once a minute.)",
+                    self.name,
+                    key,
+                    self.config.max_samples_per_get,
+                    results.len(),
+                    self.truncated_gets.load(Ordering::Relaxed)
+                );
+            }
+        }
+
+        // Oldest first, as a window reads.
+        results.reverse();
         Ok(results)
     }
 
@@ -1725,6 +1805,14 @@ impl RedbStorage {
             pass.samples_dropped += self.prune_by_time(age_cutoff, decimate)?;
         }
 
+        // Whole keys, once nothing about them is recent. After the history, so that
+        // a key never outlives its samples the other way round.
+        if policy.expire_keys
+            && let Some(cutoff) = age_cutoff
+        {
+            pass.keys_expired = self.expire_keys(cutoff)?;
+        }
+
         // Per-key count, applied to what the rules above left.
         if let Some(max) = policy.max_samples_per_key {
             pass.samples_dropped += self.prune_by_count(max)?;
@@ -1743,6 +1831,12 @@ impl RedbStorage {
         pass.samples_after = Some(self.sample_count()?);
         pass.duration = started.elapsed().ok();
 
+        if pass.keys_expired > 0 {
+            info!(
+                "Retention pass on '{}': forgot {} key(s) with no sample newer than max_age_secs",
+                self.name, pass.keys_expired
+            );
+        }
         if pass.samples_dropped > 0 || pass.compacted {
             // The sample counts are what show the pass working. The file length is
             // reported too, but it only moves when the pass compacts: redb reuses
@@ -1912,6 +2006,74 @@ impl RedbStorage {
         }
 
         Ok(dropped)
+    }
+
+    /// Forget every key whose latest sample is older than `cutoff`: its row in the
+    /// latest-value index, tombstone or not, and its payload. Returns how many.
+    ///
+    /// The latest timestamp is the newest sample a key has, so a key that is older
+    /// than the cutoff has no history left either — [`RedbStorage::prune_by_time`]
+    /// has just removed it. What this adds is the one row retention otherwise never
+    /// touches, which is what makes a storage whose keys come and go unbounded.
+    ///
+    /// Candidates are found in short read transactions and removed in batches; each
+    /// is checked again inside the write transaction, because a PUT may have
+    /// brought the key back in between.
+    fn expire_keys(&self, cutoff: NTP64) -> Result<u64> {
+        let mut expired = 0u64;
+        let mut pos: Vec<u8> = Vec::new();
+
+        loop {
+            let (candidates, reached_end) = {
+                let read_txn = self.begin_read()?;
+                let info = read_txn.open_table(DATA_INFO_TABLE)?;
+                let mut candidates: Vec<Vec<u8>> = Vec::new();
+                let mut examined = 0usize;
+                let mut reached_end = true;
+                for row in info.range(pos.as_slice()..)? {
+                    let (key, value) = row?;
+                    examined += 1;
+                    pos.clear();
+                    pos.extend_from_slice(key.value());
+                    pos.push(0);
+                    let (_, timestamp, _) = decode_data_info(value.value())?;
+                    if *timestamp.get_time() < cutoff {
+                        candidates.push(key.value().to_vec());
+                    }
+                    if candidates.len() >= DELETE_BATCH || examined >= SCAN_ROWS_PER_TXN {
+                        reached_end = false;
+                        break;
+                    }
+                }
+                (candidates, reached_end)
+            };
+
+            if !candidates.is_empty() {
+                let write_txn = self.begin_write()?;
+                {
+                    let mut payloads = write_txn.open_table(PAYLOADS_TABLE)?;
+                    let mut info = write_txn.open_table(DATA_INFO_TABLE)?;
+                    for key in &candidates {
+                        let still_old = match info.get(key.as_slice())? {
+                            Some(value) => *decode_data_info(value.value())?.1.get_time() < cutoff,
+                            None => false,
+                        };
+                        if still_old {
+                            info.remove(key.as_slice())?;
+                            payloads.remove(key.as_slice())?;
+                            expired += 1;
+                        }
+                    }
+                }
+                self.commit(write_txn)?;
+            }
+
+            if reached_end {
+                break;
+            }
+        }
+
+        Ok(expired)
     }
 
     /// Trim every key to its newest `max` samples. Returns how many were removed.
@@ -2336,6 +2498,7 @@ impl RedbStorage {
             on_disk_bytes: self.on_disk_bytes(),
             key_count,
             sample_count,
+            truncated_gets: self.truncated_gets.load(Ordering::Relaxed),
             cache_size_bytes: self.config.cache_size,
             cache_used_bytes: cache.used_bytes(),
             cache_read_hits: cache.read_hits(),
@@ -3904,6 +4067,188 @@ mod tests {
             end: TimeBound::Inclusive(secs(u64::from(u32::MAX) + 86400)),
         };
         assert_eq!(storage.get_range("k", &absurd).unwrap().len(), 2000);
+    }
+
+    /// #51: a window holding more than the cap yields the newest samples, oldest
+    /// of them first, and says it was cut. `0` lifts the cap.
+    #[test]
+    fn a_time_window_is_capped_to_the_newest_samples() {
+        let dir = TempDir::new().unwrap();
+        let id = TimestampId::rand();
+        let open = |name: &str, cap: u64| {
+            let path = dir.path().join(name);
+            let config = RedbStorageConfig::default()
+                .with_history(HistoryMode::All)
+                .with_fsync(false)
+                .with_max_samples_per_get(cap);
+            RedbStorage::open(path, config, name).unwrap()
+        };
+        let secs_of = |samples: &[StoredValue]| -> Vec<u64> {
+            samples
+                .iter()
+                .map(|s| u64::from(s.timestamp.get_time().as_secs()))
+                .collect()
+        };
+
+        let capped = open("capped.redb", 50);
+        put_aged(&capped, "k", 200, 100, b"x", id);
+        // A tombstone among the newest: it is not a sample, and must not use up a
+        // place in the reply. (Same instant and same source as the sample that was
+        // there, so it takes that sample's place in the history.)
+        let newest = now_secs() - 100;
+        capped.delete("k", at(newest - 10, id)).unwrap();
+
+        let window = capped.get_range("k", &full_range()).unwrap();
+        assert_eq!(window.len(), 50);
+        let secs = secs_of(&window);
+        assert_eq!(*secs.last().unwrap(), newest, "the newest sample is there");
+        assert!(secs.windows(2).all(|w| w[0] < w[1]), "oldest first");
+        assert!(
+            !secs.contains(&(newest - 10)),
+            "the tombstone is not replied"
+        );
+        assert_eq!(
+            secs[0],
+            newest - 50,
+            "the 50 newest samples: 51 seconds back, less the one that was deleted"
+        );
+        assert_eq!(capped.stats().unwrap().truncated_gets, 1);
+
+        // A window that fits exactly is not cut, and not counted.
+        let exact = TimeRange {
+            start: TimeBound::Inclusive(std::time::UNIX_EPOCH + Duration::from_secs(newest - 50)),
+            end: TimeBound::Unbounded,
+        };
+        assert_eq!(capped.get_range("k", &exact).unwrap().len(), 50);
+        assert_eq!(capped.stats().unwrap().truncated_gets, 1);
+
+        // No cap.
+        let unlimited = open("unlimited.redb", 0);
+        put_aged(&unlimited, "k", 200, 100, b"x", id);
+        assert_eq!(unlimited.get_range("k", &full_range()).unwrap().len(), 200);
+        assert_eq!(unlimited.stats().unwrap().truncated_gets, 0);
+    }
+
+    /// The warning about cut replies is for an operator, not a log of every query.
+    #[test]
+    fn a_rate_limit_lets_one_through_per_period() {
+        let limit = RateLimit::new(Duration::from_secs(3600));
+        assert!(limit.allow());
+        assert!(!limit.allow());
+        assert!(!limit.allow());
+
+        let short = RateLimit::new(Duration::from_millis(20));
+        assert!(short.allow());
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(short.allow());
+    }
+
+    /// #40: with `expire_keys`, a key whose latest sample is older than
+    /// `max_age_secs` is forgotten entirely; without it, its latest value stays.
+    #[test]
+    fn expire_keys_forgets_keys_with_nothing_recent() {
+        let dir = TempDir::new().unwrap();
+        let id = TimestampId::rand();
+        let policy = |expire_keys| RetentionPolicy {
+            max_age_secs: Some(3600),
+            expire_keys,
+            ..Default::default()
+        };
+        let fill = |storage: &RedbStorage| {
+            // Gone quiet two hours ago.
+            put_aged(storage, "stale/a", 5, 7200, b"x", id);
+            put_aged(storage, "stale/b", 1, 7200, b"x", id);
+            // Deleted two hours ago: a tombstone with no history after the pass.
+            put_aged(storage, "stale/deleted", 2, 7300, b"x", id);
+            storage
+                .delete("stale/deleted", at(now_secs() - 7200, id))
+                .unwrap();
+            // Old samples and a recent one: the key is alive.
+            put_aged(storage, "live", 5, 7200, b"x", id);
+            put_aged(storage, "live", 3, 10, b"x", id);
+            // Deleted recently: the tombstone is recent news.
+            put_aged(storage, "live/deleted", 1, 20, b"x", id);
+            storage
+                .delete("live/deleted", at(now_secs() - 10, id))
+                .unwrap();
+        };
+        let keys = |storage: &RedbStorage| -> Vec<String> {
+            storage
+                .get_all_timestamps()
+                .unwrap()
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect()
+        };
+
+        // Off (the default): the history goes, every key stays.
+        let kept = bulk_storage(policy(false), &dir.path().join("kept.redb"));
+        fill(&kept);
+        let pass = kept.enforce_retention().unwrap();
+        assert_eq!(pass.keys_expired, 0);
+        assert_eq!(keys(&kept).len(), 5);
+        assert!(
+            kept.get("stale/a").unwrap().is_some(),
+            "the latest value stays"
+        );
+
+        // On: the three keys with nothing recent are forgotten.
+        let expiring = bulk_storage(policy(true), &dir.path().join("expiring.redb"));
+        fill(&expiring);
+        let pass = expiring.enforce_retention().unwrap();
+        assert_eq!(pass.keys_expired, 3);
+        assert_eq!(keys(&expiring), vec!["live", "live/deleted"]);
+        assert!(expiring.get("stale/a").unwrap().is_none());
+        assert!(expiring.get("stale/b").unwrap().is_none());
+        assert_eq!(expiring.get("live").unwrap().unwrap().payload, b"x");
+        assert_eq!(expiring.get_range("live", &full_range()).unwrap().len(), 3);
+        let stats = expiring.stats().unwrap();
+        assert_eq!(stats.key_count, 2);
+        assert_eq!(expiring.usage().unwrap().tombstones, 1);
+
+        // Nothing left behind for a forgotten key, in any table.
+        assert!(
+            expiring
+                .get_range("stale/a", &full_range())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(expiring.timestamp_of("stale/deleted").unwrap().is_none());
+
+        // Idempotent, and a forgotten key can come back.
+        assert_eq!(expiring.enforce_retention().unwrap().keys_expired, 0);
+        put_aged(&expiring, "stale/a", 1, 5, b"back", id);
+        assert_eq!(expiring.get("stale/a").unwrap().unwrap().payload, b"back");
+        assert_eq!(expiring.enforce_retention().unwrap().keys_expired, 0);
+    }
+
+    /// #40: more keys to forget than one batch, and more than one scan transaction.
+    #[test]
+    fn expire_keys_works_across_batches() {
+        let dir = TempDir::new().unwrap();
+        let id = TimestampId::rand();
+        let storage = bulk_storage(
+            RetentionPolicy {
+                max_age_secs: Some(3600),
+                expire_keys: true,
+                ..Default::default()
+            },
+            &dir.path().join("many.redb"),
+        );
+        let stale = (DELETE_BATCH * 3 + SCAN_ROWS_PER_TXN + 5) as u64;
+        for i in 0..stale {
+            put_aged(&storage, &format!("stale/{i:05}"), 1, 7200, b"x", id);
+            if i % 7 == 0 {
+                put_aged(&storage, &format!("live/{i:05}"), 1, 10, b"x", id);
+            }
+        }
+        let live = stale.div_ceil(7);
+
+        let pass = storage.enforce_retention().unwrap();
+        assert_eq!(pass.keys_expired, stale);
+        assert_eq!(pass.samples_dropped, stale);
+        assert_eq!(storage.stats().unwrap().key_count, live);
+        assert_eq!(storage.count().unwrap() as u64, live);
     }
 
     /// A policy that bounds nothing is not a policy.

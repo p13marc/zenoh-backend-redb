@@ -42,7 +42,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first if you may need to roll back. From 0.6 on, a database written by a later
   version is refused instead of guessed at.
 
+### Added
+- **`retention.expire_keys`** (#40), off by default. Retention pruned a key's history
+  and left its latest value, and its row in the index every wildcard query walks, for
+  ever. For keys that come and go that is growth no limit bounded. With `expire_keys`
+  a key whose latest sample is older than `max_age_secs` is forgotten entirely. The
+  admin space reports `retention.last_pass.keys_expired`.
+- **`max_samples_per_get`** (#51), default 100 000. A `_time` GET read its whole
+  window into memory before replying, with no bound. It now returns at most this
+  many samples per key, the newest ones, logs a warning when it cuts a reply (at most
+  once a minute) and counts it in `stats.truncated_gets`. `0` restores the old
+  behaviour.
+
 ### Fixed
+- `_time` on a `latest` volume logged a warning for every GET; it is logged once per
+  storage.
 - **`max_bytes` evicted samples before reclaiming the free space inside pages**
   (#46). A B-tree page that has just split is half empty, and that space was counted
   as data. A pass now compacts, then packs the pages with redb 5's

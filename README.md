@@ -84,6 +84,7 @@ Each storage instance can be individually configured:
 | `cache_size` | Number | `67108864` (64 MiB) | redb page-cache budget in bytes. See [Why `cache_size` has a default](#why-cache_size-has-a-default). |
 | `fsync` | Boolean | `true` | Every commit reaches the disk before it returns. See [Durability](#durability). |
 | `flush_interval_secs` | Number | `5` | With `fsync: false`, the longest a write stays unpersisted. Ignored with `fsync: true`. |
+| `max_samples_per_get` | Number | `100000` | The most samples one `_time` GET returns for one key: the newest ones. `0` for no limit. See [Time-ranged GETs are capped](#time-ranged-gets-are-capped). |
 | `create_db` | Boolean | `true` | Create database if it doesn't exist |
 | `read_only` | Boolean | `false` | Open the database without write access. See [Read-Only Storage](#read-only-storage). |
 
@@ -223,6 +224,21 @@ v1/h-3fa9c2d41b7e/telemetry/cpu?_time=[2026-08-28T06:00:00Z;1h]
 
 Without `_time` the same key returns only its latest sample.
 
+### Time-ranged GETs are capped
+
+A `_time` GET returns at most `max_samples_per_get` samples per key (default
+100 000): the **newest** ones in the window, oldest of them first.
+
+The cap is there because zenoh hands a backend's reply over as one `Vec`: the whole
+window is read into memory, payloads included, before the first sample is sent. A
+query for a year of a 5-second key is 6.3 million samples; without a bound, one
+client can take the router down.
+
+When a reply is cut, the storage logs a warning naming the key (at most once a
+minute) and counts it in `stats.truncated_gets` on the admin space. Narrow the
+window and page backwards with the `_time` end bound, or raise the limit, or set it
+to `0` if you know your windows.
+
 ### Why `history` is a volume property and not a storage one
 
 Zenoh asks the **volume** for its capability, and the storage manager makes two
@@ -273,6 +289,7 @@ storages: {
           recent_secs: 86400,         // full resolution for a day
           bucket_secs: 300,           // then one sample per 5 min
         },
+        expire_keys: false,           // optional: also forget keys gone quiet
         interval_secs: 3600,          // how often a pass runs
       },
     },
@@ -286,6 +303,7 @@ storages: {
 | `max_bytes` | Keep the **file** under this size: compact it, and evict the oldest samples if the data itself is too big |
 | `max_samples_per_key` | Cap one key's history so a pathological key cannot evict everyone else's |
 | `decimate` | Full resolution for `recent_secs`, then one sample per `bucket_secs` |
+| `expire_keys` | Also forget a *key* once its latest sample is older than `max_age_secs` (default `false`; see below) |
 | `interval_secs` | Seconds between passes (default 3600) |
 
 Every limit is optional and all of them apply — a sample goes if *any* rule says so.
@@ -296,7 +314,8 @@ reads as protection that is not there:
 - a `retention` block on a `latest`-mode volume, which has no history to prune and
   would report passes on the admin space while reclaiming nothing;
 - an unknown field. `max_byte: 10737418240` is a typo, not "no size limit";
-- `interval_secs: 0` or `decimate.bucket_secs: 0`.
+- `interval_secs: 0` or `decimate.bucket_secs: 0`;
+- `expire_keys: true` without `max_age_secs`.
 
 A window longer than the clock (`max_age_secs: 3153600000`, "100 years") is fine and
 means what it says: nothing is that old, so nothing is dropped.
@@ -308,6 +327,26 @@ plainly and stops — it will not delete live data to hit a number.
 Decimation is what makes a year of 5-second telemetry affordable, and it is a policy
 only the backend can apply: the router's downsampling interceptor shapes *traffic*,
 not storage, so it cannot thin data that is already on disk.
+
+### Keys that go quiet: `expire_keys`
+
+The limits above prune a key's **history**. Its latest value is not history: it stays,
+a plain GET answers it, and every wildcard query lists it, however long ago its
+publisher went away. For a stable set of keys that is exactly what a storage is for.
+
+Where keys come and go — one per process, per flow, per container — it is growth no
+limit bounds, and the slow kind that nobody notices for a month.
+
+```json5
+retention: { max_age_secs: 604800, expire_keys: true }
+```
+
+With `expire_keys`, a key whose latest sample is older than `max_age_secs` is
+forgotten entirely: latest value, tombstone and all. A GET for it returns nothing,
+and wildcard queries no longer list it. It comes back the moment something publishes
+on it again. `retention.last_pass.keys_expired` on the admin space counts them.
+
+It is off by default because it changes what a plain GET returns.
 
 ### How it runs
 
@@ -383,6 +422,7 @@ retention: {
     bytes_before:         7877742592,   // the file; only moves when `compacted`
     bytes_after:          7877742592,
     compacted:                 false,
+    keys_expired:                  0,   // with `expire_keys`
     duration_ms:                 812,
   },
 }
@@ -409,6 +449,7 @@ the GUI's storage panel read it; so can any `GET`.
     on_disk_bytes:    41947136,   // the real file, from the filesystem
     key_count:           10240,
     sample_count:            0,   // history rows; 0 on a `latest` volume
+    truncated_gets:          0,   // `_time` GETs cut to max_samples_per_get
     // Need the tables read; see below:
     stored_bytes:     33554432,   // keys + values actually inserted
     metadata_bytes:    1048576,   // btree branch keys and redb metadata

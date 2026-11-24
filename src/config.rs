@@ -102,6 +102,18 @@ pub struct RetentionPolicy {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decimate: Option<DecimationPolicy>,
 
+    /// Also forget a **key** once everything about it is older than `max_age_secs`.
+    ///
+    /// The other limits prune a key's history and leave its latest value alone,
+    /// for ever: a plain GET still answers it and every wildcard query still lists
+    /// it. For a stable set of keys that is what a storage is for. Where keys come
+    /// and go (one per process, per flow, per container), it is growth that no
+    /// limit bounds. With this set, a key whose latest sample is older than
+    /// `max_age_secs` is removed entirely, tombstones included; a GET for it then
+    /// returns nothing. Requires `max_age_secs`. Off by default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub expire_keys: bool,
+
     /// Seconds between retention passes. Enforcement is periodic, not per-write:
     /// paying for it on every PUT would put a scan on the hot path.
     #[serde(default = "default_retention_interval_secs")]
@@ -148,6 +160,13 @@ impl RetentionPolicy {
             return Err(
                 "`interval_secs` is 0. A pass cannot run continuously; give the number \
                  of seconds between passes (default 3600)."
+                    .to_string(),
+            );
+        }
+        if self.expire_keys && self.max_age_secs.is_none() {
+            return Err(
+                "`expire_keys` needs `max_age_secs`: that is the age past which a key \
+                 with no newer sample is forgotten."
                     .to_string(),
             );
         }
@@ -199,6 +218,15 @@ pub struct RedbStorageConfig {
     /// while it ran. `0` makes every commit durable, the same as `fsync: true`.
     #[serde(default = "default_flush_interval_secs")]
     pub flush_interval_secs: u64,
+
+    /// The most samples one `_time` GET may return for one key; `0` for no limit.
+    ///
+    /// Zenoh's `Storage::get` returns a `Vec`, so a window is read into memory —
+    /// payloads and all — before the first reply goes out. Without a bound, one
+    /// query for a year of a busy key can take the router down. A window holding
+    /// more than this returns the **newest** that many.
+    #[serde(default = "default_max_samples_per_get")]
+    pub max_samples_per_get: u64,
 
     /// Whether to create the database if it doesn't exist.
     #[serde(default = "default_true")]
@@ -254,6 +282,12 @@ impl RedbStorageConfig {
         self
     }
 
+    /// Set the most samples one `_time` GET may return for one key (`0`: no limit).
+    pub fn with_max_samples_per_get(mut self, max: u64) -> Self {
+        self.max_samples_per_get = max;
+        self
+    }
+
     /// Set whether to create the database if it doesn't exist.
     pub fn with_create_db(mut self, create_db: bool) -> Self {
         self.create_db = create_db;
@@ -282,6 +316,7 @@ impl Default for RedbStorageConfig {
             cache_size: default_cache_size(),
             fsync: default_true(),
             flush_interval_secs: default_flush_interval_secs(),
+            max_samples_per_get: default_max_samples_per_get(),
             create_db: true,
             read_only: false,
             history: HistoryMode::Latest,
@@ -293,6 +328,13 @@ impl Default for RedbStorageConfig {
 // Default value functions for serde
 fn default_cache_size() -> usize {
     DEFAULT_CACHE_SIZE
+}
+
+/// Default cap on the samples one `_time` GET returns for one key.
+pub const DEFAULT_MAX_SAMPLES_PER_GET: u64 = 100_000;
+
+fn default_max_samples_per_get() -> u64 {
+    DEFAULT_MAX_SAMPLES_PER_GET
 }
 
 /// Default bound on unpersisted writes with `fsync: false`: 5 seconds.
@@ -334,6 +376,8 @@ mod tests {
         assert_eq!(parsed.create_db, default.create_db);
         assert_eq!(parsed.read_only, default.read_only);
         assert_eq!(parsed.flush_interval_secs, default.flush_interval_secs);
+        assert_eq!(parsed.max_samples_per_get, default.max_samples_per_get);
+        assert_eq!(default.max_samples_per_get, DEFAULT_MAX_SAMPLES_PER_GET);
         assert_eq!(default.flush_interval_secs, DEFAULT_FLUSH_INTERVAL_SECS);
         assert!(default.fsync, "fsync must default to on");
         assert!(default.create_db, "create_db must default to on");
@@ -382,6 +426,21 @@ mod tests {
                 .unwrap_err()
                 .contains("interval_secs")
         );
+
+        let no_age = RetentionPolicy {
+            max_bytes: Some(1 << 30),
+            expire_keys: true,
+            interval_secs: 60,
+            ..Default::default()
+        };
+        assert!(no_age.validate().unwrap_err().contains("expire_keys"));
+        let with_age = RetentionPolicy {
+            max_age_secs: Some(60),
+            expire_keys: true,
+            interval_secs: 60,
+            ..Default::default()
+        };
+        assert!(with_age.validate().is_ok());
 
         let no_bucket = RetentionPolicy {
             decimate: Some(DecimationPolicy {

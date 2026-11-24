@@ -254,7 +254,8 @@ Backend is configured through Zenoh's storage_manager plugin:
 | `cache_size` | number | `67108864` (64 MiB) | redb page-cache budget in bytes (never redb’s own 1 GiB default) |
 | `fsync` | bool | true | `Durability::Immediate` vs `Durability::None`. redb has no level between, and a non-durable commit is not persisted *at all* until a durable one follows, so with `false` the backend promotes a commit to durable every `flush_interval_secs` |
 | `flush_interval_secs` | number | `5` | With `fsync: false`, the longest a write stays unpersisted (and the longest redb accumulates per-commit memory). Ignored with `fsync: true` |
-| `retention` | object | - | Required for `all`-mode storages. `max_age_secs`, `max_bytes`, `max_samples_per_key`, `decimate`, `interval_secs` |
+| `max_samples_per_get` | number | `100000` | Cap on one `_time` GET's reply for one key (the newest N); `0` = unlimited. Zenoh takes the reply as one `Vec`, so an uncapped window is read into memory whole |
+| `retention` | object | - | Required for `all`-mode storages. `max_age_secs`, `max_bytes`, `max_samples_per_key`, `decimate`, `expire_keys`, `interval_secs` |
 
 Volume-level:
 

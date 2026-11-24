@@ -46,6 +46,7 @@ pub const PROP_STORAGE_READ_ONLY: &str = "read_only";
 pub const PROP_STORAGE_CACHE_SIZE: &str = "cache_size";
 pub const PROP_STORAGE_FSYNC: &str = "fsync";
 pub const PROP_STORAGE_FLUSH_INTERVAL: &str = "flush_interval_secs";
+pub const PROP_STORAGE_MAX_SAMPLES_PER_GET: &str = "max_samples_per_get";
 pub const PROP_STORAGE_RETENTION: &str = "retention";
 
 // Volume configuration properties
@@ -597,6 +598,19 @@ impl Volume for RedbVolume {
             }
         };
 
+        // Parse max_samples_per_get property
+        let max_samples_per_get = match volume_cfg.get(PROP_STORAGE_MAX_SAMPLES_PER_GET) {
+            None => None,
+            Some(serde_json::Value::Number(n)) if n.as_u64().is_some() => n.as_u64(),
+            _ => {
+                bail!(
+                    "Optional property `{}` of redb storage configurations must be a \
+                     non-negative whole number (0 for no limit)",
+                    PROP_STORAGE_MAX_SAMPLES_PER_GET
+                )
+            }
+        };
+
         // Parse cache_size property
         let cache_size = match volume_cfg.get(PROP_STORAGE_CACHE_SIZE) {
             None => None,
@@ -646,6 +660,9 @@ impl Volume for RedbVolume {
         }
         if let Some(secs) = flush_interval_secs {
             storage_config = storage_config.with_flush_interval_secs(secs);
+        }
+        if let Some(max) = max_samples_per_get {
+            storage_config = storage_config.with_max_samples_per_get(max);
         }
         storage_config = storage_config.with_history(self.history);
 
@@ -744,6 +761,8 @@ struct RedbStoragePlugin {
     /// File size up to which usage is computed inside the admin query. A field
     /// only so a test can exercise the snapshot path without a 64 MiB database.
     inline_usage_max_bytes: u64,
+    /// Whether the "this volume has no history" warning has been logged.
+    warned_about_time: AtomicBool,
 }
 
 impl RedbStoragePlugin {
@@ -784,6 +803,7 @@ impl RedbStoragePlugin {
             shared,
             requests,
             inline_usage_max_bytes: INLINE_USAGE_MAX_BYTES,
+            warned_about_time: AtomicBool::new(false),
         }
     }
 
@@ -884,6 +904,7 @@ impl Storage for RedbStoragePlugin {
                     "on_disk_bytes": stats.on_disk_bytes,
                     "key_count": stats.key_count,
                     "sample_count": stats.sample_count,
+                    "truncated_gets": stats.truncated_gets,
                     "cache": cache,
                     "stored_bytes": usage.map(|u| u.stored_bytes),
                     "metadata_bytes": usage.map(|u| u.metadata_bytes),
@@ -933,6 +954,7 @@ impl Storage for RedbStoragePlugin {
                 "bytes_before": pass.bytes_before,
                 "bytes_after": pass.bytes_after,
                 "compacted": pass.compacted,
+                "keys_expired": pass.keys_expired,
                 "duration_ms": pass.duration.map(|d| d.as_millis() as u64),
             })),
         });
@@ -1069,13 +1091,17 @@ impl Storage for RedbStoragePlugin {
         if let Some(range) = parse_time_range(parameters)? {
             if self.storage_config.history != HistoryMode::All {
                 // Answering a time range from a latest-only storage would silently
-                // return one sample and look like "there was no other data".
-                warn!(
-                    "Ignoring `_time` on storage '{}': its volume is history: \"latest\", \
-                     which keeps one value per key. Configure a volume with \
-                     history: \"all\" to serve time ranges.",
-                    self.config.name
-                );
+                // return one sample and look like "there was no other data". Said
+                // once per storage: a dashboard that sends `_time` everywhere would
+                // otherwise write this line per key per refresh.
+                if !self.warned_about_time.swap(true, Ordering::Relaxed) {
+                    warn!(
+                        "Ignoring `_time` on storage '{}': its volume is history: \"latest\", \
+                         which keeps one value per key. Configure a volume with \
+                         history: \"all\" to serve time ranges. (Logged once.)",
+                        self.config.name
+                    );
+                }
             } else {
                 let samples = storage
                     .get_range(&key_str, &range)
@@ -1189,6 +1215,7 @@ mod tests {
         assert_eq!(PROP_STORAGE_CACHE_SIZE, "cache_size");
         assert_eq!(PROP_STORAGE_FSYNC, "fsync");
         assert_eq!(PROP_STORAGE_FLUSH_INTERVAL, "flush_interval_secs");
+        assert_eq!(PROP_STORAGE_MAX_SAMPLES_PER_GET, "max_samples_per_get");
     }
 
     #[test]
@@ -1514,6 +1541,78 @@ mod tests {
             .collect();
         entries.sort();
         assert_eq!(entries, vec![None, Some(lookalike.to_string())]);
+    }
+
+    /// #51: a `_time` GET returns at most `max_samples_per_get` samples, the newest
+    /// ones, and the admin space counts how often that happened.
+    #[tokio::test]
+    async fn test_a_time_ranged_get_is_capped() {
+        let dir = TempDir::new().unwrap();
+        let volume = test_volume(&dir, HistoryMode::All);
+        let mut storage = volume
+            .create_storage(storage_config_for(
+                json!({
+                    "dir": "capped",
+                    "max_samples_per_get": 10,
+                    "retention": { "max_age_secs": 86400 },
+                }),
+                &dir,
+            ))
+            .await
+            .map_err(|e| e.to_string())
+            .unwrap();
+
+        let key = OwnedKeyExpr::new("test/busy").unwrap();
+        let id = zenoh::time::TimestampId::rand();
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        for i in 0..25u64 {
+            storage
+                .put(
+                    Some(key.clone()),
+                    ZBytes::from(format!("s{i:02}")),
+                    Encoding::ZENOH_STRING,
+                    Timestamp::new(NTP64::from(now - Duration::from_secs(60 - i)), id),
+                )
+                .await
+                .unwrap();
+        }
+
+        let window = storage
+            .get(Some(key.clone()), "_time=[now(-1h)..]")
+            .await
+            .unwrap();
+        let payloads: Vec<String> = window
+            .iter()
+            .map(|s| String::from_utf8(s.payload.to_bytes().to_vec()).unwrap())
+            .collect();
+        assert_eq!(payloads.len(), 10);
+        assert_eq!(payloads[0], "s15", "the newest ten, oldest of them first");
+        assert_eq!(payloads[9], "s24");
+
+        // A window that fits is not counted as cut.
+        let narrow = storage
+            .get(Some(key.clone()), "_time=[now(-40s)..]")
+            .await
+            .unwrap();
+        assert!(narrow.len() <= 10);
+
+        let status: serde_json::Value = serde_json::to_value(storage.get_admin_status()).unwrap();
+        assert_eq!(status["stats"]["truncated_gets"], 1);
+
+        // A cap that is not a whole number is a config error.
+        let Err(err) = volume
+            .create_storage(storage_config_for(
+                json!({ "dir": "bad", "max_samples_per_get": "many",
+                        "retention": { "max_age_secs": 60 } }),
+                &dir,
+            ))
+            .await
+        else {
+            panic!("a non-numeric cap must be rejected");
+        };
+        assert!(err.to_string().contains("max_samples_per_get"), "{err}");
     }
 
     /// #50: `dir` and `db_file` name a database inside the root. Neither may point
