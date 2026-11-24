@@ -204,9 +204,20 @@ fn spawn_background(
                 // Retention and flushing would only fail against it, so they wait.
                 if storage.needs_recovery() {
                     if next_recovery.is_none_or(|at| now >= at) {
-                        let recovered =
-                            contained(&name, "Reopening the database", || storage.try_recover());
-                        if recovered == Some(true) {
+                        // A failed attempt is not logged above debug: the outage
+                        // was announced once, `health.last_error` carries the
+                        // latest reason, and a line every 30 s for as long as a
+                        // disk stays full tells nobody anything new.
+                        let attempt =
+                            contained(
+                                &name,
+                                "Reopening the database",
+                                || Ok(storage.try_recover()),
+                            );
+                        if let Some(Err(e)) = &attempt {
+                            debug!("Reopening the database of '{}' failed: {}", name, e);
+                        }
+                        if matches!(attempt, Some(Ok(true))) {
                             next_recovery = None;
                             recovery_backoff = RECOVERY_BACKOFF_MIN;
                         } else {

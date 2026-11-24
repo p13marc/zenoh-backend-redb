@@ -1047,6 +1047,10 @@ pub struct RedbStorage {
     /// [`RedbStorage::flush`] has work to do.
     unflushed: AtomicBool,
 
+    /// Which handle is in `db`: bumped each time the database is reopened. Lets a
+    /// failure be attributed to the handle it came from.
+    generation: std::sync::atomic::AtomicU64,
+
     /// Set once the database file has failed underneath redb. Every operation
     /// checks it first and fails fast; [`RedbStorage::try_recover`] clears it.
     failed: AtomicBool,
@@ -1072,6 +1076,9 @@ impl RedbStorage {
         let guard = self.db.read().unwrap_or_else(|e| e.into_inner());
         let result = match guard.as_ref() {
             Some(db) => f(db),
+            // No handle: a reopen was tried and failed while this call was on its
+            // way in. That is the same outage, and gets the same error.
+            None if self.failed.load(Ordering::Acquire) => Err(self.unavailable()),
             None => Err(RedbBackendError::other("the database is closed")),
         };
         // Noted before the guard is released. `try_recover` swaps the handle under
@@ -1097,11 +1104,20 @@ impl RedbStorage {
     /// Logged once, at the transition; the errors that follow are returned, not
     /// logged, or a busy storage would write a line per rejected sample.
     fn note_failure(&self, e: &RedbBackendError) {
+        self.note_failure_of(e, self.generation.load(Ordering::Acquire));
+    }
+
+    /// [`RedbStorage::note_failure`], for an error from the handle of the given
+    /// generation. An error from a handle that has since been replaced says
+    /// nothing about the one in service, and is ignored.
+    fn note_failure_of(&self, e: &RedbBackendError, generation: u64) {
         if !e.is_io_failure() {
             return;
         }
         let mut health = self.health.lock().unwrap_or_else(|e| e.into_inner());
-        if health.state == HealthState::Recovering {
+        if health.state == HealthState::Recovering
+            || generation != self.generation.load(Ordering::Acquire)
+        {
             return;
         }
         health.state = HealthState::Recovering;
@@ -1173,6 +1189,9 @@ impl RedbStorage {
                 let mut health = self.health.lock().unwrap_or_else(|e| e.into_inner());
                 health.state = HealthState::Ok;
                 health.reopens += 1;
+                // Under the health lock, like every read of it that matters: from
+                // here on, a failure reported for the old handle is stale.
+                self.generation.fetch_add(1, Ordering::AcqRel);
                 self.failed.store(false, Ordering::Release);
                 info!(
                     "Storage '{}' is back in service: reopened {:?}",
@@ -1224,13 +1243,29 @@ impl RedbStorage {
         }
 
         txn.set_durability(Durability::None)?;
-        if let Err(e) = txn.commit() {
-            let e = e.into();
-            self.note_failure(&e);
-            return Err(e);
-        }
+        self.commit_noting(txn)?;
         self.unflushed.store(true, Ordering::Release);
         Ok(())
+    }
+
+    /// Commit, and if that fails on I/O, take the storage out of service.
+    ///
+    /// The failure has to be recorded against the handle the transaction belongs
+    /// to, not whichever one is current by the time it is recorded: a reopen could
+    /// slip in between, and the new handle would be blamed for the old one's
+    /// error. [`RedbStorage::with_db`] gets that by holding the database lock.
+    /// **A commit must not**: compaction holds that lock while it waits for the
+    /// open write transaction to end, so a commit that waited for the lock would
+    /// wait for ever. The handle's generation does the same job without it — a
+    /// reopen cannot succeed while this transaction is alive, so the generation
+    /// read here is this transaction's.
+    fn commit_noting(&self, txn: redb::WriteTransaction) -> Result<()> {
+        let generation = self.generation.load(Ordering::Acquire);
+        let result = txn.commit().map_err(RedbBackendError::from);
+        if let Err(e) = &result {
+            self.note_failure_of(e, generation);
+        }
+        result
     }
 
     /// Commit `txn` durably, which also persists every non-durable commit before
@@ -1246,13 +1281,11 @@ impl RedbStorage {
     fn commit_durably(&self, mut txn: redb::WriteTransaction) -> Result<()> {
         txn.set_durability(Durability::Immediate)?;
         let was_unflushed = self.unflushed.swap(false, Ordering::AcqRel);
-        if let Err(e) = txn.commit() {
+        if let Err(e) = self.commit_noting(txn) {
             // Nothing was persisted, so whatever was pending still is.
             if was_unflushed {
                 self.unflushed.store(true, Ordering::Release);
             }
-            let e = e.into();
-            self.note_failure(&e);
             return Err(e);
         }
         *self.last_durable.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
@@ -1303,6 +1336,7 @@ impl RedbStorage {
             name,
             last_durable: Mutex::new(Instant::now()),
             unflushed: AtomicBool::new(false),
+            generation: std::sync::atomic::AtomicU64::new(0),
             failed: AtomicBool::new(false),
             health: Mutex::new(Health::default()),
         })
@@ -4356,6 +4390,109 @@ mod tests {
         disk_full.store(false, Ordering::Release);
         assert!(storage.try_recover().unwrap());
         assert_eq!(storage.get_range("k", &full_range()).unwrap().len(), 100);
+    }
+
+    /// A failure reported for a handle that has since been replaced must not take
+    /// the new one out of service.
+    #[test]
+    fn a_stale_failure_does_not_condemn_the_reopened_database() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("stale.redb");
+        let disk_full = faults::inject(&path);
+        let id = TimestampId::rand();
+        let storage = RedbStorage::open(&path, RedbStorageConfig::default(), "stale").unwrap();
+        let old_generation = storage.generation.load(Ordering::Acquire);
+
+        disk_full.store(true, Ordering::Release);
+        assert!(
+            storage
+                .put(
+                    "k",
+                    StoredValue::new(b"v".to_vec(), at(100, id), Encoding::ZENOH_BYTES)
+                )
+                .is_err()
+        );
+        let _ = storage.get("k");
+        assert!(storage.needs_recovery());
+        disk_full.store(false, Ordering::Release);
+        assert!(storage.try_recover().unwrap());
+
+        // The error a slow thread is still holding from before the reopen.
+        let late = RedbBackendError::from(redb::StorageError::PreviousIo);
+        storage.note_failure_of(&late, old_generation);
+        assert!(
+            !storage.needs_recovery(),
+            "a stale failure condemned the new handle"
+        );
+        assert_eq!(storage.health().state, HealthState::Ok);
+
+        // The same error from the current handle still counts.
+        storage.note_failure(&late);
+        assert!(storage.needs_recovery());
+    }
+
+    /// Writers and compaction at the same time. Compaction holds the database
+    /// lock while it waits for the open write transaction to end, so nothing on
+    /// the commit path may wait for that lock: that is a deadlock, not a slowdown.
+    #[test]
+    fn writes_and_compaction_do_not_deadlock() {
+        let dir = TempDir::new().unwrap();
+        let storage = std::sync::Arc::new(bulk_storage(
+            RetentionPolicy {
+                max_age_secs: Some(u64::MAX),
+                ..Default::default()
+            },
+            &dir.path().join("busy.redb"),
+        ));
+        let id = TimestampId::rand();
+        let now = now_secs();
+        let (done, finished) = std::sync::mpsc::channel();
+
+        let writers: Vec<_> = (0..3u64)
+            .map(|w| {
+                let storage = storage.clone();
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    for i in 0..400u64 {
+                        storage
+                            .put(
+                                &format!("k/{w}"),
+                                StoredValue::new(
+                                    vec![7u8; 256],
+                                    at(now - 10_000 + w * 1000 + i, id),
+                                    Encoding::ZENOH_BYTES,
+                                ),
+                            )
+                            .unwrap();
+                    }
+                    done.send(()).unwrap();
+                })
+            })
+            .collect();
+        let compactor = {
+            let storage = storage.clone();
+            std::thread::spawn(move || {
+                for round in 0..40 {
+                    storage.compact(if round % 2 == 0 {
+                        CompactionMode::Balanced
+                    } else {
+                        CompactionMode::Maximum
+                    });
+                }
+                done.send(()).unwrap();
+            })
+        };
+
+        for _ in 0..4 {
+            finished
+                .recv_timeout(Duration::from_secs(60))
+                .expect("writers and compaction are deadlocked");
+        }
+        for thread in writers {
+            thread.join().unwrap();
+        }
+        compactor.join().unwrap();
+        assert_eq!(storage.sample_count().unwrap(), 1200);
     }
 
     /// An error that is not the file failing must not take a storage out of
