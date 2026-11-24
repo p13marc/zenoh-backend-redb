@@ -1495,12 +1495,16 @@ impl RedbStorage {
             // Still over. Is the data itself too big, or only loosely packed?
             let bytes = self.table_bytes()?;
 
-            // If what is stored fits, packing the pages may be all it takes. This
-            // is the expensive lever: it leaves pages full, so inserts are slower
-            // until they split again — a price only a storage that would otherwise
-            // lose samples pays.
+            // If what is stored fits the limit, packing the pages may be all it
+            // takes. This is the expensive lever: it leaves pages full, so inserts
+            // are slower until they split again — a price only a storage that would
+            // otherwise lose samples pays.
+            //
+            // The test is against the limit, not the eviction target below it: a
+            // storage at 95% of its limit is within its limit, and must be packed,
+            // not trimmed to 90%.
             let mut size_when_packed = None;
-            if bytes.packed <= target {
+            if bytes.packed <= max_bytes {
                 match self.compact(CompactionMode::Maximum) {
                     Compaction::Shrunk => {
                         compacted = true;
@@ -2828,6 +2832,69 @@ mod tests {
             storage.get_range("k/000", &full_range()).unwrap().len(),
             130
         );
+    }
+
+    /// #46: the margin that eviction aims below the limit is not the limit. A
+    /// storage whose data is at 95% of `max_bytes` fits, and must be packed, not
+    /// trimmed down to the 90% an eviction would stop at.
+    #[test]
+    fn max_bytes_packs_a_storage_that_is_within_its_limit_but_over_the_eviction_target() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("nearly-full.redb");
+        let id = TimestampId::rand();
+        let policy = |max_bytes| RetentionPolicy {
+            max_age_secs: Some(u64::MAX),
+            max_bytes,
+            ..Default::default()
+        };
+
+        // Loosely packed, as in the test above.
+        let now = now_secs();
+        {
+            let storage = bulk_storage(policy(None), &path);
+            for i in 0..6000u64 {
+                storage
+                    .put(
+                        &format!("k/{:03}", i % 200),
+                        StoredValue::new(
+                            vec![7u8; 100],
+                            at(now - 6000 + i, id),
+                            Encoding::ZENOH_BYTES,
+                        ),
+                    )
+                    .unwrap();
+            }
+        }
+        let loose = std::fs::metadata(&path).unwrap().len();
+
+        // Pack a copy to learn what this data comes to, and set the limit a hair
+        // above that: the data fits, with nothing like 10% to spare.
+        let copy = dir.path().join("copy.redb");
+        std::fs::copy(&path, &copy).unwrap();
+        let (packed_file, stored) = {
+            let storage = bulk_storage(policy(None), &copy);
+            storage.compact(CompactionMode::Maximum);
+            (
+                std::fs::metadata(&copy).unwrap().len(),
+                storage.table_bytes().unwrap().packed,
+            )
+        };
+        let max_bytes = packed_file + packed_file / 100;
+        assert!(loose > max_bytes, "the loose file must be over the limit");
+        assert!(
+            stored > max_bytes - max_bytes / 10,
+            "test needs the data over the 90% eviction target: {stored} of {max_bytes}"
+        );
+
+        let storage = bulk_storage(policy(Some(max_bytes)), &path);
+        let pass = storage.enforce_retention().unwrap();
+
+        assert_eq!(
+            pass.samples_dropped, 0,
+            "the data fits its limit ({stored} stored, {packed_file} packed, limit {max_bytes})"
+        );
+        assert!(pass.compacted);
+        assert!(std::fs::metadata(&path).unwrap().len() <= max_bytes);
     }
 
     /// #33: when compaction cannot run, the file length alone must not cost any
