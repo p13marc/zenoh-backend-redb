@@ -62,6 +62,15 @@ const INLINE_USAGE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 /// How old a usage snapshot may get before an admin query asks for a new one.
 const USAGE_MAX_AGE: Duration = Duration::from_secs(60);
 
+/// How often the background thread looks at whether its storage has failed, when
+/// it has nothing else on a timer. The check is one atomic load.
+const HEALTH_POLL: Duration = Duration::from_secs(1);
+
+/// The wait between attempts to reopen a failed database: this long after the
+/// first, doubling up to [`RECOVERY_BACKOFF_MAX`].
+const RECOVERY_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const RECOVERY_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
 /// What the storage and its background thread both touch.
 #[derive(Default)]
 struct Shared {
@@ -88,7 +97,9 @@ enum Request {
 /// * **flushing** an `fsync: false` storage, every `flush_interval`, so the last
 ///   writes before a quiet period reach the disk without waiting for the next one;
 /// * **usage statistics**, when an admin query asks — computing them reads the
-///   whole database, which is not something to do inside that query.
+///   whole database, which is not something to do inside that query;
+/// * **recovery**: when the database file has failed (a full disk), reopening it
+///   until that works, so the storage comes back without a router restart.
 ///
 /// This is a plain OS thread, deliberately. The obvious implementation —
 /// `tokio::task::spawn` — panics: `Volume::create_storage` is not called from
@@ -126,14 +137,19 @@ fn spawn_background(
             let mut next_retention = retention_interval.and_then(|i| started.checked_add(i));
             let mut next_flush = flush_interval.and_then(|i| started.checked_add(i));
 
+            let mut next_recovery: Option<Instant> = None;
+            let mut recovery_backoff = RECOVERY_BACKOFF_MIN;
+
             loop {
-                let request = match [next_retention, next_flush].into_iter().flatten().min() {
-                    Some(deadline) => {
-                        requests.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    }
-                    // Nothing on a timer: sleep until asked, or until dropped.
-                    None => requests.recv().map_err(|_| RecvTimeoutError::Disconnected),
-                };
+                // Never asleep for longer than `HEALTH_POLL`: a storage with
+                // nothing on a timer still has to notice that it has failed.
+                let poll = Instant::now() + HEALTH_POLL;
+                let deadline = [next_retention, next_flush, next_recovery]
+                    .into_iter()
+                    .flatten()
+                    .fold(poll, Instant::min);
+                let request =
+                    requests.recv_timeout(deadline.saturating_duration_since(Instant::now()));
                 match request {
                     Ok(Request::RefreshUsage) => {
                         if let Some(usage) =
@@ -154,6 +170,26 @@ fn spawn_background(
                 }
 
                 let now = Instant::now();
+
+                // A failed storage has one job: get its database open again.
+                // Retention and flushing would only fail against it, so they wait.
+                if storage.needs_recovery() {
+                    if next_recovery.is_none_or(|at| now >= at) {
+                        let recovered =
+                            contained(&name, "Reopening the database", || storage.try_recover());
+                        if recovered == Some(true) {
+                            next_recovery = None;
+                            recovery_backoff = RECOVERY_BACKOFF_MIN;
+                        } else {
+                            next_recovery = Instant::now().checked_add(recovery_backoff);
+                            recovery_backoff = (recovery_backoff * 2).min(RECOVERY_BACKOFF_MAX);
+                        }
+                    }
+                    continue;
+                }
+                next_recovery = None;
+                recovery_backoff = RECOVERY_BACKOFF_MIN;
+
                 if let Some(interval) = flush_interval
                     && next_flush.is_some_and(|at| now >= at)
                 {
@@ -278,6 +314,13 @@ fn db_path_for_dir(base: &std::path::Path, dir: &str, storage: &str) -> PathBuf 
         );
     }
     path
+}
+
+/// Seconds since the Unix epoch, for a timestamp on the admin space.
+fn epoch_secs(time: SystemTime) -> u64 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Run one piece of background work, containing whatever goes wrong in it.
@@ -713,6 +756,11 @@ impl RedbStoragePlugin {
     /// so the first query after startup reports no usage yet, and the next one
     /// does.
     fn usage(&self, on_disk_bytes: Option<u64>) -> Option<(StorageUsage, Duration)> {
+        // A storage that is out of service cannot be read, and `health` already
+        // says so; asking anyway would only log a failure per admin query.
+        if self.storage.needs_recovery() {
+            return None;
+        }
         if on_disk_bytes.is_none_or(|bytes| bytes <= self.inline_usage_max_bytes) {
             return match self.storage.usage() {
                 Ok(usage) => Some((usage, Duration::ZERO)),
@@ -815,8 +863,11 @@ impl Storage for RedbStoragePlugin {
             }
             Err(e) => {
                 // Never fail the admin space over statistics: a storage that is
-                // serving correctly must still report itself.
-                warn!("Failed to collect storage statistics: {}", e);
+                // serving correctly must still report itself. And one that is out
+                // of service says so under `health`, once, not here per query.
+                if !self.storage.needs_recovery() {
+                    warn!("Failed to collect storage statistics: {}", e);
+                }
                 json!({ "error": e.to_string() })
             }
         };
@@ -846,7 +897,19 @@ impl Storage for RedbStoragePlugin {
             })),
         });
 
+        // Whether the storage is serving at all. `stats` alone cannot say: a
+        // storage whose database has failed reports `stats: { error }`, which
+        // reads the same as a statistics bug.
+        let health = self.storage.health();
+        let health = json!({
+            "state": health.state.as_str(),
+            "last_error": health.last_error,
+            "failed_at": health.failed_at.map(epoch_secs),
+            "reopens": health.reopens,
+        });
+
         if let Some(obj) = status.as_object_mut() {
+            obj.insert("health".to_string(), health);
             obj.insert("capability".to_string(), capability);
             obj.insert("retention".to_string(), retention);
             obj.insert("stats".to_string(), stats);
@@ -1767,6 +1830,77 @@ mod tests {
         // The timestamp span of what is held.
         assert!(stats["oldest_timestamp"].is_string());
         assert!(stats["newest_timestamp"].is_string());
+    }
+
+    /// #48: a storage whose disk filled up comes back by itself once there is
+    /// space, without anyone restarting the router, and says what happened.
+    #[tokio::test]
+    async fn test_a_failed_storage_reopens_itself() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("enospc.redb");
+        let disk_full = crate::storage::faults::inject(&db_path);
+        let storage_config = RedbStorageConfig::new();
+        let storage =
+            Arc::new(RedbStorage::open(&db_path, storage_config.clone(), "enospc").unwrap());
+        let mut plugin = RedbStoragePlugin::new(
+            test_storage_config("enospc"),
+            storage.clone(),
+            storage_config,
+        );
+
+        let id = zenoh::time::TimestampId::rand();
+        let key = |name: &str| Some(OwnedKeyExpr::new(format!("test/{name}")).unwrap());
+        let put = |n: u64| {
+            (
+                ZBytes::from("v"),
+                Encoding::ZENOH_STRING,
+                Timestamp::new(NTP64(n), id),
+            )
+        };
+
+        let (payload, encoding, timestamp) = put(100);
+        plugin
+            .put(key("before"), payload, encoding, timestamp)
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::to_value(plugin.get_admin_status()).unwrap();
+        assert_eq!(status["health"]["state"], "ok");
+        assert_eq!(status["health"]["reopens"], 0);
+
+        // The disk fills: writes fail, and the admin space says the storage is down
+        // and why.
+        disk_full.store(true, Ordering::Release);
+        let (payload, encoding, timestamp) = put(200);
+        assert!(
+            plugin
+                .put(key("during"), payload, encoding, timestamp)
+                .await
+                .is_err()
+        );
+        assert!(plugin.get(key("before"), "").await.is_err());
+        let status: serde_json::Value = serde_json::to_value(plugin.get_admin_status()).unwrap();
+        assert_eq!(status["health"]["state"], "recovering", "{status}");
+        assert!(status["health"]["last_error"].is_string());
+        assert!(status["health"]["failed_at"].as_u64().unwrap() > 0);
+
+        // Space is freed. Nobody tells the storage; its background thread finds out.
+        disk_full.store(false, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while storage.needs_recovery() {
+            assert!(Instant::now() < deadline, "the storage never came back");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        assert_eq!(plugin.get(key("before"), "").await.unwrap().len(), 1);
+        let (payload, encoding, timestamp) = put(300);
+        plugin
+            .put(key("after"), payload, encoding, timestamp)
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::to_value(plugin.get_admin_status()).unwrap();
+        assert_eq!(status["health"]["state"], "ok");
+        assert_eq!(status["health"]["reopens"], 1);
+        assert_eq!(status["stats"]["key_count"], 2);
     }
 
     /// #36: on a storage too big to read inside an admin query, the query must

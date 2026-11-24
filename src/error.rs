@@ -46,6 +46,14 @@ pub enum RedbBackendError {
     #[error("the storage is read-only")]
     ReadOnly,
 
+    /// The storage hit an I/O error and is out of service until its database has
+    /// been reopened; see [`crate::RedbStorage::try_recover`].
+    #[error(
+        "the storage is out of service after an I/O error and will reopen its database \
+         when it can ({0})"
+    )]
+    Unavailable(String),
+
     /// I/O error.
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
@@ -56,6 +64,44 @@ pub enum RedbBackendError {
 }
 
 impl RedbBackendError {
+    /// Did the database file itself fail underneath this error?
+    ///
+    /// After one failed write redb refuses every later operation with
+    /// `PreviousIo` until the database is closed and reopened, so either form means
+    /// the same thing to a storage: this handle is finished.
+    pub fn is_io_failure(&self) -> bool {
+        use redb::StorageError;
+
+        let storage = match self {
+            RedbBackendError::StorageError(e) => Some(&**e),
+            RedbBackendError::TransactionError(e) => match &**e {
+                redb::TransactionError::Storage(e) => Some(e),
+                _ => None,
+            },
+            RedbBackendError::CommitError(e) => match &**e {
+                redb::CommitError::Storage(e) => Some(e),
+                _ => None,
+            },
+            RedbBackendError::TableError(e) => match &**e {
+                redb::TableError::Storage(e) => Some(e),
+                _ => None,
+            },
+            RedbBackendError::DatabaseError(e) => match &**e {
+                redb::DatabaseError::Storage(e) => Some(e),
+                _ => None,
+            },
+            RedbBackendError::CompactionError(e) => match &**e {
+                redb::CompactionError::Storage(e) => Some(e),
+                _ => None,
+            },
+            _ => None,
+        };
+        matches!(
+            storage,
+            Some(StorageError::Io(_) | StorageError::PreviousIo)
+        )
+    }
+
     /// Create a serialization error.
     pub fn serialization<S: Into<String>>(msg: S) -> Self {
         RedbBackendError::SerializationError(msg.into())

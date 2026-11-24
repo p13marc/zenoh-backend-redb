@@ -203,6 +203,13 @@ synchronous, it runs for every admin-space query, and redb's `Table::stats()` wa
 every page of the table. `RedbStorage::stats()` is the free half; `usage()` reads the
 whole database and is only called inline for files up to 64 MiB.
 
+**A database that fails is reopened, not abandoned.** redb latches after one failed
+write (`StorageError::PreviousIo` for every later operation). `RedbStorage::with_db`
+and `commit` notice (`note_failure`), the storage fails fast with
+`RedbBackendError::Unavailable` while it is down, and the background thread calls
+`try_recover` with a backoff. `storage::faults` (test-only) registers a path whose
+writes fail on demand; use it rather than trying to fill a real disk.
+
 Nothing in the plugin layer takes a lock: every `RedbStorage` method takes `&self` and
 redb does its own concurrency control. `put`/`delete` do their last-writer-wins
 comparison and the write inside one redb write transaction, and redb admits one writer

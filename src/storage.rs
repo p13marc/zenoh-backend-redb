@@ -221,6 +221,151 @@ const EVICTION_BUCKETS: usize = 4096;
 /// How many times that histogram is re-read inside the bucket holding the cut.
 const EVICTION_REFINEMENTS: usize = 3;
 
+/// Fault injection for tests: a database file whose writes can be made to fail.
+///
+/// redb reaches the disk through a `StorageBackend`. Registering a switch for a
+/// path makes [`Handle::open`] wrap that file in a backend that fails every write
+/// while the switch is on — which is what a full disk looks like from here.
+#[cfg(test)]
+pub(crate) mod faults {
+    use std::collections::HashMap;
+    use std::ops::Bound;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    use redb::{BackendError, StorageBackend};
+
+    fn registry() -> &'static Mutex<HashMap<PathBuf, Arc<AtomicBool>>> {
+        static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, Arc<AtomicBool>>>> = OnceLock::new();
+        REGISTRY.get_or_init(Default::default)
+    }
+
+    /// Make writes to the database at `path` fail whenever the returned switch is
+    /// on. Must be called before the storage is opened.
+    pub(crate) fn inject(path: &Path) -> Arc<AtomicBool> {
+        let switch = Arc::new(AtomicBool::new(false));
+        registry()
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), switch.clone());
+        switch
+    }
+
+    pub(super) fn backend_for(path: &Path) -> Option<FaultyBackend> {
+        let fail = registry().lock().unwrap().get(path).cloned()?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .ok()?;
+        Some(FaultyBackend {
+            file: redb::backends::FileBackend::new(file),
+            fail,
+        })
+    }
+
+    #[derive(Debug)]
+    pub(super) struct FaultyBackend {
+        file: redb::backends::FileBackend,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl FaultyBackend {
+        fn check(&self) -> Result<(), BackendError> {
+            if self.fail.load(Ordering::Acquire) {
+                // ENOSPC
+                Err(BackendError::Io(std::io::Error::from_raw_os_error(28)))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl StorageBackend for FaultyBackend {
+        fn len(&self) -> Result<u64, BackendError> {
+            self.file.len()
+        }
+        fn read(&self, offset: u64, out: &mut [u8]) -> Result<(), BackendError> {
+            self.file.read(offset, out)
+        }
+        fn set_len(&self, len: u64) -> Result<(), BackendError> {
+            self.check()?;
+            self.file.set_len(len)
+        }
+        fn sync_data(&self) -> Result<(), BackendError> {
+            self.check()?;
+            self.file.sync_data()
+        }
+        fn write(&self, offset: u64, data: &[u8]) -> Result<(), BackendError> {
+            self.check()?;
+            self.file.write(offset, data)
+        }
+        fn close(&self) -> Result<(), BackendError> {
+            self.file.close()
+        }
+        fn try_lock_range(&self, s: Bound<u64>, e: Bound<u64>) -> Result<bool, BackendError> {
+            self.file.try_lock_range(s, e)
+        }
+        fn try_lock_shared_range(
+            &self,
+            s: Bound<u64>,
+            e: Bound<u64>,
+        ) -> Result<bool, BackendError> {
+            self.file.try_lock_shared_range(s, e)
+        }
+        fn lock_range(&self, s: Bound<u64>, e: Bound<u64>) -> Result<(), BackendError> {
+            self.file.lock_range(s, e)
+        }
+        fn lock_shared_range(&self, s: Bound<u64>, e: Bound<u64>) -> Result<(), BackendError> {
+            self.file.lock_shared_range(s, e)
+        }
+        fn unlock_range(&self, s: Bound<u64>, e: Bound<u64>) -> Result<(), BackendError> {
+            self.file.unlock_range(s, e)
+        }
+        fn query_lock_range(&self, s: Bound<u64>, e: Bound<u64>) -> Result<bool, BackendError> {
+            self.file.query_lock_range(s, e)
+        }
+    }
+}
+
+/// Whether a storage is serving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HealthState {
+    /// In service.
+    #[default]
+    Ok,
+    /// Out of service after an I/O error, until its database has been reopened.
+    /// Every operation fails with [`RedbBackendError::Unavailable`] meanwhile.
+    Recovering,
+}
+
+impl HealthState {
+    /// As reported on the admin space.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Recovering => "recovering",
+        }
+    }
+}
+
+/// A storage's health, as [`RedbStorage::health`] reports it.
+#[derive(Debug, Clone, Default)]
+pub struct Health {
+    /// Whether the storage is serving.
+    pub state: HealthState,
+    /// The error that took it out of service, or the latest reason it could not
+    /// be reopened. Kept after recovery, as the record of what happened.
+    pub last_error: Option<String>,
+    /// When it last went out of service.
+    pub failed_at: Option<SystemTime>,
+    /// How many times its database has been reopened after a failure.
+    pub reopens: u64,
+}
+
 /// Room the tables take, as [`RedbStorage::table_bytes`] measures it.
 #[derive(Debug, Default, Clone, Copy)]
 struct TableBytes {
@@ -602,13 +747,8 @@ impl Handle {
             return Ok(Self::ReadOnly(db));
         }
 
-        // `create_db: false` means "this file must already exist".
-        let db = if config.create_db {
-            builder.create(path)
-        } else {
-            builder.open(path)
-        }
-        .map_err(|e| Self::explain_open_error(path, config, e))?;
+        let db = Self::open_writable(&builder, path, config)
+            .map_err(|e| Self::explain_open_error(path, config, e))?;
 
         // Durable whatever `fsync` says: this runs once, and it gives an
         // `fsync: false` storage a durable starting point to count its flush
@@ -671,6 +811,24 @@ impl Handle {
         write_txn.commit()?;
 
         Ok(Self::ReadWrite(db))
+    }
+
+    /// Open the file for writing. `create_db: false` means it must already exist.
+    fn open_writable(
+        builder: &redb::Builder,
+        path: &Path,
+        config: &RedbStorageConfig,
+    ) -> std::result::Result<Database, redb::DatabaseError> {
+        // Under test, a path can be registered to have its writes fail on demand.
+        #[cfg(test)]
+        if let Some(backend) = faults::backend_for(path) {
+            return builder.create_with_backend(backend);
+        }
+        if config.create_db {
+            builder.create(path)
+        } else {
+            builder.open(path)
+        }
     }
 
     /// A read-only open cannot create what is missing, so check it is all there.
@@ -888,6 +1046,13 @@ pub struct RedbStorage {
     /// Whether anything has been committed non-durably since then, i.e. whether a
     /// [`RedbStorage::flush`] has work to do.
     unflushed: AtomicBool,
+
+    /// Set once the database file has failed underneath redb. Every operation
+    /// checks it first and fails fast; [`RedbStorage::try_recover`] clears it.
+    failed: AtomicBool,
+
+    /// What the admin space reports about that.
+    health: Mutex<Health>,
 }
 
 impl RedbStorage {
@@ -896,10 +1061,126 @@ impl RedbStorage {
     /// A poisoned lock is recovered rather than propagated: the guard is only ever
     /// held to start a transaction, so a panic elsewhere cannot have left redb's own
     /// state torn — redb's transactions are atomic independently of this lock.
+    ///
+    /// This is also where a dead database is noticed and where a storage that is
+    /// known to be dead answers without touching it: every operation begins a
+    /// transaction, so every operation comes through here.
     fn with_db<T>(&self, f: impl FnOnce(&Handle) -> Result<T>) -> Result<T> {
-        match self.db.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if self.failed.load(Ordering::Acquire) {
+            return Err(self.unavailable());
+        }
+        let result = match self.db.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
             Some(db) => f(db),
             None => Err(RedbBackendError::other("the database is closed")),
+        };
+        if let Err(e) = &result {
+            self.note_failure(e);
+        }
+        result
+    }
+
+    /// If `e` says the database file failed, take the storage out of service.
+    ///
+    /// redb latches after one failed write: every later operation on that handle
+    /// returns `PreviousIo`, for good. Left at that, one `ENOSPC` is permanent — the
+    /// operator frees the disk a minute later and the storage still refuses every
+    /// PUT and GET until the router is restarted. So the storage marks itself
+    /// failed, answers quickly while it is, and [`RedbStorage::try_recover`] opens
+    /// the database again.
+    ///
+    /// Logged once, at the transition; the errors that follow are returned, not
+    /// logged, or a busy storage would write a line per rejected sample.
+    fn note_failure(&self, e: &RedbBackendError) {
+        if !e.is_io_failure() {
+            return;
+        }
+        let mut health = self.health.lock().unwrap_or_else(|e| e.into_inner());
+        if health.state == HealthState::Recovering {
+            return;
+        }
+        health.state = HealthState::Recovering;
+        health.last_error = Some(e.to_string());
+        health.failed_at = Some(SystemTime::now());
+        self.failed.store(true, Ordering::Release);
+        tracing::error!(
+            "Storage '{}' is out of service: its database {:?} failed with: {}. It will \
+             be reopened as soon as that works (for a full disk: once there is space).",
+            self.name,
+            self.path,
+            e
+        );
+    }
+
+    fn unavailable(&self) -> RedbBackendError {
+        let health = self.health.lock().unwrap_or_else(|e| e.into_inner());
+        RedbBackendError::Unavailable(
+            health
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "unknown error".to_string()),
+        )
+    }
+
+    /// Whether the storage is out of service and [`RedbStorage::try_recover`] has
+    /// work to do.
+    pub fn needs_recovery(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    /// The storage's health, for the admin space.
+    pub fn health(&self) -> Health {
+        self.health
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Reopen the database after an I/O failure.
+    ///
+    /// Returns `Ok(false)` if the storage is in service and there was nothing to do,
+    /// `Ok(true)` if it is back, and the error if the database still cannot be
+    /// opened — in which case the storage stays out of service and this can be
+    /// called again. The plugin calls it from the storage's background thread, with
+    /// a backoff.
+    ///
+    /// What was committed durably before the failure is there afterwards. With
+    /// `fsync: false`, commits that had not been flushed yet are gone, as they
+    /// would be after a crash.
+    pub fn try_recover(&self) -> Result<bool> {
+        if !self.needs_recovery() {
+            return Ok(false);
+        }
+
+        let mut guard = self.db.write().unwrap_or_else(|e| e.into_inner());
+        // The dead handle has to go first: redb will not open a file twice. Its
+        // close fails, which is the reason we are here, and does not matter.
+        if let Some(dead) = guard.take() {
+            let _ = dead.close();
+        }
+
+        match Handle::open(&self.path, &self.config) {
+            Ok(db) => {
+                *guard = Some(db);
+                *self.last_durable.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+                self.unflushed.store(false, Ordering::Release);
+
+                let mut health = self.health.lock().unwrap_or_else(|e| e.into_inner());
+                health.state = HealthState::Ok;
+                health.reopens += 1;
+                self.failed.store(false, Ordering::Release);
+                info!(
+                    "Storage '{}' is back in service: reopened {:?}",
+                    self.name, self.path
+                );
+                Ok(true)
+            }
+            Err(e) => {
+                self.health
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .last_error = Some(format!("reopening failed: {e}"));
+                Err(e)
+            }
         }
     }
 
@@ -937,7 +1218,11 @@ impl RedbStorage {
         }
 
         txn.set_durability(Durability::None)?;
-        txn.commit()?;
+        if let Err(e) = txn.commit() {
+            let e = e.into();
+            self.note_failure(&e);
+            return Err(e);
+        }
         self.unflushed.store(true, Ordering::Release);
         Ok(())
     }
@@ -960,7 +1245,9 @@ impl RedbStorage {
             if was_unflushed {
                 self.unflushed.store(true, Ordering::Release);
             }
-            return Err(e.into());
+            let e = e.into();
+            self.note_failure(&e);
+            return Err(e);
         }
         *self.last_durable.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
         Ok(())
@@ -1010,6 +1297,8 @@ impl RedbStorage {
             name,
             last_durable: Mutex::new(Instant::now()),
             unflushed: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            health: Mutex::new(Health::default()),
         })
     }
 
@@ -3947,6 +4236,105 @@ mod tests {
             None,
             "and it must not have touched it"
         );
+    }
+
+    /// #48: one failed write must not be the end of a storage. After it, every
+    /// operation is refused quickly; once writes work again the database is
+    /// reopened, serves what was committed before the failure, and takes writes.
+    #[test]
+    fn a_storage_recovers_from_an_io_failure_once_the_disk_does() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("enospc.redb");
+        let disk_full = faults::inject(&path);
+        let id = TimestampId::rand();
+        let value =
+            |n: u64| StoredValue::new(vec![n as u8; 64], at(100 + n, id), Encoding::ZENOH_BYTES);
+
+        let storage = RedbStorage::open(&path, RedbStorageConfig::default(), "enospc").unwrap();
+        storage.put("before", value(1)).unwrap();
+        assert_eq!(storage.health().state, HealthState::Ok);
+        assert!(!storage.try_recover().unwrap(), "nothing to recover from");
+
+        // The disk fills. The write that hits it fails...
+        disk_full.store(true, Ordering::Release);
+        assert!(storage.put("during", value(2)).is_err());
+
+        // ...and from then on the storage says it is out of service, for reads as
+        // well as writes, instead of redb's "previous I/O error" for ever.
+        for _ in 0..3 {
+            let get = storage.get("before");
+            assert!(
+                matches!(get, Err(RedbBackendError::Unavailable(_))),
+                "{get:?}"
+            );
+            let put = storage.put("during", value(3));
+            assert!(
+                matches!(put, Err(RedbBackendError::Unavailable(_))),
+                "{put:?}"
+            );
+        }
+        assert!(storage.needs_recovery());
+        let health = storage.health();
+        assert_eq!(health.state, HealthState::Recovering);
+        assert!(health.failed_at.is_some());
+        assert!(health.last_error.is_some());
+        assert_eq!(health.reopens, 0);
+
+        // Reopening while the disk is still full fails, and changes nothing.
+        assert!(storage.try_recover().is_err());
+        assert!(storage.needs_recovery());
+        assert!(matches!(
+            storage.get("before"),
+            Err(RedbBackendError::Unavailable(_))
+        ));
+
+        // Space is freed. The next attempt brings the storage back.
+        disk_full.store(false, Ordering::Release);
+        assert!(storage.try_recover().unwrap());
+        assert!(!storage.needs_recovery());
+        let health = storage.health();
+        assert_eq!(health.state, HealthState::Ok);
+        assert_eq!(health.reopens, 1);
+        assert!(
+            health.last_error.is_some(),
+            "what happened stays on record after recovery"
+        );
+
+        // What was committed before the failure is there; what failed is not; and
+        // new writes land.
+        assert_eq!(
+            storage.get("before").unwrap().unwrap().payload,
+            vec![1u8; 64]
+        );
+        assert!(storage.get("during").unwrap().is_none());
+        storage.put("after", value(4)).unwrap();
+        assert_eq!(storage.count().unwrap(), 2);
+    }
+
+    /// An error that is not the file failing must not take a storage out of
+    /// service.
+    #[test]
+    fn an_ordinary_error_is_not_an_io_failure() {
+        assert!(!RedbBackendError::ReadOnly.is_io_failure());
+        assert!(!RedbBackendError::other("x").is_io_failure());
+        assert!(!RedbBackendError::Unavailable("x".into()).is_io_failure());
+        assert!(RedbBackendError::from(redb::StorageError::PreviousIo).is_io_failure());
+        assert!(
+            RedbBackendError::from(redb::TransactionError::Storage(
+                redb::StorageError::PreviousIo
+            ))
+            .is_io_failure()
+        );
+
+        let (storage, _temp) = create_test_storage();
+        assert!(storage.get_range("k", &full_range()).is_ok());
+        // A read-only refusal, for one.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ro.redb");
+        populated(&path);
+        let ro = read_only(&path).unwrap();
+        assert!(ro.clear().is_err());
+        assert!(!ro.needs_recovery());
     }
 
     /// `read_only` / `create_db: false` on a database that does not exist must fail

@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fields nothing read (`db_file`, `key_expr`, `strip_prefix`, `table_name`) with their
   builders. The plugin never used the backend layer; `RedbStorage` is the library
   entry point. Unused error variants are gone too.
+- New API: `RedbStorage::try_recover`, `needs_recovery`, `health`;
+  `RedbBackendError::Unavailable`, `ReadOnly` and `is_io_failure`.
+- Every storage's background thread now wakes once a second (one atomic load) to see
+  whether its storage has failed.
 - The crate root re-exports `HistoryMode`, `RetentionPolicy`, `DecimationPolicy`,
   `RetentionPass`, `StorageStats`, `StorageUsage` and `WriteOutcome`.
 
@@ -52,6 +56,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   router cannot write to opens, and any number of read-only storages can share one
   database. A read-only storage refuses a file that lacks this backend's tables or
   needs a repair, instead of creating or repairing it.
+- **One I/O error left a storage dead until the router was restarted** (#48). After
+  a failed write (a full disk), redb refuses every later operation on that database
+  until it is reopened, and the backend never reopened it. A storage now takes itself
+  out of service, fails fast while it is, and reopens its database from its
+  background thread (1 s, 2 s, 4 s … up to every 30 s) until that works. New `health`
+  object on the admin space: `state`, `last_error`, `failed_at`, `reopens`.
 - **The "no key" sentinel collided with a real key** (#49). A sample whose key is
   exactly the storage's `strip_prefix` was stored under `@@none_key@@`, which is a
   valid key expression: `<prefix>/@@none_key@@` landed on the same row and was

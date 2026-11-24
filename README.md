@@ -398,6 +398,12 @@ the GUI's storage panel read it; so can any `GET`.
 {
   capability: { persistence: "durable", history: "latest" },
   db_path: "/var/lib/zenoh/redb/telemetry.redb",
+  health: {
+    state: "ok",                  // or "recovering": see "When the disk fills up"
+    last_error: null,             // what took it out of service, kept after recovery
+    failed_at: null,              // seconds since the epoch
+    reopens: 0,                   // times the database was reopened after a failure
+  },
   stats: {
     // Free to read, computed for every query:
     on_disk_bytes:    41947136,   // the real file, from the filesystem
@@ -443,6 +449,31 @@ multi-gigabyte read. So:
 - above that, they come from a snapshot. A query that finds it missing or more than
   60 s old asks a background thread for a new one and returns what it has, so the
   first query after startup shows them as `null` and the next shows them filled in.
+
+## When the disk fills up
+
+Retention exists so that this backend does not fill a disk. Something else on the
+same filesystem still can, and then a write to the database fails.
+
+redb is strict about that: after one failed write it refuses every further operation
+on that database until it has been closed and reopened. So the storage does exactly
+that, by itself:
+
+1. the failed write is reported, and the storage logs **one** ERROR line saying it is
+   out of service and why;
+2. while it is, every PUT, DELETE and GET fails immediately with an error that says
+   the storage is recovering (the storage manager logs those per sample; this backend
+   does not add to them);
+3. its background thread tries to reopen the database after 1 s, then 2 s, 4 s … up to
+   every 30 s;
+4. the first attempt that succeeds puts it back in service, with one INFO line.
+
+No router restart, and nothing to do but free the space. What was committed before
+the failure is there afterwards. With `fsync: false`, writes that had not been flushed
+yet are lost, as after a crash.
+
+`health` on the admin space (above) shows where a storage is in this, and `reopens`
+that it happened at all.
 
 ## Usage Examples
 
