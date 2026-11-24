@@ -1585,12 +1585,19 @@ mod tests {
         assert_eq!(payloads[0], "s15", "the newest ten, oldest of them first");
         assert_eq!(payloads[9], "s24");
 
-        // A window that fits is not counted as cut.
+        // A window that fits is returned whole, and not counted as cut. The
+        // samples sit 60s to 36s back, so the last 40s hold five of them — or
+        // four, if a millisecond boundary fell between writing and asking.
         let narrow = storage
             .get(Some(key.clone()), "_time=[now(-40s)..]")
             .await
             .unwrap();
-        assert!(narrow.len() <= 10);
+        assert!(
+            (4..=5).contains(&narrow.len()),
+            "expected the 4 or 5 newest samples, got {}",
+            narrow.len()
+        );
+        assert_eq!(narrow.last().unwrap().payload.to_bytes().as_ref(), b"s24");
 
         let status: serde_json::Value = serde_json::to_value(storage.get_admin_status()).unwrap();
         assert_eq!(status["stats"]["truncated_gets"], 1);

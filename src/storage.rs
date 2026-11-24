@@ -2019,6 +2019,11 @@ impl RedbStorage {
     /// Candidates are found in short read transactions and removed in batches; each
     /// is checked again inside the write transaction, because a PUT may have
     /// brought the key back in between.
+    ///
+    /// "No history left" is how things settle, not an invariant to lean on: a
+    /// sample that is *already* older than the cutoff when it arrives can land
+    /// between the prune and this, and leaves a history row behind a key that is
+    /// then forgotten. The next pass prunes it.
     fn expire_keys(&self, cutoff: NTP64) -> Result<u64> {
         let mut expired = 0u64;
         let mut pos: Vec<u8> = Vec::new();
