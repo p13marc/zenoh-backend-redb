@@ -71,6 +71,30 @@ const HEALTH_POLL: Duration = Duration::from_secs(1);
 const RECOVERY_BACKOFF_MIN: Duration = Duration::from_secs(1);
 const RECOVERY_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// When the background thread should next wake up.
+///
+/// Never later than `HEALTH_POLL` from now: a storage with nothing on a timer
+/// still has to notice that it has failed.
+///
+/// And while the storage is recovering, **only** the recovery timer counts.
+/// Retention and flushing are not run then, so their deadlines are not advanced
+/// either; were they still waited on, the first one to pass would make every wait
+/// zero-length and the thread would spin at full CPU for as long as the disk stayed
+/// full.
+fn next_wake(
+    now: Instant,
+    recovering: bool,
+    timers: [Option<Instant>; 2],
+    next_recovery: Option<Instant>,
+) -> Instant {
+    let poll = now + HEALTH_POLL;
+    if recovering {
+        next_recovery.map_or(poll, |at| at.min(poll))
+    } else {
+        timers.into_iter().flatten().fold(poll, Instant::min)
+    }
+}
+
 /// What the storage and its background thread both touch.
 #[derive(Default)]
 struct Shared {
@@ -81,6 +105,9 @@ struct Shared {
     /// A refresh has been asked for and not finished. Keeps a dashboard polling
     /// the admin space from queueing a tree walk per poll.
     usage_refresh_pending: AtomicBool,
+    /// How many times the background thread has gone round its loop.
+    #[cfg(test)]
+    wakeups: std::sync::atomic::AtomicU64,
 }
 
 /// What the storage asks its background thread to do.
@@ -141,13 +168,15 @@ fn spawn_background(
             let mut recovery_backoff = RECOVERY_BACKOFF_MIN;
 
             loop {
-                // Never asleep for longer than `HEALTH_POLL`: a storage with
-                // nothing on a timer still has to notice that it has failed.
-                let poll = Instant::now() + HEALTH_POLL;
-                let deadline = [next_retention, next_flush, next_recovery]
-                    .into_iter()
-                    .flatten()
-                    .fold(poll, Instant::min);
+                #[cfg(test)]
+                shared.wakeups.fetch_add(1, Ordering::Relaxed);
+
+                let deadline = next_wake(
+                    Instant::now(),
+                    storage.needs_recovery(),
+                    [next_retention, next_flush],
+                    next_recovery,
+                );
                 let request =
                     requests.recv_timeout(deadline.saturating_duration_since(Instant::now()));
                 match request {
@@ -1901,6 +1930,106 @@ mod tests {
         assert_eq!(status["health"]["state"], "ok");
         assert_eq!(status["health"]["reopens"], 1);
         assert_eq!(status["stats"]["key_count"], 2);
+    }
+
+    /// The wake-up time never lies in the past because of a timer that is not being
+    /// served: that is a thread spinning at full CPU.
+    #[test]
+    fn test_next_wake_ignores_retention_and_flush_while_recovering() {
+        let now = Instant::now();
+        let past = now - Duration::from_secs(60);
+        let soon = now + Duration::from_millis(200);
+        let later = now + Duration::from_secs(600);
+
+        // In service: the earliest timer, or the health poll if that comes first.
+        assert_eq!(next_wake(now, false, [Some(soon), Some(later)], None), soon);
+        assert_eq!(
+            next_wake(now, false, [Some(later), None], None),
+            now + HEALTH_POLL
+        );
+        assert_eq!(next_wake(now, false, [None, None], None), now + HEALTH_POLL);
+        assert_eq!(next_wake(now, false, [Some(past), None], None), past);
+
+        // Recovering: overdue retention and flush deadlines are not waited on.
+        assert_eq!(
+            next_wake(now, true, [Some(past), Some(past)], Some(later)),
+            now + HEALTH_POLL
+        );
+        assert_eq!(
+            next_wake(now, true, [Some(past), Some(past)], Some(soon)),
+            soon
+        );
+        assert_eq!(
+            next_wake(now, true, [Some(past), Some(past)], None),
+            now + HEALTH_POLL
+        );
+    }
+
+    /// #48: an outage that lasts past a flush deadline must not turn the
+    /// background thread into a busy loop. It did: the overdue deadline was still
+    /// waited on, so every wait returned at once.
+    #[tokio::test]
+    async fn test_a_recovering_storage_does_not_spin() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("down.redb");
+        let disk_full = crate::storage::faults::inject(&db_path);
+        // A flush every second, and a retention pass every second: both deadlines
+        // pass several times during the outage below.
+        let storage_config = RedbStorageConfig::new()
+            .with_history(HistoryMode::All)
+            .with_fsync(false)
+            .with_flush_interval_secs(1)
+            .with_retention(RetentionPolicy {
+                max_age_secs: Some(3600),
+                interval_secs: 1,
+                ..Default::default()
+            });
+        let storage =
+            Arc::new(RedbStorage::open(&db_path, storage_config.clone(), "down").unwrap());
+        let mut plugin =
+            RedbStoragePlugin::new(test_storage_config("down"), storage.clone(), storage_config);
+
+        disk_full.store(true, Ordering::Release);
+        let put = plugin
+            .put(
+                Some(OwnedKeyExpr::new("test/k").unwrap()),
+                ZBytes::from("v"),
+                Encoding::ZENOH_STRING,
+                Timestamp::new(NTP64(100), zenoh::time::TimestampId::rand()),
+            )
+            .await;
+        // With `fsync: false` the write that fails may be this one or the flush
+        // after it; either way the storage ends up out of service.
+        let _ = put;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !storage.needs_recovery() {
+            assert!(
+                Instant::now() < deadline,
+                "the storage never noticed the failure"
+            );
+            let _ = storage.flush();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // Stay down for three seconds: three flush deadlines, three retention
+        // deadlines, and a couple of failed reopen attempts.
+        let before = plugin.shared.wakeups.load(Ordering::Relaxed);
+        std::thread::sleep(Duration::from_secs(3));
+        let wakeups = plugin.shared.wakeups.load(Ordering::Relaxed) - before;
+        assert!(storage.needs_recovery(), "the disk is still full");
+        assert!(
+            wakeups < 50,
+            "the background thread woke {wakeups} times in 3s of outage; a handful is \
+             right, thousands is a busy loop"
+        );
+
+        // And it still recovers afterwards.
+        disk_full.store(false, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(40);
+        while storage.needs_recovery() {
+            assert!(Instant::now() < deadline, "the storage never came back");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// #36: on a storage too big to read inside an admin query, the query must

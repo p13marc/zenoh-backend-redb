@@ -1069,13 +1069,19 @@ impl RedbStorage {
         if self.failed.load(Ordering::Acquire) {
             return Err(self.unavailable());
         }
-        let result = match self.db.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        let guard = self.db.read().unwrap_or_else(|e| e.into_inner());
+        let result = match guard.as_ref() {
             Some(db) => f(db),
             None => Err(RedbBackendError::other("the database is closed")),
         };
+        // Noted before the guard is released. `try_recover` swaps the handle under
+        // the write lock, so this failure is recorded against the handle it came
+        // from: either before the reopen, or not at all. Noted afterwards, a late
+        // error from the dead handle could take the new one out of service.
         if let Err(e) = &result {
             self.note_failure(e);
         }
+        drop(guard);
         result
     }
 
@@ -2169,9 +2175,13 @@ impl RedbStorage {
                     std::thread::sleep(BACKOFF);
                 }
                 Err(e) => {
-                    // Not fatal: whatever was deleted is committed and correct, and
-                    // the next pass tries again.
+                    // Not fatal to the pass: whatever was deleted is committed and
+                    // correct, and the next pass tries again. But compacting writes
+                    // a great deal, so this is where a full disk is likely to show
+                    // first, and it does not come through `with_db`: say so here.
+                    let e = RedbBackendError::from(e);
                     warn!("Compaction of '{}' failed: {}", self.name, e);
+                    self.note_failure(&e);
                     return Compaction::Refused;
                 }
             }
@@ -4309,6 +4319,43 @@ mod tests {
         assert!(storage.get("during").unwrap().is_none());
         storage.put("after", value(4)).unwrap();
         assert_eq!(storage.count().unwrap(), 2);
+    }
+
+    /// #48: compaction takes the database lock itself rather than going through
+    /// `with_db`, and it is the operation most likely to hit a full disk. A
+    /// failure there must take the storage out of service like any other.
+    #[test]
+    fn an_io_failure_during_compaction_is_noticed() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("compact.redb");
+        let disk_full = faults::inject(&path);
+        let id = TimestampId::rand();
+        let storage = bulk_storage(
+            RetentionPolicy {
+                max_age_secs: Some(u64::MAX),
+                ..Default::default()
+            },
+            &path,
+        );
+        // Enough churn that a compaction has pages to move, all of it on disk.
+        put_aged(&storage, "k", 400, 10, &[7u8; 512], id);
+        let cutoff = storage.eviction_cutoff(300).unwrap().unwrap();
+        storage.prune_by_time(Some(cutoff), None).unwrap();
+        storage.flush().unwrap();
+
+        disk_full.store(true, Ordering::Release);
+        assert_eq!(
+            storage.compact(CompactionMode::Maximum),
+            Compaction::Refused
+        );
+        assert!(
+            storage.needs_recovery(),
+            "a compaction that failed on I/O must take the storage out of service"
+        );
+
+        disk_full.store(false, Ordering::Release);
+        assert!(storage.try_recover().unwrap());
+        assert_eq!(storage.get_range("k", &full_range()).unwrap().len(), 100);
     }
 
     /// An error that is not the file failing must not take a storage out of
