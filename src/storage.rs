@@ -2230,8 +2230,8 @@ impl RedbStorage {
         let mut compacted = false;
 
         if self.on_disk_bytes().is_none() {
-            // Without a path we cannot measure, and guessing would be worse than
-            // doing nothing.
+            // The file cannot be stat'ed, so there is nothing to measure, and
+            // guessing would be worse than doing nothing.
             warn!(
                 "Storage '{}': max_bytes is configured but the database file is \
                  unreadable, so size cannot be enforced",

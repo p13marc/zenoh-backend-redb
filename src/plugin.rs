@@ -1333,7 +1333,7 @@ mod tests {
         }
     }
 
-    fn storage_config_for(volume_cfg: serde_json::Value, _dir: &TempDir) -> StorageConfig {
+    fn storage_config_for(volume_cfg: serde_json::Value) -> StorageConfig {
         StorageConfig {
             name: "s".to_string(),
             key_expr: "test/**".parse().unwrap(),
@@ -1358,7 +1358,7 @@ mod tests {
         let volume = test_volume(&dir, HistoryMode::All);
 
         let Err(err) = volume
-            .create_storage(storage_config_for(json!({ "dir": "unbounded" }), &dir))
+            .create_storage(storage_config_for(json!({ "dir": "unbounded" })))
             .await
         else {
             panic!("an all-mode storage with no retention must not start");
@@ -1373,7 +1373,6 @@ mod tests {
         volume
             .create_storage(storage_config_for(
                 json!({ "dir": "bounded", "retention": { "max_age_secs": 3600 } }),
-                &dir,
             ))
             .await
             .map(|_| ())
@@ -1391,7 +1390,6 @@ mod tests {
         let Err(err) = volume
             .create_storage(storage_config_for(
                 json!({ "dir": "bounded-latest", "retention": { "max_age_secs": 60 } }),
-                &dir,
             ))
             .await
         else {
@@ -1443,7 +1441,6 @@ mod tests {
             let Err(err) = volume
                 .create_storage(storage_config_for(
                     json!({ "dir": "bad", "retention": retention }),
-                    &dir,
                 ))
                 .await
             else {
@@ -1501,7 +1498,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let volume = test_volume(&dir, HistoryMode::Latest);
         let mut storage = volume
-            .create_storage(storage_config_for(json!({ "dir": "keys" }), &dir))
+            .create_storage(storage_config_for(json!({ "dir": "keys" })))
             .await
             .map_err(|e| e.to_string())
             .unwrap();
@@ -1550,14 +1547,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let volume = test_volume(&dir, HistoryMode::All);
         let mut storage = volume
-            .create_storage(storage_config_for(
-                json!({
-                    "dir": "capped",
-                    "max_samples_per_get": 10,
-                    "retention": { "max_age_secs": 86400 },
-                }),
-                &dir,
-            ))
+            .create_storage(storage_config_for(json!({
+                "dir": "capped",
+                "max_samples_per_get": 10,
+                "retention": { "max_age_secs": 86400 },
+            })))
             .await
             .map_err(|e| e.to_string())
             .unwrap();
@@ -1606,7 +1600,6 @@ mod tests {
             .create_storage(storage_config_for(
                 json!({ "dir": "bad", "max_samples_per_get": "many",
                         "retention": { "max_age_secs": 60 } }),
-                &dir,
             ))
             .await
         else {
@@ -1633,7 +1626,7 @@ mod tests {
             ("dir", ""),
         ] {
             let Err(err) = volume
-                .create_storage(storage_config_for(json!({ property: value }), &dir))
+                .create_storage(storage_config_for(json!({ property: value })))
                 .await
             else {
                 panic!("`{property}: \"{value}\"` must be rejected");
@@ -1650,16 +1643,13 @@ mod tests {
 
         // A wrong type is said to be a wrong type.
         let Err(err) = volume
-            .create_storage(storage_config_for(json!({ "dir": 5 }), &dir))
+            .create_storage(storage_config_for(json!({ "dir": 5 })))
             .await
         else {
             panic!("a numeric dir must be rejected");
         };
         assert!(err.to_string().contains("must be a string"), "{err}");
-        let Err(err) = volume
-            .create_storage(storage_config_for(json!({}), &dir))
-            .await
-        else {
+        let Err(err) = volume.create_storage(storage_config_for(json!({}))).await else {
             panic!("a storage with no path must be rejected");
         };
         assert!(err.to_string().contains("is required"), "{err}");
@@ -1672,7 +1662,7 @@ mod tests {
             ("db_file", "bare", "bare.redb"),
         ] {
             volume
-                .create_storage(storage_config_for(json!({ property: value }), &dir))
+                .create_storage(storage_config_for(json!({ property: value })))
                 .await
                 .map(|_| ())
                 .unwrap_or_else(|e| panic!("`{property}: \"{value}\"` must work: {e}"));
@@ -1693,7 +1683,6 @@ mod tests {
         let Err(err) = volume
             .create_storage(storage_config_for(
                 json!({ "dir": "cfg", "read_only": true }),
-                &dir,
             ))
             .await
         else {
@@ -1705,7 +1694,7 @@ mod tests {
         // Populate it writable, then serve it read-only.
         {
             let mut writable = volume
-                .create_storage(storage_config_for(json!({ "dir": "cfg" }), &dir))
+                .create_storage(storage_config_for(json!({ "dir": "cfg" })))
                 .await
                 .map_err(|e| e.to_string())
                 .unwrap();
@@ -1726,7 +1715,6 @@ mod tests {
             match volume
                 .create_storage(storage_config_for(
                     json!({ "dir": "cfg", "read_only": true }),
-                    &dir,
                 ))
                 .await
             {
@@ -1804,7 +1792,7 @@ mod tests {
         let volume = test_volume(&dir, HistoryMode::Latest);
 
         volume
-            .create_storage(storage_config_for(json!({ "dir": "plain" }), &dir))
+            .create_storage(storage_config_for(json!({ "dir": "plain" })))
             .await
             .map(|_| ())
             .expect("a latest-mode storage needs no retention policy");
@@ -1819,7 +1807,6 @@ mod tests {
         let Err(err) = volume
             .create_storage(storage_config_for(
                 json!({ "dir": "empty", "retention": {} }),
-                &dir,
             ))
             .await
         else {
@@ -2299,7 +2286,6 @@ mod tests {
             let Err(err) = volume
                 .create_storage(storage_config_for(
                     json!({ "dir": "bad", "fsync": false, "flush_interval_secs": bad }),
-                    &dir,
                 ))
                 .await
             else {
@@ -2311,7 +2297,6 @@ mod tests {
         volume
             .create_storage(storage_config_for(
                 json!({ "dir": "good", "fsync": false, "flush_interval_secs": 30 }),
-                &dir,
             ))
             .await
             .map(|_| ())
