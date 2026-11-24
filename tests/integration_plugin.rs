@@ -18,7 +18,8 @@ mod plugin_tests {
 
     #[test]
     fn test_none_key_constant() {
-        assert_eq!(NONE_KEY, "@@none_key@@");
+        // Not a key expression, so no publisher's key can collide with it.
+        assert_eq!(NONE_KEY, "");
     }
 
     #[test]

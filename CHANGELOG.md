@@ -30,6 +30,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The crate root re-exports `HistoryMode`, `RetentionPolicy`, `DecimationPolicy`,
   `RetentionPass`, `StorageStats`, `StorageUsage` and `WriteOutcome`.
 
+- **On-disk format 2, with a version stamp** (#49). A database now says which
+  layout it has. A 0.4 / 0.5 database (format 1) is **migrated in place the first time
+  0.6 opens it for writing**, in one transaction. The migration is one-way: 0.5 cannot
+  open a migrated file, so copy it first if you may need to roll back. A database
+  written by a later version is refused instead of guessed at.
+
 ### Fixed
 - **`max_bytes` evicted samples before reclaiming the free space inside pages**
   (#46). A B-tree page that has just split is half empty, and that space was counted
@@ -44,6 +50,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   router cannot write to opens, and any number of read-only storages can share one
   database. A read-only storage refuses a file that lacks this backend's tables or
   needs a repair, instead of creating or repairing it.
+- **The "no key" sentinel collided with a real key** (#49). A sample whose key is
+  exactly the storage's `strip_prefix` was stored under `@@none_key@@`, which is a
+  valid key expression: `<prefix>/@@none_key@@` landed on the same row and was
+  answered as `<prefix>`. It is now stored under the empty string.
 - **`dir` and `db_file` could point outside the backend root** (#50). An absolute
   `db_file` replaced the root and a `..` walked out of it. Both are now rejected at
   storage creation. **Breaking** for a config that used an absolute `db_file` on

@@ -51,8 +51,8 @@ pub const PROP_STORAGE_RETENTION: &str = "retention";
 // Volume configuration properties
 pub const PROP_VOLUME_HISTORY: &str = "history";
 
-// Special key for None (when the prefix being stripped exactly matches the key)
-pub const NONE_KEY: &str = "@@none_key@@";
+/// What a sample with no key is stored under; see [`crate::storage::NO_KEY`].
+pub const NONE_KEY: &str = crate::storage::NO_KEY;
 
 /// A storage whose file is at most this big has its [`StorageUsage`] computed
 /// inside the admin query that asks for it: the walk fits in the default page
@@ -1073,11 +1073,6 @@ mod tests {
     }
 
     #[test]
-    fn test_special_none_key() {
-        assert_eq!(NONE_KEY, "@@none_key@@");
-    }
-
-    #[test]
     fn test_environment_variable_constant() {
         assert_eq!(SCOPE_ENV_VAR, "ZENOH_BACKEND_REDB_ROOT");
     }
@@ -1366,6 +1361,56 @@ mod tests {
             db_path_for_dir(base, "telemetry", "s"),
             base.join("telemetry.redb")
         );
+    }
+
+    /// #49: the sample whose key is the storage's whole `strip_prefix` (no key
+    /// left) and a sample whose stripped key happens to be `@@none_key@@` are two
+    /// different entries. Format 1 stored both on one row.
+    #[tokio::test]
+    async fn test_a_keyless_sample_does_not_collide_with_a_real_key() {
+        let dir = TempDir::new().unwrap();
+        let volume = test_volume(&dir, HistoryMode::Latest);
+        let mut storage = volume
+            .create_storage(storage_config_for(json!({ "dir": "keys" }), &dir))
+            .await
+            .map_err(|e| e.to_string())
+            .unwrap();
+        let id = zenoh::time::TimestampId::rand();
+        let lookalike = OwnedKeyExpr::new("@@none_key@@").unwrap();
+
+        storage
+            .put(
+                None,
+                ZBytes::from("keyless"),
+                Encoding::ZENOH_STRING,
+                Timestamp::new(NTP64(100), id),
+            )
+            .await
+            .unwrap();
+        storage
+            .put(
+                Some(lookalike.clone()),
+                ZBytes::from("lookalike"),
+                Encoding::ZENOH_STRING,
+                Timestamp::new(NTP64(200), id),
+            )
+            .await
+            .unwrap();
+
+        let keyless = storage.get(None, "").await.unwrap();
+        assert_eq!(keyless[0].payload.to_bytes().as_ref(), b"keyless");
+        let real = storage.get(Some(lookalike.clone()), "").await.unwrap();
+        assert_eq!(real[0].payload.to_bytes().as_ref(), b"lookalike");
+
+        let mut entries: Vec<Option<String>> = storage
+            .get_all_entries()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key.map(|k| k.to_string()))
+            .collect();
+        entries.sort();
+        assert_eq!(entries, vec![None, Some(lookalike.to_string())]);
     }
 
     /// #50: `dir` and `db_file` name a database inside the root. Neither may point

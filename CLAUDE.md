@@ -107,6 +107,15 @@ time window into a single bounded range scan. `data_info` stays the latest-value
 index in both modes, which keeps `get_all_entries` O(keys) and a no-`_time` GET a
 point lookup.
 
+A fifth table, **meta**, holds the format version (`FORMAT_VERSION` in storage.rs).
+`Handle::open` stamps a new database, migrates an older one in the same transaction
+that restamps it, and refuses a newer one. **Any change to what is on disk bumps
+`FORMAT_VERSION` and adds a `migrate_N_to_M`**; there is no other way for a later
+build to tell an old file from a new one.
+
+A sample with no key (its key was exactly the storage's `strip_prefix`) is stored
+under `NO_KEY`, the empty string, which no key expression can be.
+
 A thread-local `KEY_BUFFER` keeps PUT/GET/DELETE from allocating a key per call.
 
 ### History and retention

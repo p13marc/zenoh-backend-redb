@@ -160,6 +160,28 @@ flushes the tail when writes stop.
 
 A clean shutdown always persists everything, in either mode.
 
+### On-disk format and upgrades
+
+A database carries a format version (a `meta` table), and this build writes
+**format 2**.
+
+| Format | Written by | Opened by this version |
+|---|---|---|
+| 1 | 0.4, 0.5 | Yes: **migrated in place**, automatically, the first time it is opened for writing |
+| 2 | 0.6 | Yes |
+| newer | a later version | No: refused, with an error naming both formats |
+
+The migration is one transaction: after a crash the file is either still format 1 or
+fully format 2. It only moves the sample stored under a storage's bare `strip_prefix`
+(see below), so it is quick. **It is one-way**: 0.5 cannot read a format-2 file, so
+take a copy first if you may need to go back. A `read_only` storage cannot migrate; it
+asks for the database to be opened writable once.
+
+What changed in format 2: a sample whose key is exactly the storage's `strip_prefix`
+has no key left after stripping. It used to be stored under `@@none_key@@`, which is
+itself a valid key, so `<prefix>/@@none_key@@` landed on the same row. It is now
+stored under the empty string, which no key expression can be.
+
 ## History: `latest` and `all`
 
 By default a storage keeps **one value per key** — the last writer wins. That is

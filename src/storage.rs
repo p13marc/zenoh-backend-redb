@@ -514,6 +514,35 @@ impl StoredValue {
     }
 }
 
+/// Where a database says which layout it has.
+const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("meta");
+
+/// The key in [`META_TABLE`] holding the format version.
+const META_FORMAT: &str = "format";
+
+/// The on-disk layout this build reads and writes.
+///
+/// * **1** — 0.4 and 0.5. No `meta` table; a sample with no key stored under
+///   `"@@none_key@@"`.
+/// * **2** — a `meta` table; a sample with no key stored under [`NO_KEY`].
+///
+/// A database is stamped when it is created and migrated, in one transaction, when
+/// an older one is opened for writing. A newer one is refused: guessing at a layout
+/// this build has never seen is how data gets quietly misread.
+pub const FORMAT_VERSION: u64 = 2;
+
+/// The key a sample is stored under when it has no key of its own — when its key
+/// expression is exactly the storage's `strip_prefix`, so nothing is left of it.
+///
+/// The empty string, because a key expression can never be empty: nothing a
+/// publisher writes can collide with it. Format 1 used `"@@none_key@@"`, which is
+/// a perfectly valid key expression, so `<prefix>/@@none_key@@` and `<prefix>`
+/// itself landed on the same row.
+pub const NO_KEY: &str = "";
+
+/// What format 1 stored a keyless sample under.
+const FORMAT_1_NO_KEY: &str = "@@none_key@@";
+
 /// The four tables a database of this backend holds, by name.
 fn table_names() -> [&'static str; 4] {
     use redb::TableHandle;
@@ -569,6 +598,7 @@ impl Handle {
                 .open_read_only(path)
                 .map_err(|e| Self::explain_open_error(path, config, e))?;
             Self::require_tables(path, &db)?;
+            Self::require_current_format(path, &db)?;
             return Ok(Self::ReadOnly(db));
         }
 
@@ -585,6 +615,36 @@ impl Handle {
         // interval from.
         let mut write_txn = db.begin_write()?;
         write_txn.set_durability(Durability::Immediate)?;
+
+        let found = {
+            use redb::TableHandle;
+            let tables: Vec<String> = write_txn
+                .list_tables()?
+                .map(|table| table.name().to_string())
+                .collect();
+            if tables.iter().any(|name| name == "meta") {
+                write_txn
+                    .open_table(META_TABLE)?
+                    .get(META_FORMAT)?
+                    .map(|v| v.value())
+            } else if tables
+                .iter()
+                .any(|name| table_names().contains(&name.as_str()))
+            {
+                // Data but no stamp: written before there was one.
+                Some(1)
+            } else {
+                // Nothing at all: a new database, which starts at the current format.
+                None
+            }
+        };
+        if let Some(found) = found
+            && found > FORMAT_VERSION
+        {
+            write_txn.abort()?;
+            return Err(Self::newer_format(path, found));
+        }
+
         {
             write_txn.open_table(PAYLOADS_TABLE)?;
             write_txn.open_table(DATA_INFO_TABLE)?;
@@ -593,6 +653,20 @@ impl Handle {
             // migration step on a database that already exists.
             write_txn.open_table(HISTORY_PAYLOADS_TABLE)?;
             write_txn.open_table(HISTORY_INFO_TABLE)?;
+        }
+        if found == Some(1) {
+            let moved = Self::migrate_1_to_2(&write_txn)?;
+            info!(
+                "Migrated {:?} from format 1 to format {}: {} keyless row(s) moved",
+                path, FORMAT_VERSION, moved
+            );
+        }
+        // Stamped in the same transaction as the migration, so a crash leaves either
+        // the old layout unstamped or the new one stamped, never a mix.
+        if found != Some(FORMAT_VERSION) {
+            write_txn
+                .open_table(META_TABLE)?
+                .insert(META_FORMAT, FORMAT_VERSION)?;
         }
         write_txn.commit()?;
 
@@ -624,6 +698,85 @@ impl Handle {
              database once with `read_only: false`, or point this storage at the right file.",
             missing.join(" / ")
         )))
+    }
+
+    /// Format 1 → 2: move the keyless rows from `"@@none_key@@"` to [`NO_KEY`].
+    ///
+    /// A row under the old sentinel is taken to be keyless, which is what format 1
+    /// itself took it to be. Returns how many rows moved.
+    fn migrate_1_to_2(write_txn: &redb::WriteTransaction) -> Result<u64> {
+        let mut moved = 0u64;
+
+        // The latest value: one row per table.
+        for table in [PAYLOADS_TABLE, DATA_INFO_TABLE] {
+            let mut table = write_txn.open_table(table)?;
+            let old = table
+                .remove(FORMAT_1_NO_KEY.as_bytes())?
+                .map(|value| value.value().to_vec());
+            if let Some(value) = old {
+                table.insert(NO_KEY.as_bytes(), value.as_slice())?;
+                moved += 1;
+            }
+        }
+
+        // Its history: every `"@@none_key@@" || 0x00 || timestamp` row, re-keyed to
+        // `"" || 0x00 || timestamp`. A batch at a time, so a long history does not
+        // have to fit in memory.
+        let start = key_range_start(FORMAT_1_NO_KEY.as_bytes());
+        let end = key_range_end(FORMAT_1_NO_KEY.as_bytes());
+        for table in [HISTORY_PAYLOADS_TABLE, HISTORY_INFO_TABLE] {
+            let mut table = write_txn.open_table(table)?;
+            loop {
+                let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                for row in table
+                    .range(start.as_slice()..end.as_slice())?
+                    .take(DELETE_BATCH)
+                {
+                    let (key, value) = row?;
+                    batch.push((key.value().to_vec(), value.value().to_vec()));
+                }
+                if batch.is_empty() {
+                    break;
+                }
+                for (old_key, value) in &batch {
+                    table.remove(old_key.as_slice())?;
+                    // Everything from the separator on is unchanged.
+                    table.insert(&old_key[FORMAT_1_NO_KEY.len()..], value.as_slice())?;
+                    moved += 1;
+                }
+            }
+        }
+
+        Ok(moved)
+    }
+
+    /// A read-only open cannot migrate, so the database must already be current.
+    fn require_current_format(path: &Path, db: &redb::ReadOnlyDatabase) -> Result<()> {
+        let read_txn = db.begin_read()?;
+        let found = match read_txn.open_table(META_TABLE) {
+            Ok(meta) => meta.get(META_FORMAT)?.map(|v| v.value()),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(e) => return Err(e.into()),
+        };
+        match found {
+            Some(FORMAT_VERSION) => Ok(()),
+            Some(newer) if newer > FORMAT_VERSION => Err(Self::newer_format(path, newer)),
+            older => Err(RedbBackendError::other(format!(
+                "{path:?} is in format {}, and this version reads format {FORMAT_VERSION}. \
+                 A `read_only` storage cannot migrate it. Open the database once with \
+                 `read_only: false`, which migrates it in place.",
+                older.unwrap_or(1)
+            ))),
+        }
+    }
+
+    fn newer_format(path: &Path, found: u64) -> RedbBackendError {
+        RedbBackendError::other(format!(
+            "{path:?} is in format {found}, written by a newer version of this backend. \
+             This version ({}) reads up to format {FORMAT_VERSION}. Upgrade the backend; \
+             it will not guess at a layout it does not know.",
+            env!("CARGO_PKG_VERSION")
+        ))
     }
 
     /// Turn the errors an operator can act on into ones that say how.
@@ -3626,6 +3779,176 @@ mod tests {
         read_only(&path).expect("and then it opens read-only");
     }
 
+    /// The format version a file is stamped with, read straight off the file.
+    fn stamped_format(path: &std::path::Path) -> Option<u64> {
+        let db = redb::ReadOnlyDatabase::open(path).unwrap();
+        let txn = db.begin_read().unwrap();
+        match txn.open_table(META_TABLE) {
+            Ok(meta) => meta.get(META_FORMAT).unwrap().map(|v| v.value()),
+            Err(redb::TableError::TableDoesNotExist(_)) => None,
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    /// A database as 0.4 / 0.5 wrote it: four tables, no `meta`, and a keyless
+    /// sample (latest value plus `history` samples) under `"@@none_key@@"`, next
+    /// to an ordinary key.
+    fn write_format_1(path: &std::path::Path, history: u64, id: TimestampId) {
+        let db = Database::create(path).unwrap();
+        let txn = db.begin_write().unwrap();
+        {
+            let mut payloads = txn.open_table(PAYLOADS_TABLE).unwrap();
+            let mut info = txn.open_table(DATA_INFO_TABLE).unwrap();
+            let mut history_payloads = txn.open_table(HISTORY_PAYLOADS_TABLE).unwrap();
+            let mut history_info = txn.open_table(HISTORY_INFO_TABLE).unwrap();
+
+            for key in [FORMAT_1_NO_KEY, "ordinary"] {
+                for n in 1..=history {
+                    let timestamp = at(1000 + n, id);
+                    let meta = encode_data_info(Encoding::ZENOH_BYTES, &timestamp, false).unwrap();
+                    let payload = format!("{key}#{n}");
+                    let composite = encode_history_key(key, &timestamp);
+                    history_payloads
+                        .insert(composite.as_slice(), payload.as_bytes())
+                        .unwrap();
+                    history_info
+                        .insert(composite.as_slice(), meta.as_slice())
+                        .unwrap();
+                    if n == history {
+                        payloads.insert(key.as_bytes(), payload.as_bytes()).unwrap();
+                        info.insert(key.as_bytes(), meta.as_slice()).unwrap();
+                    }
+                }
+            }
+        }
+        txn.commit().unwrap();
+    }
+
+    /// #49: a new database is stamped with the format it is written in.
+    #[test]
+    fn a_new_database_is_stamped_with_the_current_format() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("new.redb");
+        drop(RedbStorage::open(&path, RedbStorageConfig::default(), "new").unwrap());
+        assert_eq!(stamped_format(&path), Some(FORMAT_VERSION));
+
+        // Opening it again changes nothing.
+        drop(RedbStorage::open(&path, RedbStorageConfig::default(), "new").unwrap());
+        assert_eq!(stamped_format(&path), Some(FORMAT_VERSION));
+    }
+
+    /// #49: a format-1 database is migrated when it is opened for writing: the
+    /// keyless sample moves from `"@@none_key@@"` to the empty key, latest value
+    /// and history both, and everything else is left exactly as it was.
+    #[test]
+    fn a_format_1_database_is_migrated_in_place() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v1.redb");
+        let id = TimestampId::rand();
+        // More history than one migration batch.
+        let history = (DELETE_BATCH * 3 + 7) as u64;
+        write_format_1(&path, history, id);
+        assert_eq!(stamped_format(&path), None);
+
+        let config = RedbStorageConfig::default().with_history(HistoryMode::All);
+        let storage = RedbStorage::open(&path, config.clone(), "v1").unwrap();
+
+        // The keyless sample is where format 2 looks for it...
+        let latest = storage.get(NO_KEY).unwrap().expect("keyless latest value");
+        assert_eq!(
+            latest.payload,
+            format!("{FORMAT_1_NO_KEY}#{history}").into_bytes()
+        );
+        let samples = storage.get_range(NO_KEY, &full_range()).unwrap();
+        assert_eq!(samples.len() as u64, history);
+        assert_eq!(
+            samples[0].payload,
+            format!("{FORMAT_1_NO_KEY}#1").into_bytes()
+        );
+        assert_eq!(samples[0].timestamp, at(1001, id));
+
+        // ...and no longer where format 1 left it.
+        assert!(storage.get(FORMAT_1_NO_KEY).unwrap().is_none());
+        assert!(
+            storage
+                .get_range(FORMAT_1_NO_KEY, &full_range())
+                .unwrap()
+                .is_empty()
+        );
+
+        // The ordinary key did not move.
+        assert_eq!(
+            storage.get_range("ordinary", &full_range()).unwrap().len() as u64,
+            history
+        );
+        let stats = storage.stats().unwrap();
+        assert_eq!((stats.key_count, stats.sample_count), (2, 2 * history));
+
+        // Stamped, and a second open has nothing left to do.
+        drop(storage);
+        assert_eq!(stamped_format(&path), Some(FORMAT_VERSION));
+        let storage = RedbStorage::open(&path, config, "v1").unwrap();
+        assert_eq!(
+            storage.get_range(NO_KEY, &full_range()).unwrap().len() as u64,
+            history
+        );
+    }
+
+    /// #49: a database from a newer version of this backend is refused, not read
+    /// on the assumption that nothing changed.
+    #[test]
+    fn a_database_in_a_newer_format_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("future.redb");
+        drop(RedbStorage::open(&path, RedbStorageConfig::default(), "f").unwrap());
+        {
+            let db = Database::open(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(META_TABLE)
+                .unwrap()
+                .insert(META_FORMAT, FORMAT_VERSION + 1)
+                .unwrap();
+            txn.commit().unwrap();
+        }
+
+        for config in [
+            RedbStorageConfig::default(),
+            RedbStorageConfig::default().with_read_only(true),
+        ] {
+            let Err(err) = RedbStorage::open(&path, config, "f") else {
+                panic!("a newer format must be refused");
+            };
+            let msg = err.to_string();
+            assert!(
+                msg.contains(&format!("format {}", FORMAT_VERSION + 1)),
+                "{msg}"
+            );
+            assert!(msg.contains("newer version"), "{msg}");
+        }
+        // Refusing it must not have restamped it.
+        assert_eq!(stamped_format(&path), Some(FORMAT_VERSION + 1));
+    }
+
+    /// #49: a read-only storage cannot migrate, so it says what will.
+    #[test]
+    fn a_read_only_storage_refuses_a_format_1_database() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("v1-ro.redb");
+        write_format_1(&path, 3, TimestampId::rand());
+
+        let Err(err) = read_only(&path) else {
+            panic!("a read-only storage must not serve a format it cannot migrate");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("format 1"), "{msg}");
+        assert!(msg.contains("read_only: false"), "{msg}");
+        assert_eq!(
+            stamped_format(&path),
+            None,
+            "and it must not have touched it"
+        );
+    }
+
     /// `read_only` / `create_db: false` on a database that does not exist must fail
     /// with an error that names the setting responsible.
     ///
@@ -3990,20 +4313,13 @@ mod tests {
         assert!(!RedbStorage::matches_wildcard("a/other/c", "a/sensor$*/c"));
     }
 
-    /// The placeholder used when `strip_prefix` consumes a key entirely is a
-    /// verbatim chunk, so `**` cannot reach it. That is the correct outcome —
-    /// it is an internal sentinel, not part of anyone's keyspace — but it is
-    /// worth pinning so the behaviour is not rediscovered as a bug.
+    /// The key a keyless sample is stored under must be one no publisher can
+    /// write. The empty string qualifies because a key expression is never empty;
+    /// format 1's `"@@none_key@@"` did not, because it is a valid one.
     #[test]
-    fn the_none_key_sentinel_is_verbatim() {
-        assert!(!RedbStorage::matches_wildcard(
-            crate::plugin::NONE_KEY,
-            "**"
-        ));
-        assert!(RedbStorage::matches_wildcard(
-            crate::plugin::NONE_KEY,
-            crate::plugin::NONE_KEY
-        ));
+    fn the_no_key_sentinel_is_not_a_key_expression() {
+        assert!(keyexpr::new(NO_KEY).is_err());
+        assert!(keyexpr::new(FORMAT_1_NO_KEY).is_ok());
     }
 
     /// Anything that is not a valid key expression matches nothing, rather than
