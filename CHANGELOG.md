@@ -18,6 +18,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Opening a database that was not closed cleanly logs the progress of the repair. On
   a large file that takes minutes, during which the router used to look hung.
 
+- **Breaking (API): one way to open a storage, one copy of its path** (#52).
+  `RedbStorage::open(path, config, name)` replaces `RedbStorage::new`, and the
+  storage keeps the path it opened. `RedbStorageConfig::db_path` is gone: it was a
+  second, optional copy that `max_bytes` and the statistics read, so a storage opened
+  without it reported no size and enforced no size limit.
+- **Breaking (API): removed** `RedbBackend`, `RedbBackendConfig`, and the config
+  fields nothing read (`db_file`, `key_expr`, `strip_prefix`, `table_name`) with their
+  builders. The plugin never used the backend layer; `RedbStorage` is the library
+  entry point. Unused error variants are gone too.
+- The crate root re-exports `HistoryMode`, `RetentionPolicy`, `DecimationPolicy`,
+  `RetentionPass`, `StorageStats`, `StorageUsage` and `WriteOutcome`.
+
 ### Fixed
 - **`max_bytes` evicted samples before reclaiming the free space inside pages**
   (#46). A B-tree page that has just split is half empty, and that space was counted

@@ -4,13 +4,6 @@ This directory contains integration tests for the zenoh-backend-redb storage bac
 
 ## Test Files
 
-### `integration_backend.rs`
-Tests the backend layer functionality, including:
-- Backend creation and configuration
-- Storage instance management
-- Multiple storage handling
-- Backend lifecycle
-
 ### `integration_storage.rs`
 Tests the storage layer functionality, including:
 - Basic PUT/GET/DELETE operations

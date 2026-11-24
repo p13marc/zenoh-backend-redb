@@ -71,13 +71,12 @@ fn key(i: u64) -> String {
 
 fn open(path: &std::path::Path, policy: RetentionPolicy) -> RedbStorage {
     let config = RedbStorageConfig::default()
-        .with_db_path(path.to_path_buf())
         .with_history(HistoryMode::All)
         .with_cache_size(CACHE)
         // One fsync per sample would make this test take minutes.
         .with_fsync(false)
         .with_retention(policy);
-    RedbStorage::new(path, config, "memory".to_string()).unwrap()
+    RedbStorage::open(path, config, "memory").unwrap()
 }
 
 fn fill(storage: &RedbStorage, age_secs: u64) {

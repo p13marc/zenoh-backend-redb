@@ -1,24 +1,6 @@
 //! Configuration structures for the zenoh-backend-redb storage backend.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-
-/// Configuration for the redb backend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RedbBackendConfig {
-    /// Base directory for storing databases.
-    /// If not specified, defaults to "./zenoh_redb_backend"
-    #[serde(default = "default_base_dir")]
-    pub base_dir: PathBuf,
-
-    /// Whether to create the directory if it doesn't exist.
-    #[serde(default = "default_true")]
-    pub create_dir: bool,
-
-    /// Default configuration for storages (can be overridden per storage).
-    #[serde(default)]
-    pub default_storage_config: RedbStorageConfig,
-}
 
 /// How much of a key's history a storage keeps.
 ///
@@ -189,14 +171,6 @@ fn default_retention_interval_secs() -> u64 {
 /// Configuration for a single redb storage instance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RedbStorageConfig {
-    /// Database file name. If not specified, uses the storage name.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub db_file: Option<String>,
-
-    /// Full path to the database file. Overrides base_dir and db_file if set.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub db_path: Option<PathBuf>,
-
     /// Page-cache budget in bytes for redb.
     ///
     /// Defaults to [`DEFAULT_CACHE_SIZE`] (64 MiB) and is **always** set explicitly —
@@ -226,23 +200,6 @@ pub struct RedbStorageConfig {
     #[serde(default = "default_flush_interval_secs")]
     pub flush_interval_secs: u64,
 
-    /// **Unused.** Nothing in this crate reads it. Which keys reach a storage is
-    /// decided by the storage manager from the storage's own `key_expr`, before the
-    /// backend is called. Kept so existing configs still deserialize.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub key_expr: Option<String>,
-
-    /// **Unused.** Nothing in this crate reads it. Prefix stripping is done by the
-    /// storage manager (the storage's `strip_prefix`), which hands the backend keys
-    /// that are already stripped. Kept so existing configs still deserialize.
-    #[serde(default)]
-    pub strip_prefix: bool,
-
-    /// **Unused.** The four tables have fixed names. Kept so existing configs
-    /// still deserialize.
-    #[serde(default = "default_table_name")]
-    pub table_name: String,
-
     /// Whether to create the database if it doesn't exist.
     #[serde(default = "default_true")]
     pub create_db: bool,
@@ -261,57 +218,10 @@ pub struct RedbStorageConfig {
     pub retention: Option<RetentionPolicy>,
 }
 
-impl Default for RedbBackendConfig {
-    fn default() -> Self {
-        Self {
-            base_dir: default_base_dir(),
-            create_dir: true,
-            default_storage_config: RedbStorageConfig::default(),
-        }
-    }
-}
-
-impl RedbBackendConfig {
-    /// Create a new configuration with default values.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Set the base directory for databases.
-    pub fn with_base_dir(mut self, base_dir: PathBuf) -> Self {
-        self.base_dir = base_dir;
-        self
-    }
-
-    /// Set whether to create the directory if it doesn't exist.
-    pub fn with_create_dir(mut self, create_dir: bool) -> Self {
-        self.create_dir = create_dir;
-        self
-    }
-
-    /// Set the default storage configuration.
-    pub fn with_default_storage_config(mut self, config: RedbStorageConfig) -> Self {
-        self.default_storage_config = config;
-        self
-    }
-}
-
 impl RedbStorageConfig {
     /// Create a new storage configuration with default values.
     pub fn new() -> Self {
         Self::default()
-    }
-
-    /// Set the database file name.
-    pub fn with_db_file(mut self, db_file: String) -> Self {
-        self.db_file = Some(db_file);
-        self
-    }
-
-    /// Set the full database path.
-    pub fn with_db_path(mut self, db_path: PathBuf) -> Self {
-        self.db_path = Some(db_path);
-        self
     }
 
     /// Set the cache size in bytes.
@@ -344,33 +254,6 @@ impl RedbStorageConfig {
         self
     }
 
-    /// Has no effect; see [`RedbStorageConfig::key_expr`].
-    #[deprecated(
-        since = "0.5.0",
-        note = "never read: the storage manager filters keys before calling the backend"
-    )]
-    pub fn with_key_expr(mut self, key_expr: String) -> Self {
-        self.key_expr = Some(key_expr);
-        self
-    }
-
-    /// Has no effect; see [`RedbStorageConfig::strip_prefix`].
-    #[deprecated(
-        since = "0.5.0",
-        note = "never read: the storage manager strips the prefix before calling the backend"
-    )]
-    pub fn with_strip_prefix(mut self, strip_prefix: bool) -> Self {
-        self.strip_prefix = strip_prefix;
-        self
-    }
-
-    /// Has no effect; see [`RedbStorageConfig::table_name`].
-    #[deprecated(since = "0.5.0", note = "never read: the tables have fixed names")]
-    pub fn with_table_name(mut self, table_name: String) -> Self {
-        self.table_name = table_name;
-        self
-    }
-
     /// Set whether to create the database if it doesn't exist.
     pub fn with_create_db(mut self, create_db: bool) -> Self {
         self.create_db = create_db;
@@ -382,22 +265,6 @@ impl RedbStorageConfig {
         self.read_only = read_only;
         self
     }
-
-    /// Get the effective database path for a given storage name and backend config.
-    pub fn effective_db_path(
-        &self,
-        storage_name: &str,
-        backend_config: &RedbBackendConfig,
-    ) -> PathBuf {
-        if let Some(ref path) = self.db_path {
-            // Explicit path takes precedence
-            path.clone()
-        } else {
-            // Construct path from base_dir and db_file (or storage name)
-            let filename = self.db_file.as_deref().unwrap_or(storage_name).to_string() + ".redb";
-            backend_config.base_dir.join(filename)
-        }
-    }
 }
 
 /// Default redb page-cache budget: 64 MiB.
@@ -406,20 +273,15 @@ impl RedbStorageConfig {
 pub const DEFAULT_CACHE_SIZE: usize = 64 * 1024 * 1024;
 
 /// `Default` is written out rather than derived so that it cannot drift from the
-/// serde defaults above. A derived `Default` gave `fsync: false`, `create_db: false`
-/// and an empty `table_name`, none of which matches what parsing the same config
-/// from JSON produces.
+/// serde defaults above. A derived `Default` gave `fsync: false` and
+/// `create_db: false`, neither of which matches what parsing the same config from
+/// JSON produces.
 impl Default for RedbStorageConfig {
     fn default() -> Self {
         Self {
-            db_file: None,
-            db_path: None,
             cache_size: default_cache_size(),
             fsync: default_true(),
             flush_interval_secs: default_flush_interval_secs(),
-            key_expr: None,
-            strip_prefix: false,
-            table_name: default_table_name(),
             create_db: true,
             read_only: false,
             history: HistoryMode::Latest,
@@ -440,16 +302,8 @@ fn default_flush_interval_secs() -> u64 {
     DEFAULT_FLUSH_INTERVAL_SECS
 }
 
-fn default_base_dir() -> PathBuf {
-    PathBuf::from("./zenoh_redb_backend")
-}
-
 fn default_true() -> bool {
     true
-}
-
-fn default_table_name() -> String {
-    "zenoh_kv".to_string()
 }
 
 #[cfg(test)]
@@ -478,7 +332,6 @@ mod tests {
 
         assert_eq!(parsed.fsync, default.fsync);
         assert_eq!(parsed.create_db, default.create_db);
-        assert_eq!(parsed.table_name, default.table_name);
         assert_eq!(parsed.read_only, default.read_only);
         assert_eq!(parsed.flush_interval_secs, default.flush_interval_secs);
         assert_eq!(default.flush_interval_secs, DEFAULT_FLUSH_INTERVAL_SECS);
@@ -542,48 +395,13 @@ mod tests {
     }
 
     #[test]
-    fn test_default_config() {
-        let config = RedbBackendConfig::default();
-        assert_eq!(config.base_dir, PathBuf::from("./zenoh_redb_backend"));
-        assert!(config.create_dir);
-    }
-
-    #[test]
     fn test_storage_config_builder() {
         let config = RedbStorageConfig::new()
-            .with_db_file("test.redb".to_string())
             .with_cache_size(1024 * 1024)
             .with_fsync(false);
 
-        assert_eq!(config.db_file, Some("test.redb".to_string()));
         assert_eq!(config.cache_size, 1024 * 1024);
         assert!(!config.fsync);
-    }
-
-    #[test]
-    fn test_effective_db_path() {
-        let backend_config = RedbBackendConfig::default();
-
-        // Test with explicit path
-        let storage_config = RedbStorageConfig::new().with_db_path(PathBuf::from("/tmp/test.redb"));
-        assert_eq!(
-            storage_config.effective_db_path("storage1", &backend_config),
-            PathBuf::from("/tmp/test.redb")
-        );
-
-        // Test with db_file
-        let storage_config = RedbStorageConfig::new().with_db_file("custom.redb".to_string());
-        assert_eq!(
-            storage_config.effective_db_path("storage1", &backend_config),
-            PathBuf::from("./zenoh_redb_backend/custom.redb.redb")
-        );
-
-        // Test with storage name as default
-        let storage_config = RedbStorageConfig::new();
-        assert_eq!(
-            storage_config.effective_db_path("mystorage", &backend_config),
-            PathBuf::from("./zenoh_redb_backend/mystorage.redb")
-        );
     }
 
     #[test]
@@ -599,13 +417,5 @@ mod tests {
         assert_eq!(config.cache_size, deserialized.cache_size);
         assert_eq!(config.fsync, deserialized.fsync);
         assert_eq!(config.flush_interval_secs, deserialized.flush_interval_secs);
-
-        // A config written by an earlier version, naming the fields nothing reads,
-        // still loads.
-        let old: RedbStorageConfig = serde_json::from_str(
-            r#"{ "key_expr": "demo/**", "strip_prefix": true, "table_name": "zenoh_kv" }"#,
-        )
-        .unwrap();
-        assert_eq!(old.key_expr.as_deref(), Some("demo/**"));
     }
 }

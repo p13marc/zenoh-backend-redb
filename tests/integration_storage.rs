@@ -4,22 +4,21 @@ use std::collections::HashSet;
 use tempfile::TempDir;
 use zenoh::bytes::Encoding;
 use zenoh::time::{NTP64, Timestamp, TimestampId};
-use zenoh_backend_redb::{RedbBackend, RedbBackendConfig, RedbStorageConfig, StoredValue};
+use zenoh_backend_redb::{RedbStorage, RedbStorageConfig, StoredValue};
 
-/// Helper function to create a test backend and storage.
-fn create_test_storage() -> (RedbBackend, TempDir) {
+/// A storage in a fresh temporary directory.
+fn create_test_storage() -> (RedbStorage, TempDir) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let config = RedbBackendConfig::new()
-        .with_base_dir(temp_dir.path().to_path_buf())
-        .with_create_dir(true);
+    let storage = RedbStorage::open(
+        temp_dir.path().join("test_storage.redb"),
+        RedbStorageConfig::new(),
+        "test_storage",
+    )
+    .expect("Failed to open storage");
 
-    let backend = RedbBackend::new(config).expect("Failed to create backend");
-    let _storage = backend
-        .create_storage("test_storage".to_string(), None)
-        .expect("Failed to create storage");
-
-    (backend, temp_dir)
+    (storage, temp_dir)
 }
+
 /// Helper to create a test value with proper types
 fn test_value(payload: Vec<u8>, time: u64) -> StoredValue {
     let timestamp = Timestamp::new(NTP64(time), TimestampId::rand());
@@ -29,8 +28,7 @@ fn test_value(payload: Vec<u8>, time: u64) -> StoredValue {
 
 #[test]
 fn test_basic_put_get_delete() {
-    let (backend, _temp) = create_test_storage();
-    let storage = backend.get_storage("test_storage").unwrap();
+    let (storage, _temp) = create_test_storage();
 
     // Put a value
     let value = test_value(b"test_value".to_vec(), 12345);
@@ -57,8 +55,7 @@ fn test_basic_put_get_delete() {
 
 #[test]
 fn test_put_overwrite() {
-    let (backend, _temp) = create_test_storage();
-    let storage = backend.get_storage("test_storage").unwrap();
+    let (storage, _temp) = create_test_storage();
 
     // Put initial value
     let value1 = test_value(b"value1".to_vec(), 100);
@@ -76,8 +73,7 @@ fn test_put_overwrite() {
 
 #[test]
 fn test_delete_nonexistent() {
-    let (backend, _temp) = create_test_storage();
-    let storage = backend.get_storage("test_storage").unwrap();
+    let (storage, _temp) = create_test_storage();
 
     // Delete non-existent key should return false
     storage
@@ -88,8 +84,7 @@ fn test_delete_nonexistent() {
 
 #[test]
 fn test_get_nonexistent() {
-    let (backend, _temp) = create_test_storage();
-    let storage = backend.get_storage("test_storage").unwrap();
+    let (storage, _temp) = create_test_storage();
 
     // Get non-existent key should return None
     let result = storage.get("nonexistent").unwrap();
@@ -98,8 +93,7 @@ fn test_get_nonexistent() {
 
 #[test]
 fn test_multiple_keys() {
-    let (backend, _temp) = create_test_storage();
-    let storage = backend.get_storage("test_storage").unwrap();
+    let (storage, _temp) = create_test_storage();
 
     // Put multiple keys
     for i in 0..100 {
@@ -125,8 +119,7 @@ fn test_multiple_keys() {
 
 #[test]
 fn test_get_all() {
-    let (backend, _temp) = create_test_storage();
-    let storage = backend.get_storage("test_storage").unwrap();
+    let (storage, _temp) = create_test_storage();
 
     // Put some data
     for i in 0..10 {
@@ -149,8 +142,7 @@ fn test_get_all() {
 
 #[test]
 fn test_get_by_prefix() {
-    let (backend, _temp) = create_test_storage();
-    let storage = backend.get_storage("test_storage").unwrap();
+    let (storage, _temp) = create_test_storage();
 
     // Put data with different prefixes
     storage
@@ -179,8 +171,7 @@ fn test_get_by_prefix() {
 
 #[test]
 fn test_get_by_prefix_no_matches() {
-    let (backend, _temp) = create_test_storage();
-    let storage = backend.get_storage("test_storage").unwrap();
+    let (storage, _temp) = create_test_storage();
 
     storage
         .put("key1", test_value(b"value1".to_vec(), 1))
@@ -192,8 +183,7 @@ fn test_get_by_prefix_no_matches() {
 
 #[test]
 fn test_wildcard_single_segment() {
-    let (backend, _temp) = create_test_storage();
-    let storage = backend.get_storage("test_storage").unwrap();
+    let (storage, _temp) = create_test_storage();
 
     // Put data
     storage.put("a/b/c", test_value(b"1".to_vec(), 1)).unwrap();
@@ -214,8 +204,7 @@ fn test_wildcard_single_segment() {
 
 #[test]
 fn test_wildcard_multi_segment() {
-    let (backend, _temp) = create_test_storage();
-    let storage = backend.get_storage("test_storage").unwrap();
+    let (storage, _temp) = create_test_storage();
 
     // Put data
     storage.put("a/c", test_value(b"1".to_vec(), 1)).unwrap();
@@ -242,8 +231,7 @@ fn test_wildcard_multi_segment() {
 
 #[test]
 fn test_wildcard_complex_patterns() {
-    let (backend, _temp) = create_test_storage();
-    let storage = backend.get_storage("test_storage").unwrap();
+    let (storage, _temp) = create_test_storage();
 
     // Put sensor data
     let sensors = [
@@ -282,8 +270,7 @@ fn test_wildcard_complex_patterns() {
 
 #[test]
 fn test_clear_storage() {
-    let (backend, _temp) = create_test_storage();
-    let storage = backend.get_storage("test_storage").unwrap();
+    let (storage, _temp) = create_test_storage();
 
     // Put some data
     for i in 0..50 {
@@ -305,8 +292,7 @@ fn test_clear_storage() {
 
 #[test]
 fn test_large_payloads() {
-    let (backend, _temp) = create_test_storage();
-    let storage = backend.get_storage("test_storage").unwrap();
+    let (storage, _temp) = create_test_storage();
 
     // Create a large payload (1 MB)
     let large_data = vec![0u8; 1024 * 1024];
@@ -323,8 +309,7 @@ fn test_large_payloads() {
 
 #[test]
 fn test_special_characters_in_keys() {
-    let (backend, _temp) = create_test_storage();
-    let storage = backend.get_storage("test_storage").unwrap();
+    let (storage, _temp) = create_test_storage();
 
     let special_keys = vec![
         "key with spaces",
@@ -355,8 +340,7 @@ fn test_special_characters_in_keys() {
 
 #[test]
 fn test_empty_payload() {
-    let (backend, _temp) = create_test_storage();
-    let storage = backend.get_storage("test_storage").unwrap();
+    let (storage, _temp) = create_test_storage();
 
     // Store empty payload
     let value = test_value(vec![], 1);
@@ -369,8 +353,7 @@ fn test_empty_payload() {
 
 #[test]
 fn test_different_encodings() {
-    let (backend, _temp) = create_test_storage();
-    let storage = backend.get_storage("test_storage").unwrap();
+    let (storage, _temp) = create_test_storage();
 
     let encodings = [
         "text/plain",
@@ -400,8 +383,7 @@ fn test_different_encodings() {
 
 #[test]
 fn test_timestamp_preservation() {
-    let (backend, _temp) = create_test_storage();
-    let storage = backend.get_storage("test_storage").unwrap();
+    let (storage, _temp) = create_test_storage();
 
     let timestamps = [0, 1, 1000, 1234567890, u64::MAX - 1, u64::MAX];
 
@@ -426,17 +408,7 @@ fn test_data_persistence() {
 
     // Create storage, add data, and close
     {
-        let config = RedbBackendConfig::new()
-            .with_base_dir(temp_dir.path().to_path_buf())
-            .with_create_dir(true);
-
-        let backend = RedbBackend::new(config).unwrap();
-
-        let storage_config = RedbStorageConfig::new().with_db_path(db_path.clone());
-
-        let storage = backend
-            .create_storage("persistent".to_string(), Some(storage_config))
-            .unwrap();
+        let storage = RedbStorage::open(&db_path, RedbStorageConfig::new(), "persistent").unwrap();
 
         // Add some data
         for i in 0..10 {
@@ -447,21 +419,11 @@ fn test_data_persistence() {
 
         assert_eq!(storage.count().unwrap(), 10);
     }
-    // Backend and storage dropped here
+    // Storage dropped here, which closes the database
 
     // Reopen the database
     {
-        let config = RedbBackendConfig::new()
-            .with_base_dir(temp_dir.path().to_path_buf())
-            .with_create_dir(true);
-
-        let backend = RedbBackend::new(config).unwrap();
-
-        let storage_config = RedbStorageConfig::new().with_db_path(db_path);
-
-        let storage = backend
-            .create_storage("persistent".to_string(), Some(storage_config))
-            .unwrap();
+        let storage = RedbStorage::open(&db_path, RedbStorageConfig::new(), "persistent").unwrap();
 
         // Data should still be there
         assert_eq!(storage.count().unwrap(), 10);
@@ -484,8 +446,7 @@ fn test_concurrent_reads() {
     use std::sync::Arc;
     use std::thread;
 
-    let (backend, _temp) = create_test_storage();
-    let storage = backend.get_storage("test_storage").unwrap();
+    let (storage, _temp) = create_test_storage();
     let storage = Arc::new(storage);
 
     // Populate with data
@@ -525,8 +486,7 @@ fn test_concurrent_writes() {
     use std::sync::Arc;
     use std::thread;
 
-    let (backend, _temp) = create_test_storage();
-    let storage = backend.get_storage("test_storage").unwrap();
+    let (storage, _temp) = create_test_storage();
     let storage = Arc::new(storage);
 
     // Spawn multiple writers
@@ -555,41 +515,9 @@ fn test_concurrent_writes() {
     assert_eq!(storage.count().unwrap(), 100);
 }
 
-/// The backend stores the key it is given. Prefix stripping is the storage
-/// manager's job, done before the backend is called; `RedbStorageConfig`'s
-/// `strip_prefix` is not read, and this pins that setting it changes nothing.
-#[test]
-#[allow(deprecated)]
-fn test_strip_prefix_in_the_backend_config_is_inert() {
-    let temp_dir = TempDir::new().unwrap();
-    let config = RedbBackendConfig::new()
-        .with_base_dir(temp_dir.path().to_path_buf())
-        .with_create_dir(true);
-
-    let backend = RedbBackend::new(config).unwrap();
-
-    let storage_config = RedbStorageConfig::new()
-        .with_key_expr("demo/app/".to_string())
-        .with_strip_prefix(true);
-
-    let storage = backend
-        .create_storage("prefix_test".to_string(), Some(storage_config))
-        .unwrap();
-
-    // Store with full key
-    let value = test_value(b"test".to_vec(), 1);
-    storage.put("demo/app/sensor/temp", value).unwrap();
-
-    // Stored, and found, under the full key: nothing was stripped.
-    let retrieved = storage.get("demo/app/sensor/temp").unwrap();
-    assert!(retrieved.is_some());
-    assert!(storage.get("sensor/temp").unwrap().is_none());
-}
-
 #[test]
 fn test_batch_operations() {
-    let (backend, _temp) = create_test_storage();
-    let storage = backend.get_storage("test_storage").unwrap();
+    let (storage, _temp) = create_test_storage();
 
     // Batch insert
     let batch_size = 1000;

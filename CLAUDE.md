@@ -83,9 +83,8 @@ just deny
 | File | Purpose |
 |------|---------|
 | `lib.rs` | Crate entry point, re-exports public types |
-| `backend.rs` | RedbBackend - manages multiple storage instances |
-| `storage.rs` | RedbStorage - CRUD operations, wildcard matching |
-| `config.rs` | RedbBackendConfig, RedbStorageConfig |
+| `storage.rs` | RedbStorage - the engine: one redb file, latest values, history, retention |
+| `config.rs` | RedbStorageConfig, HistoryMode, RetentionPolicy |
 | `error.rs` | Error types (RedbBackendError, Result) |
 | `plugin.rs` | Zenoh plugin integration (RedbBackendPlugin, RedbVolume) |
 

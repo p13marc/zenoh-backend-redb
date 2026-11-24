@@ -3,16 +3,13 @@ use std::hint::black_box;
 use tempfile::TempDir;
 use zenoh::bytes::Encoding;
 use zenoh::time::{NTP64, Timestamp, TimestampId};
-use zenoh_backend_redb::{RedbBackend, RedbBackendConfig, RedbStorageConfig, StoredValue};
+use zenoh_backend_redb::{RedbStorage, RedbStorageConfig, StoredValue};
 
-/// Helper to create a temporary backend for benchmarks
-fn create_test_backend() -> (RedbBackend, TempDir) {
+/// A storage in a fresh temporary directory.
+fn create_storage(config: RedbStorageConfig) -> (RedbStorage, TempDir) {
     let temp_dir = TempDir::new().unwrap();
-    let config = RedbBackendConfig::new()
-        .with_base_dir(temp_dir.path().to_path_buf())
-        .with_create_dir(true);
-    let backend = RedbBackend::new(config).unwrap();
-    (backend, temp_dir)
+    let storage = RedbStorage::open(temp_dir.path().join("bench.redb"), config, "bench").unwrap();
+    (storage, temp_dir)
 }
 
 /// Helper to create a stored value with a given size
@@ -32,10 +29,7 @@ fn bench_put_operations(c: &mut Criterion) {
     for size in [100, 1_000, 10_000, 100_000, 1_000_000].iter() {
         group.throughput(Throughput::Bytes(*size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
-            let (backend, _temp_dir) = create_test_backend();
-            let storage = backend
-                .create_storage("bench_storage".to_string(), None)
-                .unwrap();
+            let (storage, _temp_dir) = create_storage(RedbStorageConfig::new());
             let mut counter = 0u64;
 
             b.iter(|| {
@@ -56,10 +50,7 @@ fn bench_get_operations(c: &mut Criterion) {
     for size in [100, 1_000, 10_000, 100_000, 1_000_000].iter() {
         group.throughput(Throughput::Bytes(*size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
-            let (backend, _temp_dir) = create_test_backend();
-            let storage = backend
-                .create_storage("bench_storage".to_string(), None)
-                .unwrap();
+            let (storage, _temp_dir) = create_storage(RedbStorageConfig::new());
 
             // Pre-populate with data
             for i in 0..100 {
@@ -81,10 +72,7 @@ fn bench_get_operations(c: &mut Criterion) {
 
 /// Benchmark DELETE operations
 fn bench_delete_operations(c: &mut Criterion) {
-    let (backend, _temp_dir) = create_test_backend();
-    let storage = backend
-        .create_storage("bench_storage".to_string(), None)
-        .unwrap();
+    let (storage, _temp_dir) = create_storage(RedbStorageConfig::new());
 
     c.bench_function("delete_single", |b| {
         b.iter_batched(
@@ -118,10 +106,7 @@ fn bench_batch_put(c: &mut Criterion) {
             BenchmarkId::from_parameter(batch_size),
             batch_size,
             |b, &batch_size| {
-                let (backend, _temp_dir) = create_test_backend();
-                let storage = backend
-                    .create_storage("bench_storage".to_string(), None)
-                    .unwrap();
+                let (storage, _temp_dir) = create_storage(RedbStorageConfig::new());
 
                 b.iter(|| {
                     for i in 0..batch_size {
@@ -146,10 +131,7 @@ fn bench_prefix_queries(c: &mut Criterion) {
             BenchmarkId::from_parameter(num_results),
             num_results,
             |b, &num_results| {
-                let (backend, _temp_dir) = create_test_backend();
-                let storage = backend
-                    .create_storage("bench_storage".to_string(), None)
-                    .unwrap();
+                let (storage, _temp_dir) = create_storage(RedbStorageConfig::new());
 
                 // Pre-populate with data
                 for i in 0..num_results {
@@ -184,10 +166,7 @@ fn bench_wildcard_single_segment(c: &mut Criterion) {
             BenchmarkId::from_parameter(num_results),
             num_results,
             |b, &num_results| {
-                let (backend, _temp_dir) = create_test_backend();
-                let storage = backend
-                    .create_storage("bench_storage".to_string(), None)
-                    .unwrap();
+                let (storage, _temp_dir) = create_storage(RedbStorageConfig::new());
 
                 // Pre-populate with matching data
                 for i in 0..num_results {
@@ -215,10 +194,7 @@ fn bench_wildcard_multi_segment(c: &mut Criterion) {
             BenchmarkId::from_parameter(num_results),
             num_results,
             |b, &num_results| {
-                let (backend, _temp_dir) = create_test_backend();
-                let storage = backend
-                    .create_storage("bench_storage".to_string(), None)
-                    .unwrap();
+                let (storage, _temp_dir) = create_storage(RedbStorageConfig::new());
 
                 // Pre-populate with matching data at various depths
                 for i in 0..num_results {
@@ -251,10 +227,7 @@ fn bench_get_all(c: &mut Criterion) {
             BenchmarkId::from_parameter(total_entries),
             total_entries,
             |b, &total_entries| {
-                let (backend, _temp_dir) = create_test_backend();
-                let storage = backend
-                    .create_storage("bench_storage".to_string(), None)
-                    .unwrap();
+                let (storage, _temp_dir) = create_storage(RedbStorageConfig::new());
 
                 // Pre-populate with data
                 for i in 0..total_entries {
@@ -281,12 +254,8 @@ fn bench_concurrent_reads(c: &mut Criterion) {
         b.iter_batched(
             || {
                 // Setup: create storage and populate
-                let (backend, temp_dir) = create_test_backend();
-                let storage = Arc::new(
-                    backend
-                        .create_storage("bench_storage".to_string(), None)
-                        .unwrap(),
-                );
+                let (storage, temp_dir) = create_storage(RedbStorageConfig::new());
+                let storage = Arc::new(storage);
 
                 // Pre-populate with data
                 for i in 0..1000 {
@@ -336,10 +305,7 @@ fn bench_wildcard_scan_100k(c: &mut Criterion) {
     // A 100k-key store takes a while to build; don't rebuild it per sample.
     group.sample_size(10);
 
-    let (backend, _temp_dir) = create_test_backend();
-    let storage = backend
-        .create_storage("bench_storage".to_string(), None)
-        .unwrap();
+    let (storage, _temp_dir) = create_storage(RedbStorageConfig::new());
 
     // 500 hosts x 200 metrics = 100k keys.
     let mut counter = 0u64;
@@ -391,11 +357,8 @@ fn bench_fsync_impact(c: &mut Criterion) {
             "without_fsync"
         };
         group.bench_function(label, |b| {
-            let (backend, _temp_dir) = create_test_backend();
-            let config = RedbStorageConfig::new().with_fsync(*fsync_enabled);
-            let storage = backend
-                .create_storage("bench_storage".to_string(), Some(config))
-                .unwrap();
+            let (storage, _temp_dir) =
+                create_storage(RedbStorageConfig::new().with_fsync(*fsync_enabled));
 
             let mut counter = 0u64;
             b.iter(|| {

@@ -216,10 +216,6 @@ bench:
 bench-storage:
     cargo bench --bench storage_benchmarks
 
-# Run backend benchmarks only
-bench-backend:
-    cargo bench --bench backend_benchmarks
-
 # Run specific benchmark
 bench-one BENCH:
     cargo bench --bench {{BENCH}}
@@ -399,7 +395,6 @@ help:
     @echo "Benchmarks:"
     @echo "  bench          - Run all benchmarks"
     @echo "  bench-storage  - Run storage benchmarks only"
-    @echo "  bench-backend  - Run backend benchmarks only"
     @echo "  bench-quick    - Run quick benchmarks (faster)"
     @echo "  bench-baseline - Save benchmark baseline"
     @echo "  bench-compare  - Compare against baseline"

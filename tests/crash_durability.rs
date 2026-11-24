@@ -23,10 +23,9 @@ const CHILD_CASE: &str = "REDB_CRASH_CHILD_CASE";
 
 fn open(path: &Path, flush_interval_secs: u64) -> RedbStorage {
     let config = RedbStorageConfig::default()
-        .with_db_path(path.to_path_buf())
         .with_fsync(false)
         .with_flush_interval_secs(flush_interval_secs);
-    RedbStorage::new(path, config, "crash".to_string()).unwrap()
+    RedbStorage::open(path, config, "crash").unwrap()
 }
 
 fn put(storage: &RedbStorage, range: std::ops::Range<u64>) {

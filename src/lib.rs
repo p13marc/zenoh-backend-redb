@@ -16,29 +16,27 @@
 //!
 //! # Example
 //!
+//! The plugin is the usual way in, but the engine can be used directly:
+//!
 //! ```rust,no_run
-//! use zenoh_backend_redb::{RedbBackend, RedbBackendConfig, RedbStorageConfig};
+//! use zenoh::bytes::Encoding;
+//! use zenoh::time::{NTP64, Timestamp, TimestampId};
+//! use zenoh_backend_redb::{RedbStorage, RedbStorageConfig, StoredValue};
 //!
-//! // Create a backend with custom configuration
-//! let config = RedbBackendConfig::new()
-//!     .with_base_dir("./my_databases".into())
-//!     .with_create_dir(true);
+//! let config = RedbStorageConfig::new().with_cache_size(32 * 1024 * 1024);
+//! let storage = RedbStorage::open("./demo.redb", config, "demo").unwrap();
 //!
-//! let backend = RedbBackend::new(config).unwrap();
-//!
-//! // Create a storage instance
-//! let storage_config = RedbStorageConfig::new()
-//!     .with_cache_size(32 * 1024 * 1024)
-//!     .with_fsync(true);
-//!
-//! let storage = backend.create_storage(
-//!     "my_storage".to_string(),
-//!     Some(storage_config)
-//! ).unwrap();
+//! let timestamp = Timestamp::new(NTP64(1), TimestampId::rand());
+//! storage
+//!     .put(
+//!         "demo/key",
+//!         StoredValue::new(b"hello".to_vec(), timestamp, Encoding::ZENOH_BYTES),
+//!     )
+//!     .unwrap();
+//! assert!(storage.get("demo/key").unwrap().is_some());
 //! ```
 
 // Module declarations
-pub mod backend;
 pub mod config;
 pub mod error;
 pub mod storage;
@@ -47,10 +45,11 @@ pub mod storage;
 pub mod plugin;
 
 // Re-export main types for convenience
-pub use backend::RedbBackend;
-pub use config::{RedbBackendConfig, RedbStorageConfig};
+pub use config::{DecimationPolicy, HistoryMode, RedbStorageConfig, RetentionPolicy};
 pub use error::{RedbBackendError, Result};
-pub use storage::{RedbStorage, StoredValue};
+pub use storage::{
+    RedbStorage, RetentionPass, StorageStats, StorageUsage, StoredValue, WriteOutcome,
+};
 
 #[cfg(feature = "plugin")]
 pub use plugin::{DEFAULT_ROOT_DIR, RedbBackendPlugin, RedbVolume, SCOPE_ENV_VAR};
@@ -70,17 +69,13 @@ mod tests {
 
     #[test]
     fn test_basic_workflow() {
-        // Create a temporary directory for the test
         let temp_dir = TempDir::new().unwrap();
-
-        // Create backend
-        let config = RedbBackendConfig::new().with_base_dir(temp_dir.path().to_path_buf());
-        let backend = RedbBackend::new(config).unwrap();
-
-        // Create storage
-        let storage = backend
-            .create_storage("test_storage".to_string(), None)
-            .unwrap();
+        let storage = RedbStorage::open(
+            temp_dir.path().join("test.redb"),
+            RedbStorageConfig::new(),
+            "test",
+        )
+        .unwrap();
 
         // Store a value
         let timestamp = Timestamp::new(NTP64(12345), TimestampId::rand());

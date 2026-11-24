@@ -34,10 +34,6 @@ pub enum RedbBackendError {
     #[error("Compaction error: {0}")]
     CompactionError(Box<redb::CompactionError>),
 
-    /// Configuration error.
-    #[error("Configuration error: {0}")]
-    ConfigError(String),
-
     /// Serialization/deserialization error.
     #[error("Serialization error: {0}")]
     SerializationError(String),
@@ -46,25 +42,9 @@ pub enum RedbBackendError {
     #[error("Key encoding error: {0}")]
     KeyEncodingError(String),
 
-    /// Value encoding error.
-    #[error("Value encoding error: {0}")]
-    ValueEncodingError(String),
-
-    /// Invalid key expression.
-    #[error("Invalid key expression: {0}")]
-    InvalidKeyExpression(String),
-
-    /// Storage not found.
-    #[error("Storage not found: {0}")]
-    StorageNotFound(String),
-
     /// I/O error.
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
-
-    /// Zenoh error.
-    #[error("Zenoh error: {0}")]
-    ZenohError(String),
 
     /// Generic error with custom message.
     #[error("{0}")]
@@ -72,11 +52,6 @@ pub enum RedbBackendError {
 }
 
 impl RedbBackendError {
-    /// Create a configuration error.
-    pub fn config<S: Into<String>>(msg: S) -> Self {
-        RedbBackendError::ConfigError(msg.into())
-    }
-
     /// Create a serialization error.
     pub fn serialization<S: Into<String>>(msg: S) -> Self {
         RedbBackendError::SerializationError(msg.into())
@@ -87,43 +62,9 @@ impl RedbBackendError {
         RedbBackendError::KeyEncodingError(msg.into())
     }
 
-    /// Create a value encoding error.
-    pub fn value_encoding<S: Into<String>>(msg: S) -> Self {
-        RedbBackendError::ValueEncodingError(msg.into())
-    }
-
-    /// Create an invalid key expression error.
-    pub fn invalid_key<S: Into<String>>(msg: S) -> Self {
-        RedbBackendError::InvalidKeyExpression(msg.into())
-    }
-
-    /// Create a storage not found error.
-    pub fn storage_not_found<S: Into<String>>(name: S) -> Self {
-        RedbBackendError::StorageNotFound(name.into())
-    }
-
-    /// Create a Zenoh error.
-    pub fn zenoh<S: Into<String>>(msg: S) -> Self {
-        RedbBackendError::ZenohError(msg.into())
-    }
-
     /// Create a generic error.
     pub fn other<S: Into<String>>(msg: S) -> Self {
         RedbBackendError::Other(msg.into())
-    }
-}
-
-// Convert from serde_json errors
-impl From<serde_json::Error> for RedbBackendError {
-    fn from(err: serde_json::Error) -> Self {
-        RedbBackendError::SerializationError(err.to_string())
-    }
-}
-
-// Convert from zenoh errors
-impl From<zenoh::Error> for RedbBackendError {
-    fn from(err: zenoh::Error) -> Self {
-        RedbBackendError::ZenohError(err.to_string())
     }
 }
 

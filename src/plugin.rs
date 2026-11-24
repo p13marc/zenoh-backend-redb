@@ -3,8 +3,7 @@
 //! This module provides the integration between the redb storage backend and
 //! Zenoh's plugin system, implementing the required traits for Volume and Storage.
 
-use crate::backend::RedbBackend;
-use crate::config::{HistoryMode, RedbBackendConfig, RedbStorageConfig, RetentionPolicy};
+use crate::config::{HistoryMode, RedbStorageConfig, RetentionPolicy};
 
 use crate::storage::{RedbStorage, RetentionPass, StorageUsage, StoredValue, WriteOutcome};
 use async_trait::async_trait;
@@ -329,14 +328,14 @@ impl Plugin for RedbBackendPlugin {
             dir
         };
 
-        // Create backend configuration
-        let backend_config = RedbBackendConfig::new()
-            .with_base_dir(root.clone())
-            .with_create_dir(true);
-
-        // Create backend
-        let backend = RedbBackend::new(backend_config)
-            .map_err(|e| zerror!("Failed to create redb backend: {}", e))?;
+        std::fs::create_dir_all(&root).map_err(|e| {
+            zerror!(
+                "Volume '{}': cannot create the storage root {:?}: {}",
+                name,
+                root,
+                e
+            )
+        })?;
 
         // Prepare admin status
         let mut properties = HashMap::new();
@@ -351,7 +350,7 @@ impl Plugin for RedbBackendPlugin {
 
         Ok(Box::new(RedbVolume {
             admin_status,
-            backend: Arc::new(backend),
+            root,
             history,
         }))
     }
@@ -360,7 +359,8 @@ impl Plugin for RedbBackendPlugin {
 /// Volume implementation for redb backend.
 pub struct RedbVolume {
     admin_status: serde_json::Value,
-    backend: Arc<RedbBackend>,
+    /// The directory every storage of this volume keeps its database in.
+    root: PathBuf,
     /// The history mode every storage on this volume inherits.
     history: HistoryMode,
 }
@@ -472,11 +472,11 @@ impl Volume for RedbVolume {
         // Determine database path
         let db_path = if let Some(serde_json::Value::String(dir)) = volume_cfg.get(PROP_STORAGE_DIR)
         {
-            db_path_for_dir(&self.backend.config().base_dir, dir, &config.name)
+            db_path_for_dir(&self.root, dir, &config.name)
         } else if let Some(serde_json::Value::String(filename)) =
             volume_cfg.get(PROP_STORAGE_DB_FILE)
         {
-            let mut path = self.backend.config().base_dir.clone();
+            let mut path = self.root.clone();
             path.push(filename);
             if path.extension().is_none() {
                 path.set_extension("redb");
@@ -492,7 +492,6 @@ impl Volume for RedbVolume {
 
         // Create storage configuration
         let mut storage_config = RedbStorageConfig::new()
-            .with_db_path(db_path.clone())
             .with_create_db(create_db)
             .with_read_only(read_only)
             .with_fsync(fsync);
@@ -570,14 +569,8 @@ impl Volume for RedbVolume {
             storage_config = storage_config.with_retention(policy);
         }
 
-        // Get storage name from config
-        let storage_name = config.name.clone();
-
-        // Create the storage directly (not using backend.create_storage to avoid double management)
-        let redb_storage = RedbStorage::new(&db_path, storage_config.clone(), storage_name.clone())
-            .map_err(|e| zerror!("Failed to create redb storage: {}", e))?;
-
-        info!("Created redb storage '{}' at {:?}", storage_name, db_path);
+        let redb_storage = RedbStorage::open(&db_path, storage_config.clone(), &config.name)
+            .map_err(|e| zerror!("Failed to open redb storage '{}': {}", config.name, e))?;
 
         Ok(Box::new(RedbStoragePlugin::new(
             config,
@@ -795,12 +788,10 @@ impl Storage for RedbStoragePlugin {
             obj.insert("capability".to_string(), capability);
             obj.insert("retention".to_string(), retention);
             obj.insert("stats".to_string(), stats);
-            if let Some(path) = &self.storage_config.db_path {
-                obj.insert(
-                    "db_path".to_string(),
-                    json!(path.to_string_lossy().to_string()),
-                );
-            }
+            obj.insert(
+                "db_path".to_string(),
+                json!(self.storage.path().to_string_lossy()),
+            );
         }
 
         status.into()
@@ -1042,26 +1033,14 @@ mod tests {
 
     #[test]
     fn test_redb_volume_structure() {
-        // Test that RedbVolume can be constructed
-        let backend_config = RedbBackendConfig::new();
-        let backend = RedbBackend::new(backend_config).unwrap();
+        let dir = TempDir::new().unwrap();
 
-        let properties: HashMap<String, String> = HashMap::new();
-        let admin_status: serde_json::Value = properties
-            .into_iter()
-            .map(|(k, v)| (k, serde_json::Value::String(v)))
-            .collect();
-
-        let volume = RedbVolume {
-            history: HistoryMode::Latest,
-            admin_status,
-            backend: Arc::new(backend),
-        };
-
-        // Verify capability
-        let cap = volume.get_capability();
+        let cap = test_volume(&dir, HistoryMode::Latest).get_capability();
         assert_eq!(cap.persistence, Persistence::Durable);
         assert_eq!(cap.history, History::Latest);
+
+        let cap = test_volume(&dir, HistoryMode::All).get_capability();
+        assert_eq!(cap.history, History::All);
     }
 
     #[tokio::test]
@@ -1070,12 +1049,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.redb");
 
-        let storage_config = RedbStorageConfig::new()
-            .with_db_path(db_path.clone())
-            .with_create_db(true);
+        let storage_config = RedbStorageConfig::new().with_create_db(true);
 
         let redb_storage =
-            RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
+            RedbStorage::open(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
         let storage_plugin = RedbStoragePlugin::new(
             test_storage_config("test"),
@@ -1092,12 +1069,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.redb");
 
-        let storage_config = RedbStorageConfig::new()
-            .with_db_path(db_path.clone())
-            .with_create_db(true);
+        let storage_config = RedbStorageConfig::new().with_create_db(true);
 
         let redb_storage =
-            RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
+            RedbStorage::open(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
         let storage_plugin = RedbStoragePlugin::new(
             test_storage_config("test_storage"),
@@ -1117,12 +1092,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.redb");
 
-        let storage_config = RedbStorageConfig::new()
-            .with_db_path(db_path.clone())
-            .with_create_db(true);
+        let storage_config = RedbStorageConfig::new().with_create_db(true);
 
         let redb_storage =
-            RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
+            RedbStorage::open(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
         let mut storage_plugin = RedbStoragePlugin::new(
             test_storage_config("test"),
@@ -1164,14 +1137,21 @@ mod tests {
         }
     }
 
-    fn storage_config_for(volume_cfg: serde_json::Value, dir: &TempDir) -> StorageConfig {
-        let mut cfg = volume_cfg;
-        cfg["db_file"] = json!(dir.path().join("s.redb").to_string_lossy().to_string());
+    /// A volume rooted in `dir`, as `RedbBackendPlugin::start` would build it.
+    fn test_volume(dir: &TempDir, history: HistoryMode) -> RedbVolume {
+        RedbVolume {
+            history,
+            admin_status: serde_json::Value::Object(Default::default()),
+            root: dir.path().to_path_buf(),
+        }
+    }
+
+    fn storage_config_for(volume_cfg: serde_json::Value, _dir: &TempDir) -> StorageConfig {
         StorageConfig {
             name: "s".to_string(),
             key_expr: "test/**".parse().unwrap(),
             strip_prefix: None,
-            volume_cfg: cfg.into(),
+            volume_cfg: volume_cfg.into(),
             volume_id: "redb".to_string(),
             complete: false,
             garbage_collection_config: Default::default(),
@@ -1188,18 +1168,7 @@ mod tests {
     #[tokio::test]
     async fn test_all_mode_without_retention_refuses_to_start() {
         let dir = TempDir::new().unwrap();
-        let backend = RedbBackend::new(
-            RedbBackendConfig::new()
-                .with_base_dir(dir.path().to_path_buf())
-                .with_create_dir(true),
-        )
-        .unwrap();
-
-        let volume = RedbVolume {
-            history: HistoryMode::All,
-            admin_status: serde_json::Value::Object(Default::default()),
-            backend: Arc::new(backend),
-        };
+        let volume = test_volume(&dir, HistoryMode::All);
 
         let Err(err) = volume
             .create_storage(storage_config_for(json!({ "dir": "unbounded" }), &dir))
@@ -1230,18 +1199,7 @@ mod tests {
     #[tokio::test]
     async fn test_retention_on_a_latest_volume_is_rejected() {
         let dir = TempDir::new().unwrap();
-        let backend = RedbBackend::new(
-            RedbBackendConfig::new()
-                .with_base_dir(dir.path().to_path_buf())
-                .with_create_dir(true),
-        )
-        .unwrap();
-
-        let volume = RedbVolume {
-            history: HistoryMode::Latest,
-            admin_status: serde_json::Value::Object(Default::default()),
-            backend: Arc::new(backend),
-        };
+        let volume = test_volume(&dir, HistoryMode::Latest);
 
         let Err(err) = volume
             .create_storage(storage_config_for(
@@ -1282,17 +1240,7 @@ mod tests {
     #[tokio::test]
     async fn test_a_retention_policy_with_a_typo_or_a_zero_is_rejected() {
         let dir = TempDir::new().unwrap();
-        let backend = RedbBackend::new(
-            RedbBackendConfig::new()
-                .with_base_dir(dir.path().to_path_buf())
-                .with_create_dir(true),
-        )
-        .unwrap();
-        let volume = RedbVolume {
-            history: HistoryMode::All,
-            admin_status: serde_json::Value::Object(Default::default()),
-            backend: Arc::new(backend),
-        };
+        let volume = test_volume(&dir, HistoryMode::All);
 
         for (retention, names) in [
             (json!({ "max_age_secs": 60, "max_byte": 1000 }), "max_byte"),
@@ -1363,17 +1311,7 @@ mod tests {
     #[tokio::test]
     async fn test_two_dotted_dirs_do_not_collide() {
         let dir = TempDir::new().unwrap();
-        let backend = RedbBackend::new(
-            RedbBackendConfig::new()
-                .with_base_dir(dir.path().to_path_buf())
-                .with_create_dir(true),
-        )
-        .unwrap();
-        let volume = RedbVolume {
-            history: HistoryMode::Latest,
-            admin_status: serde_json::Value::Object(Default::default()),
-            backend: Arc::new(backend),
-        };
+        let volume = test_volume(&dir, HistoryMode::Latest);
         let cfg = |name: &str| StorageConfig {
             name: name.to_string(),
             key_expr: "test/**".parse().unwrap(),
@@ -1413,18 +1351,7 @@ mod tests {
     #[tokio::test]
     async fn test_latest_mode_needs_no_retention() {
         let dir = TempDir::new().unwrap();
-        let backend = RedbBackend::new(
-            RedbBackendConfig::new()
-                .with_base_dir(dir.path().to_path_buf())
-                .with_create_dir(true),
-        )
-        .unwrap();
-
-        let volume = RedbVolume {
-            history: HistoryMode::Latest,
-            admin_status: serde_json::Value::Object(Default::default()),
-            backend: Arc::new(backend),
-        };
+        let volume = test_volume(&dir, HistoryMode::Latest);
 
         volume
             .create_storage(storage_config_for(json!({ "dir": "plain" }), &dir))
@@ -1437,18 +1364,7 @@ mod tests {
     #[tokio::test]
     async fn test_empty_retention_policy_is_rejected() {
         let dir = TempDir::new().unwrap();
-        let backend = RedbBackend::new(
-            RedbBackendConfig::new()
-                .with_base_dir(dir.path().to_path_buf())
-                .with_create_dir(true),
-        )
-        .unwrap();
-
-        let volume = RedbVolume {
-            history: HistoryMode::All,
-            admin_status: serde_json::Value::Object(Default::default()),
-            backend: Arc::new(backend),
-        };
+        let volume = test_volume(&dir, HistoryMode::All);
 
         let Err(err) = volume
             .create_storage(storage_config_for(
@@ -1471,12 +1387,11 @@ mod tests {
         let db_path = temp_dir.path().join("history.redb");
 
         let storage_config = RedbStorageConfig::new()
-            .with_db_path(db_path.clone())
             .with_create_db(true)
             .with_history(HistoryMode::All);
 
         let redb_storage =
-            RedbStorage::new(&db_path, storage_config.clone(), "history".to_string()).unwrap();
+            RedbStorage::open(&db_path, storage_config.clone(), "history".to_string()).unwrap();
 
         let mut plugin = RedbStoragePlugin::new(
             test_storage_config("history"),
@@ -1552,12 +1467,11 @@ mod tests {
         let db_path = temp_dir.path().join("test.redb");
 
         let storage_config = RedbStorageConfig::new()
-            .with_db_path(db_path.clone())
             .with_create_db(true)
             .with_cache_size(8 * 1024 * 1024);
 
         let redb_storage =
-            RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
+            RedbStorage::open(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
         let mut storage_plugin = RedbStoragePlugin::new(
             test_storage_config("test"),
@@ -1614,9 +1528,9 @@ mod tests {
     async fn test_admin_status_of_a_large_storage_serves_a_snapshot() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("big.redb");
-        let storage_config = RedbStorageConfig::new().with_db_path(db_path.clone());
+        let storage_config = RedbStorageConfig::new();
         let redb_storage =
-            RedbStorage::new(&db_path, storage_config.clone(), "big".to_string()).unwrap();
+            RedbStorage::open(&db_path, storage_config.clone(), "big".to_string()).unwrap();
 
         let mut plugin = RedbStoragePlugin::new(
             test_storage_config("big"),
@@ -1673,7 +1587,6 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("forever.redb");
         let storage_config = RedbStorageConfig::new()
-            .with_db_path(db_path.clone())
             .with_history(HistoryMode::All)
             .with_fsync(false)
             .with_flush_interval_secs(u64::MAX)
@@ -1683,7 +1596,7 @@ mod tests {
                 ..Default::default()
             });
         let redb_storage =
-            RedbStorage::new(&db_path, storage_config.clone(), "forever".to_string()).unwrap();
+            RedbStorage::open(&db_path, storage_config.clone(), "forever".to_string()).unwrap();
 
         let mut plugin = RedbStoragePlugin::new(
             test_storage_config("forever"),
@@ -1720,11 +1633,10 @@ mod tests {
         // thread, which takes its timer from the config handed to the plugin, can
         // be what flushes it.
         let storage_config = RedbStorageConfig::new()
-            .with_db_path(db_path.clone())
             .with_fsync(false)
             .with_flush_interval_secs(3600);
         let storage = Arc::new(
-            RedbStorage::new(&db_path, storage_config.clone(), "lazy".to_string()).unwrap(),
+            RedbStorage::open(&db_path, storage_config.clone(), "lazy".to_string()).unwrap(),
         );
 
         let mut plugin = RedbStoragePlugin::new(
@@ -1760,17 +1672,7 @@ mod tests {
     #[tokio::test]
     async fn test_flush_interval_must_be_a_number() {
         let dir = TempDir::new().unwrap();
-        let backend = RedbBackend::new(
-            RedbBackendConfig::new()
-                .with_base_dir(dir.path().to_path_buf())
-                .with_create_dir(true),
-        )
-        .unwrap();
-        let volume = RedbVolume {
-            history: HistoryMode::Latest,
-            admin_status: serde_json::Value::Object(Default::default()),
-            backend: Arc::new(backend),
-        };
+        let volume = test_volume(&dir, HistoryMode::Latest);
 
         for bad in [json!("5"), json!(-1), json!(1.5)] {
             let Err(err) = volume
@@ -1801,12 +1703,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.redb");
 
-        let storage_config = RedbStorageConfig::new()
-            .with_db_path(db_path.clone())
-            .with_create_db(true);
+        let storage_config = RedbStorageConfig::new().with_create_db(true);
 
         let redb_storage =
-            RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
+            RedbStorage::open(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
         let mut storage_plugin = RedbStoragePlugin::new(
             test_storage_config("test"),
@@ -1845,12 +1745,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.redb");
 
-        let storage_config = RedbStorageConfig::new()
-            .with_db_path(db_path.clone())
-            .with_create_db(true);
+        let storage_config = RedbStorageConfig::new().with_create_db(true);
 
         let redb_storage =
-            RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
+            RedbStorage::open(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
         let mut storage_plugin = RedbStoragePlugin::new(
             test_storage_config("test"),
@@ -1915,12 +1813,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.redb");
 
-        let storage_config = RedbStorageConfig::new()
-            .with_db_path(db_path.clone())
-            .with_create_db(true);
+        let storage_config = RedbStorageConfig::new().with_create_db(true);
 
         let redb_storage =
-            RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
+            RedbStorage::open(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
         let mut storage_plugin = RedbStoragePlugin::new(
             test_storage_config("test"),
@@ -1969,12 +1865,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.redb");
 
-        let storage_config = RedbStorageConfig::new()
-            .with_db_path(db_path.clone())
-            .with_create_db(true);
+        let storage_config = RedbStorageConfig::new().with_create_db(true);
 
         let redb_storage =
-            RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
+            RedbStorage::open(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
         let mut storage_plugin = RedbStoragePlugin::new(
             test_storage_config("test"),
@@ -2006,12 +1900,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.redb");
 
-        let storage_config = RedbStorageConfig::new()
-            .with_db_path(db_path.clone())
-            .with_create_db(true);
+        let storage_config = RedbStorageConfig::new().with_create_db(true);
 
         let redb_storage =
-            RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
+            RedbStorage::open(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
         let mut storage_plugin = RedbStoragePlugin::new(
             test_storage_config("test"),
@@ -2047,11 +1939,9 @@ mod tests {
         let db_path = temp_dir.path().join("test.redb");
 
         // First create with write access
-        let storage_config = RedbStorageConfig::new()
-            .with_db_path(db_path.clone())
-            .with_create_db(true);
+        let storage_config = RedbStorageConfig::new().with_create_db(true);
 
-        let redb_storage = RedbStorage::new(&db_path, storage_config, "test".to_string()).unwrap();
+        let redb_storage = RedbStorage::open(&db_path, storage_config, "test".to_string()).unwrap();
 
         let key = OwnedKeyExpr::new("test/key1").unwrap();
         let payload = ZBytes::from("test_value");
@@ -2070,11 +1960,11 @@ mod tests {
 
         // Now open as read-only
         let ro_config = RedbStorageConfig::new()
-            .with_db_path(db_path.clone())
             .with_create_db(false)
             .with_read_only(true);
 
-        let ro_storage = RedbStorage::new(&db_path, ro_config.clone(), "test".to_string()).unwrap();
+        let ro_storage =
+            RedbStorage::open(&db_path, ro_config.clone(), "test".to_string()).unwrap();
 
         let mut storage_plugin =
             RedbStoragePlugin::new(test_storage_config("test"), Arc::new(ro_storage), ro_config);
@@ -2093,11 +1983,9 @@ mod tests {
         let db_path = temp_dir.path().join("test.redb");
 
         // First create with write access
-        let storage_config = RedbStorageConfig::new()
-            .with_db_path(db_path.clone())
-            .with_create_db(true);
+        let storage_config = RedbStorageConfig::new().with_create_db(true);
 
-        let redb_storage = RedbStorage::new(&db_path, storage_config, "test".to_string()).unwrap();
+        let redb_storage = RedbStorage::open(&db_path, storage_config, "test".to_string()).unwrap();
 
         let key = OwnedKeyExpr::new("test/key1").unwrap();
         let payload = ZBytes::from("test_value");
@@ -2116,11 +2004,11 @@ mod tests {
 
         // Now open as read-only
         let ro_config = RedbStorageConfig::new()
-            .with_db_path(db_path.clone())
             .with_create_db(false)
             .with_read_only(true);
 
-        let ro_storage = RedbStorage::new(&db_path, ro_config.clone(), "test".to_string()).unwrap();
+        let ro_storage =
+            RedbStorage::open(&db_path, ro_config.clone(), "test".to_string()).unwrap();
 
         let mut storage_plugin =
             RedbStoragePlugin::new(test_storage_config("test"), Arc::new(ro_storage), ro_config);
@@ -2135,12 +2023,10 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.redb");
 
-        let storage_config = RedbStorageConfig::new()
-            .with_db_path(db_path.clone())
-            .with_create_db(true);
+        let storage_config = RedbStorageConfig::new().with_create_db(true);
 
         let redb_storage =
-            RedbStorage::new(&db_path, storage_config.clone(), "test".to_string()).unwrap();
+            RedbStorage::open(&db_path, storage_config.clone(), "test".to_string()).unwrap();
 
         let mut storage_plugin = RedbStoragePlugin::new(
             test_storage_config("test"),

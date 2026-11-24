@@ -10,7 +10,7 @@ use redb::{
     TableDefinition,
 };
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -524,6 +524,10 @@ pub struct RedbStorage {
     /// borrowed from the database — so concurrent readers do not contend.
     db: RwLock<Option<Database>>,
 
+    /// The database file. The one copy of the path: what was opened is what
+    /// `max_bytes` measures and what the statistics report.
+    path: PathBuf,
+
     /// Storage configuration
     config: RedbStorageConfig,
 
@@ -707,11 +711,19 @@ impl RedbStorage {
         Ok(true)
     }
 
-    /// Create a new RedbStorage instance.
-    pub fn new<P: AsRef<Path>>(path: P, config: RedbStorageConfig, name: String) -> Result<Self> {
-        info!("Creating redb storage at: {:?}", path.as_ref());
+    /// Open the database at `path`, creating it if the config allows.
+    ///
+    /// `name` is only used in log lines.
+    pub fn open(
+        path: impl AsRef<Path>,
+        config: RedbStorageConfig,
+        name: impl Into<String>,
+    ) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let name = name.into();
+        info!("Opening redb storage '{}' at {:?}", name, path);
 
-        let db = Self::open_database(path.as_ref(), &config)?;
+        let db = Self::open_database(&path, &config)?;
 
         // Initialize both tables
         // Durable whatever `fsync` says: this runs once, and it gives an
@@ -731,15 +743,19 @@ impl RedbStorage {
         }
         write_txn.commit()?;
 
-        info!("Redb storage created successfully");
-
         Ok(Self {
             db: RwLock::new(Some(db)),
+            path,
             config,
             name,
             last_durable: Mutex::new(Instant::now()),
             unflushed: AtomicBool::new(false),
         })
+    }
+
+    /// The database file this storage opened.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Get the storage name.
@@ -1163,11 +1179,7 @@ impl RedbStorage {
 
     /// Size of the database file, from the filesystem.
     fn on_disk_bytes(&self) -> Option<u64> {
-        self.config
-            .db_path
-            .as_ref()
-            .and_then(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len())
+        std::fs::metadata(&self.path).ok().map(|m| m.len())
     }
 
     /// Samples held in the history tables. O(1): redb keeps the count in the tree
@@ -1470,8 +1482,8 @@ impl RedbStorage {
             // Without a path we cannot measure, and guessing would be worse than
             // doing nothing.
             warn!(
-                "Storage '{}': max_bytes is configured but the database path is \
-                 unknown, so size cannot be enforced",
+                "Storage '{}': max_bytes is configured but the database file is \
+                 unreadable, so size cannot be enforced",
                 self.name
             );
             return Ok((0, false));
@@ -2070,7 +2082,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.redb");
         let config = RedbStorageConfig::default();
-        let storage = RedbStorage::new(db_path, config, "test".to_string()).unwrap();
+        let storage = RedbStorage::open(db_path, config, "test".to_string()).unwrap();
         (storage, temp_dir)
     }
 
@@ -2181,7 +2193,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("history.redb");
         let config = RedbStorageConfig::default().with_history(HistoryMode::All);
-        let storage = RedbStorage::new(db_path, config, "history".to_string()).unwrap();
+        let storage = RedbStorage::open(db_path, config, "history".to_string()).unwrap();
         (storage, temp_dir)
     }
 
@@ -2338,10 +2350,9 @@ mod tests {
     fn retained_storage(policy: RetentionPolicy, dir: &TempDir) -> RedbStorage {
         let db_path = dir.path().join("retained.redb");
         let config = RedbStorageConfig::default()
-            .with_db_path(db_path.clone())
             .with_history(HistoryMode::All)
             .with_retention(policy);
-        RedbStorage::new(db_path, config, "retained".to_string()).unwrap()
+        RedbStorage::open(db_path, config, "retained".to_string()).unwrap()
     }
 
     /// Fill `key` with one sample per `step` seconds, ending `now`, and return the
@@ -2529,13 +2540,12 @@ mod tests {
 
         let db_path = dir.path().join("sized.redb");
         let config = RedbStorageConfig::default()
-            .with_db_path(db_path.clone())
             .with_history(HistoryMode::All)
             .with_retention(RetentionPolicy {
                 max_bytes: Some(256 * 1024),
                 ..Default::default()
             });
-        let storage = RedbStorage::new(&db_path, config, "sized".to_string()).unwrap();
+        let storage = RedbStorage::open(&db_path, config, "sized".to_string()).unwrap();
 
         // Write comfortably past the limit: 400 samples of 4 KiB.
         let now = SystemTime::now()
@@ -2585,14 +2595,13 @@ mod tests {
 
         let db_path = dir.path().join("tiny.redb");
         let config = RedbStorageConfig::default()
-            .with_db_path(db_path.clone())
             .with_history(HistoryMode::All)
             // Far below any real redb file, which always carries page overhead.
             .with_retention(RetentionPolicy {
                 max_bytes: Some(1),
                 ..Default::default()
             });
-        let storage = RedbStorage::new(&db_path, config, "tiny".to_string()).unwrap();
+        let storage = RedbStorage::open(&db_path, config, "tiny".to_string()).unwrap();
 
         for i in 0..10u64 {
             storage
@@ -2617,11 +2626,10 @@ mod tests {
     /// not each wait for the disk.
     fn bulk_storage(policy: RetentionPolicy, path: &std::path::Path) -> RedbStorage {
         let config = RedbStorageConfig::default()
-            .with_db_path(path.to_path_buf())
             .with_history(HistoryMode::All)
             .with_fsync(false)
             .with_retention(policy);
-        RedbStorage::new(path, config, "bulk".to_string()).unwrap()
+        RedbStorage::open(path, config, "bulk".to_string()).unwrap()
     }
 
     fn now_secs() -> u64 {
@@ -3176,10 +3184,9 @@ mod tests {
         let open = |name: &str, fsync: bool, flush_interval_secs: u64| {
             let path = temp.path().join(name);
             let config = RedbStorageConfig::default()
-                .with_db_path(path.clone())
                 .with_fsync(fsync)
                 .with_flush_interval_secs(flush_interval_secs);
-            RedbStorage::new(path, config, name.to_string()).unwrap()
+            RedbStorage::open(path, config, name.to_string()).unwrap()
         };
         let put = |storage: &RedbStorage, n: u64| {
             storage
@@ -3346,19 +3353,15 @@ mod tests {
 
         for (config, expected) in [
             (
-                RedbStorageConfig::default()
-                    .with_db_path(path.clone())
-                    .with_read_only(true),
+                RedbStorageConfig::default().with_read_only(true),
                 "read_only",
             ),
             (
-                RedbStorageConfig::default()
-                    .with_db_path(path.clone())
-                    .with_create_db(false),
+                RedbStorageConfig::default().with_create_db(false),
                 "create_db",
             ),
         ] {
-            let Err(err) = RedbStorage::new(&path, config, "probe".to_string()) else {
+            let Err(err) = RedbStorage::open(&path, config, "probe".to_string()) else {
                 panic!("a missing database must not be created here");
             };
             let msg = err.to_string();

@@ -1,139 +1,94 @@
-//! Basic usage example for zenoh-backend-redb.
+//! Using the storage engine directly, without `zenohd`.
 //!
-//! This example demonstrates how to create a backend, create a storage,
-//! and perform basic CRUD operations.
+//! The plugin is the usual way in (see `config/zenoh-redb-example.json5`); this
+//! shows what it does underneath: one redb file per storage, a latest value per key,
+//! and, with `HistoryMode::All`, every sample kept and addressable by time.
+//!
+//! Run with: cargo run --example basic_usage
+
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use zenoh::bytes::Encoding;
 use zenoh::time::{NTP64, Timestamp, TimestampId};
-use zenoh_backend_redb::{RedbBackend, RedbBackendConfig, RedbStorageConfig, StoredValue};
+use zenoh_backend_redb::{
+    HistoryMode, RedbStorage, RedbStorageConfig, RetentionPolicy, StoredValue,
+};
+use zenoh_util::time_range::{TimeBound, TimeRange};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing for logging
-    tracing_subscriber::fmt::init();
+    let dir = tempfile::tempdir()?;
+    let id = TimestampId::rand();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    let at = |secs_ago: u64| Timestamp::new(NTP64::from(now - Duration::from_secs(secs_ago)), id);
 
-    println!("=== Zenoh Backend redb - Basic Usage Example ===\n");
-
-    // 1. Create a backend with custom configuration
-    println!("1. Creating backend...");
-    let config = RedbBackendConfig::new()
-        .with_base_dir("./example_databases".into())
-        .with_create_dir(true);
-
-    let backend = RedbBackend::new(config)?;
-    println!("   ✓ Backend created\n");
-
-    // 2. Create a storage instance
-    println!("2. Creating storage...");
-    let storage_config = RedbStorageConfig::new().with_fsync(true);
-
-    let storage = backend.create_storage("demo_storage".to_string(), Some(storage_config))?;
-    println!("   ✓ Storage 'demo_storage' created\n");
-
-    // 3. Store some key-value pairs
-    println!("3. Storing data...");
-    let entries = vec![
-        ("demo/sensor/temperature", "23.5", "application/json"),
-        ("demo/sensor/humidity", "65", "application/json"),
-        ("demo/sensor/pressure", "1013", "application/json"),
-        ("demo/device/status", "online", "text/plain"),
-        ("demo/device/name", "sensor-001", "text/plain"),
-    ];
-
-    for (key, value, encoding) in &entries {
-        let time_u64 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs();
-        let timestamp = Timestamp::new(NTP64(time_u64), TimestampId::rand());
-        let enc = match *encoding {
-            "application/json" => Encoding::APPLICATION_JSON,
-            "text/plain" => Encoding::TEXT_PLAIN,
-            _ => Encoding::ZENOH_BYTES,
-        };
-        let stored_value = StoredValue::new(value.as_bytes().to_vec(), timestamp, enc);
-        storage.put(key, stored_value)?;
-    }
-    println!();
-
-    // 4. Retrieve a specific value
-    println!("4. Retrieving specific value...");
-    let key = "demo/sensor/temperature";
-    if let Some(value) = storage.get(key)? {
-        let payload_str = String::from_utf8_lossy(&value.payload);
-        println!("   ✓ Retrieved '{}': {}", key, payload_str);
-        println!("     Timestamp: {}", value.timestamp);
-        println!("     Encoding: {}\n", value.encoding);
-    }
-
-    // 5. Retrieve all values
-    println!("5. Retrieving all values...");
-    let all_entries = storage.get_all()?;
-    println!("   ✓ Total entries: {}", all_entries.len());
-    for (key, value) in &all_entries {
-        let payload_str = String::from_utf8_lossy(&value.payload);
-        println!("     - {}: {}", key, payload_str);
-    }
-    println!();
-
-    // 6. Query by prefix
-    println!("6. Querying by prefix 'demo/sensor/'...");
-    let sensor_entries = storage.get_by_prefix("demo/sensor/")?;
-    println!("   ✓ Found {} sensor entries:", sensor_entries.len());
-    for (key, value) in &sensor_entries {
-        let payload_str = String::from_utf8_lossy(&value.payload);
-        println!("     - {}: {}", key, payload_str);
-    }
-    println!();
-
-    // 7. Query with wildcards
-    println!("7. Querying with wildcard 'demo/*/temperature'...");
-    let wildcard_entries = storage.get_by_wildcard("demo/*/temperature")?;
-    println!("   ✓ Found {} matching entries:", wildcard_entries.len());
-    for (key, value) in &wildcard_entries {
-        let payload_str = String::from_utf8_lossy(&value.payload);
-        println!("     - {}: {}", key, payload_str);
-    }
-    println!();
-
-    // 8. Update a value
-    // 8. Update an existing value
-    println!("8. Updating value...");
-    let time_u64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs();
-    let timestamp = Timestamp::new(NTP64(time_u64), TimestampId::rand());
-    let updated_value = StoredValue::new(
-        "24.8".as_bytes().to_vec(),
-        timestamp,
-        Encoding::APPLICATION_JSON,
+    // A latest-value storage: one value per key, last writer wins.
+    let state = RedbStorage::open(
+        dir.path().join("state.redb"),
+        RedbStorageConfig::new(),
+        "state",
+    )?;
+    state.put(
+        "robot/1/mode",
+        StoredValue::new(b"idle".to_vec(), at(20), Encoding::TEXT_PLAIN),
+    )?;
+    state.put(
+        "robot/1/mode",
+        StoredValue::new(b"moving".to_vec(), at(10), Encoding::TEXT_PLAIN),
+    )?;
+    // An older sample arriving late does not replace a newer one.
+    let outcome = state.put(
+        "robot/1/mode",
+        StoredValue::new(b"stale".to_vec(), at(15), Encoding::TEXT_PLAIN),
+    )?;
+    let mode = state.get("robot/1/mode")?.expect("stored");
+    println!(
+        "latest: robot/1/mode = {} (late sample: {outcome:?})",
+        String::from_utf8_lossy(&mode.payload)
     );
-    storage.put("demo/sensor/temperature", updated_value)?;
-    if let Some(value) = storage.get("demo/sensor/temperature")? {
-        let payload_str = String::from_utf8_lossy(&value.payload);
-        println!("   ✓ Updated temperature: {}\n", payload_str);
+
+    // A history storage keeps every sample. It must say how much it may keep.
+    let telemetry = RedbStorage::open(
+        dir.path().join("telemetry.redb"),
+        RedbStorageConfig::new()
+            .with_history(HistoryMode::All)
+            .with_retention(RetentionPolicy {
+                max_age_secs: Some(30),
+                ..Default::default()
+            }),
+        "telemetry",
+    )?;
+    for secs_ago in (0..60).rev().step_by(5) {
+        telemetry.put(
+            "robot/1/battery",
+            StoredValue::new(
+                format!("{}", 100 - secs_ago).into_bytes(),
+                at(secs_ago),
+                Encoding::TEXT_PLAIN,
+            ),
+        )?;
     }
 
-    // 9. Delete a value
-    println!("9. Deleting value...");
-    storage.delete("demo/device/status", timestamp)?;
-    println!("   ✓ Deleted 'demo/device/status'\n");
+    let last_20s = TimeRange {
+        start: TimeBound::Inclusive(SystemTime::now() - Duration::from_secs(20)),
+        end: TimeBound::Unbounded,
+    };
+    let window = telemetry.get_range("robot/1/battery", &last_20s)?;
+    println!("history: {} samples in the last 20s", window.len());
 
-    // 10. Count remaining entries
-    println!("10. Counting entries...");
-    let count = storage.count()?;
-    println!("    ✓ Total entries: {}\n", count);
+    // Retention normally runs on a timer inside the plugin; run one pass by hand.
+    let pass = telemetry.enforce_retention()?;
+    println!(
+        "retention: dropped {} of {} samples older than 30s",
+        pass.samples_dropped,
+        pass.samples_before.unwrap_or(0)
+    );
 
-    // 11. List all storages in backend
-    println!("11. Listing storages in backend...");
-    let storages = backend.list_storages()?;
-    println!("    ✓ Storages: {:?}\n", storages);
-
-    // 12. Cleanup (optional - clear all data)
-    println!("12. Cleaning up...");
-    storage.clear()?;
-    println!("    ✓ Cleared all entries from storage");
-    println!("    Final count: {}\n", storage.count()?);
-
-    println!("=== Example completed successfully! ===");
-
+    let stats = telemetry.stats()?;
+    println!(
+        "stats: {} key(s), {} sample(s), {} bytes on disk",
+        stats.key_count,
+        stats.sample_count,
+        stats.on_disk_bytes.unwrap_or(0)
+    );
     Ok(())
 }

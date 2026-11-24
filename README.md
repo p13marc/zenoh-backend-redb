@@ -551,33 +551,17 @@ Strip prefix saves storage space by removing the common prefix from stored keys:
 ## Architecture
 
 ```
-┌─────────────────────────────────────┐
-│       Zenoh Application             │
-└────────────┬────────────────────────┘
-             │
-             ↓
-┌─────────────────────────────────────┐
-│      RedbBackend                    │
-│  - Manages multiple storages        │
-│  - Configuration management         │
-└────────────┬────────────────────────┘
-             │
-             ↓
-┌─────────────────────────────────────┐
-│      RedbStorage                    │
-│  - CRUD operations                  │
-│  - Wildcard matching (* and **)     │
-│  - Dual-table design                │
-└────────────┬────────────────────────┘
-             │
-             ↓
-┌─────────────────────────────────────┐
-│         redb Database               │
-│  - ACID transactions                │
-│  - MVCC                             │
-│  - Zero-copy reads                  │
-└─────────────────────────────────────┘
+zenohd
+  └─ storage_manager plugin      subscribes, strips prefixes, resolves wildcards
+       └─ RedbVolume             one per `volumes` entry; fixes the history mode
+            └─ RedbStoragePlugin   one per storage; implements zenoh's `Storage`
+                 ├─ RedbStorage      one redb file: latest values, history, retention
+                 └─ background thread  retention, flushing, usage snapshots
 ```
+
+`RedbStorage` is the engine and can be used without `zenohd`
+(`cargo run --example basic_usage`). Everything else is the glue that makes it a
+zenoh storage backend.
 
 ## Comparison with Other Backends
 
@@ -587,7 +571,6 @@ Strip prefix saves storage space by removing the common prefix from stored keys:
 | ACID | Yes | Yes | Yes |
 | Zero-copy reads | Yes | No | Yes |
 | Concurrent writes | MVCC | Yes | Limited |
-| Memory-mapped | Yes | No | Yes |
 | Setup complexity | Simple | Moderate | Moderate |
 | Best for | Edge/Embedded | High-throughput | Read-heavy |
 
