@@ -5,7 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.0] - 2026-11-24
+
+### Upgrading from 0.5
+
+- **Copy your databases first if you may need to roll back.** 0.6 migrates a 0.5
+  database to format 2 the first time it opens it for writing, and 0.5 does not
+  notice that it is reading a migrated file (see "On-disk format 2" below).
+- **Do not run a 0.5 and a 0.6 router against the same storage directory at the same
+  time.** redb 5 locks files differently.
+- A `db_file` or `dir` that is absolute or contains `..` is now a startup error. Move
+  the root with `ZENOH_BACKEND_REDB_ROOT` instead.
+- A `_time` GET now returns at most 100 000 samples per key (the newest). Set
+  `max_samples_per_get` to raise it, or to `0` for the old unbounded behaviour.
+- A `read_only` storage needs a database that is already in format 2 and was closed
+  cleanly; open it writable once after upgrading.
+- Library users: `RedbStorage::new` is `RedbStorage::open`, and `RedbBackend` is gone.
 
 ### Changed
 - **redb 4.2 → 5.0** (#45). Databases written by 0.5 open as they are. redb changed

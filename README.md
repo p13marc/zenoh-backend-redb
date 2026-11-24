@@ -13,15 +13,22 @@ This backend provides persistent storage for Zenoh using redb, a pure Rust embed
 
 ### Features
 
-- **Pure Rust** - No C dependencies, fully memory-safe
-- **High Performance** - Zero-copy reads with MVCC support, thread-local buffers
-- **ACID Compliant** - Reliable data storage with transaction support
-- **Wildcard Queries** - Supports Zenoh wildcard patterns (`*` and `**`)
-- **Flexible Configuration** - Per-storage configuration options
-- **Read-Only Mode** - Optional read-only storage instances
-- **Prefix Stripping** - Efficient key storage with optional prefix removal
-- **Embedded** - No separate database server required
-- **Persistent** - Data survives zenohd restarts
+- **Pure Rust, embedded** - no C dependencies, no database server: one redb file
+  per storage
+- **Latest value or full history** - a volume keeps one value per key, or every
+  sample, addressable with `_time` selectors
+- **Bounded** - retention by age, size, per-key count and decimation; optional expiry
+  of keys that have gone quiet; a capped page cache; capped `_time` replies
+- **Durable, with a stated loss bound** - fsync per commit, or commits flushed every
+  few seconds
+- **Recovers by itself** - a storage whose disk filled up reopens its database when
+  there is space again, without a router restart
+- **Read-only storages** - serve a database without write access to it; several
+  routers can share one
+- **Observable** - size, counts, cache, retention and health on the admin space,
+  without reading the database to answer
+- **Zenoh's own key matching** - `*`, `**`, `$*` and verbatim (`@`) chunks behave
+  exactly as the router's do
 
 ## Installation
 
@@ -768,6 +775,8 @@ a state doc outlives its publisher, a DELETE retires it, `*` cannot reach a
 in, every event record survives, plus a `_time`-ranged GET and a retention pass. A
 failure blocks merge.
 
-The Rust API is still moving — 0.4 changed `RedbStorage::put`/`delete` signatures —
-and `history: "all"` has not yet run in a production deployment. Treat the plugin
-interface and on-disk format as stable, and the library API as not.
+The Rust API is still moving — 0.6 removed a layer of it — and `history: "all"` has
+had one production deployment, which is where most of 0.5's and 0.6's fixes came
+from. The on-disk format is versioned and migrated automatically (see
+[On-disk format and upgrades](#on-disk-format-and-upgrades)). Treat the plugin
+interface as stable and the library API as not.
