@@ -175,6 +175,72 @@ fn spawn_background(
         .expect("spawn storage background thread");
 }
 
+/// Where a storage's database lives, from its `dir` or `db_file` property.
+///
+/// Both are names **inside the volume's root** and nothing else. They used to be
+/// pushed onto the root unchecked, so an absolute `db_file` replaced the root
+/// outright and a `..` walked out of it: the storage opened, or created, a file
+/// anywhere the router could write. That is a footgun in a config file, and more
+/// than one where the admin space is writable, since storages can be created at
+/// runtime by whoever may PUT on the router's config.
+fn resolve_db_path(
+    root: &std::path::Path,
+    volume_cfg: &serde_json::Map<String, serde_json::Value>,
+    storage: &str,
+) -> ZResult<PathBuf> {
+    let (property, value) = match (
+        volume_cfg.get(PROP_STORAGE_DIR),
+        volume_cfg.get(PROP_STORAGE_DB_FILE),
+    ) {
+        (Some(dir), _) => (PROP_STORAGE_DIR, dir),
+        (None, Some(file)) => (PROP_STORAGE_DB_FILE, file),
+        (None, None) => bail!(
+            "Storage '{}': one of `{}` or `{}` is required, to name its database",
+            storage,
+            PROP_STORAGE_DIR,
+            PROP_STORAGE_DB_FILE
+        ),
+    };
+    let Some(name) = value.as_str() else {
+        bail!(
+            "Storage '{}': `{}` must be a string, got {}",
+            storage,
+            property,
+            value
+        )
+    };
+
+    // Only plain path components: no root, no drive prefix, no `.` or `..`.
+    let confined = !name.is_empty()
+        && std::path::Path::new(name)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+    if !confined {
+        bail!(
+            "Storage '{}': `{}: \"{}\"` is not a name inside the storage root {:?}. It \
+             must be a relative path with no `..` in it. To keep databases somewhere \
+             else, move the root with {}.",
+            storage,
+            property,
+            name,
+            root,
+            SCOPE_ENV_VAR
+        )
+    }
+
+    Ok(if property == PROP_STORAGE_DIR {
+        db_path_for_dir(root, name, storage)
+    } else {
+        // `db_file` is the file name as given; `.redb` is only added to a name
+        // that has no extension of its own.
+        let mut path = root.join(name);
+        if path.extension().is_none() {
+            path.set_extension("redb");
+        }
+        path
+    })
+}
+
 /// The database file for a storage's `dir` property: `<base>/<dir>.redb`.
 ///
 /// `.redb` is **appended**. This used `PathBuf::set_extension`, which *replaces*
@@ -469,26 +535,22 @@ impl Volume for RedbVolume {
             }
         };
 
-        // Determine database path
-        let db_path = if let Some(serde_json::Value::String(dir)) = volume_cfg.get(PROP_STORAGE_DIR)
+        let db_path = resolve_db_path(&self.root, volume_cfg, &config.name)?;
+        // A name may have directories in it (`dir: "fleet/telemetry"`); make them,
+        // unless the database is not supposed to be created at all.
+        if create_db
+            && !read_only
+            && let Some(parent) = db_path.parent()
         {
-            db_path_for_dir(&self.root, dir, &config.name)
-        } else if let Some(serde_json::Value::String(filename)) =
-            volume_cfg.get(PROP_STORAGE_DB_FILE)
-        {
-            let mut path = self.root.clone();
-            path.push(filename);
-            if path.extension().is_none() {
-                path.set_extension("redb");
-            }
-            path
-        } else {
-            bail!(
-                "Required property `{}` or `{}` for redb Storage must be a string",
-                PROP_STORAGE_DIR,
-                PROP_STORAGE_DB_FILE
-            )
-        };
+            std::fs::create_dir_all(parent).map_err(|e| {
+                zerror!(
+                    "Storage '{}': cannot create {:?}: {}",
+                    config.name,
+                    parent,
+                    e
+                )
+            })?;
+        }
 
         // Create storage configuration
         let mut storage_config = RedbStorageConfig::new()
@@ -1304,6 +1366,143 @@ mod tests {
             db_path_for_dir(base, "telemetry", "s"),
             base.join("telemetry.redb")
         );
+    }
+
+    /// #50: `dir` and `db_file` name a database inside the root. Neither may point
+    /// out of it.
+    #[tokio::test]
+    async fn test_a_storage_path_cannot_leave_the_root() {
+        let outside = TempDir::new().unwrap();
+        let dir = TempDir::new().unwrap();
+        let volume = test_volume(&dir, HistoryMode::Latest);
+        let absolute = outside.path().join("x.redb").to_string_lossy().to_string();
+
+        for (property, value) in [
+            ("db_file", absolute.as_str()),
+            ("dir", absolute.as_str()),
+            ("dir", "../escape"),
+            ("db_file", "a/../../escape.redb"),
+            ("dir", "./here"),
+            ("dir", ""),
+        ] {
+            let Err(err) = volume
+                .create_storage(storage_config_for(json!({ property: value }), &dir))
+                .await
+            else {
+                panic!("`{property}: \"{value}\"` must be rejected");
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("storage root"), "{msg}");
+            assert!(msg.contains(property), "{msg}");
+        }
+        assert_eq!(
+            std::fs::read_dir(outside.path()).unwrap().count(),
+            0,
+            "nothing may have been created outside the root"
+        );
+
+        // A wrong type is said to be a wrong type.
+        let Err(err) = volume
+            .create_storage(storage_config_for(json!({ "dir": 5 }), &dir))
+            .await
+        else {
+            panic!("a numeric dir must be rejected");
+        };
+        assert!(err.to_string().contains("must be a string"), "{err}");
+        let Err(err) = volume
+            .create_storage(storage_config_for(json!({}), &dir))
+            .await
+        else {
+            panic!("a storage with no path must be rejected");
+        };
+        assert!(err.to_string().contains("is required"), "{err}");
+
+        // Names inside the root work, directories included.
+        for (property, value, file) in [
+            ("dir", "plain", "plain.redb"),
+            ("dir", "fleet/telemetry", "fleet/telemetry.redb"),
+            ("db_file", "named.redb", "named.redb"),
+            ("db_file", "bare", "bare.redb"),
+        ] {
+            volume
+                .create_storage(storage_config_for(json!({ property: value }), &dir))
+                .await
+                .map(|_| ())
+                .unwrap_or_else(|e| panic!("`{property}: \"{value}\"` must work: {e}"));
+            assert!(dir.path().join(file).exists(), "{file}");
+        }
+    }
+
+    /// #47: through the plugin, a `read_only` storage serves an existing database
+    /// and creates nothing.
+    #[tokio::test]
+    async fn test_a_read_only_storage_serves_and_creates_nothing() {
+        let dir = TempDir::new().unwrap();
+        let volume = test_volume(&dir, HistoryMode::Latest);
+        let key = OwnedKeyExpr::new("test/k").unwrap();
+
+        // No database yet: a read-only storage has nothing to open, and must not
+        // make one.
+        let Err(err) = volume
+            .create_storage(storage_config_for(
+                json!({ "dir": "cfg", "read_only": true }),
+                &dir,
+            ))
+            .await
+        else {
+            panic!("a read-only storage with no database must not start");
+        };
+        assert!(err.to_string().contains("does not exist"), "{err}");
+        assert!(!dir.path().join("cfg.redb").exists());
+
+        // Populate it writable, then serve it read-only.
+        {
+            let mut writable = volume
+                .create_storage(storage_config_for(json!({ "dir": "cfg" }), &dir))
+                .await
+                .map_err(|e| e.to_string())
+                .unwrap();
+            writable
+                .put(
+                    Some(key.clone()),
+                    ZBytes::from("v"),
+                    Encoding::ZENOH_STRING,
+                    Timestamp::new(NTP64(100), zenoh::time::TimestampId::rand()),
+                )
+                .await
+                .unwrap();
+        }
+        // The writable storage's background thread lets go of the database a
+        // moment after the storage is dropped.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut storage = loop {
+            match volume
+                .create_storage(storage_config_for(
+                    json!({ "dir": "cfg", "read_only": true }),
+                    &dir,
+                ))
+                .await
+            {
+                Ok(storage) => break storage,
+                Err(e) => assert!(Instant::now() < deadline, "never opened: {e}"),
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        assert_eq!(storage.get(Some(key.clone()), "").await.unwrap().len(), 1);
+        assert!(
+            storage
+                .put(
+                    Some(key),
+                    ZBytes::from("w"),
+                    Encoding::ZENOH_STRING,
+                    Timestamp::new(NTP64(200), zenoh::time::TimestampId::rand()),
+                )
+                .await
+                .is_err()
+        );
+        let status: serde_json::Value = serde_json::to_value(storage.get_admin_status()).unwrap();
+        assert_eq!(status["stats"]["key_count"], 1);
     }
 
     /// Storages whose `dir`s differ only after a dot all start, each on its own

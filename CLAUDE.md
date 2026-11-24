@@ -232,9 +232,9 @@ Backend is configured through Zenoh's storage_manager plugin:
 | Property | Type | Default | Description |
 |----------|------|---------|-------------|
 | `dir` | string | required | Database name; the file is `<dir>.redb`, with `.redb` *appended* (a dot in `dir` is kept) |
-| `db_file` | string | - | Alternative to dir, explicit filename |
+| `db_file` | string | - | Alternative to dir: the file name as given. Both must stay inside the root (relative, no `..`); `resolve_db_path` rejects anything else |
 | `create_db` | bool | true | Create database if missing |
-| `read_only` | bool | false | Read-only mode |
+| `read_only` | bool | false | Opens through redb's `ReadOnlyDatabase` (`Handle::ReadOnly`): no write transaction ever, the file is not modified, and read-only storages can share it |
 | `cache_size` | number | `67108864` (64 MiB) | redb page-cache budget in bytes (never redb’s own 1 GiB default) |
 | `fsync` | bool | true | `Durability::Immediate` vs `Durability::None`. redb has no level between, and a non-durable commit is not persisted *at all* until a durable one follows, so with `false` the backend promotes a commit to durable every `flush_interval_secs` |
 | `flush_interval_secs` | number | `5` | With `fsync: false`, the longest a write stays unpersisted (and the longest redb accumulates per-commit memory). Ignored with `fsync: true` |

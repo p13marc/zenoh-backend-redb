@@ -42,6 +42,10 @@ pub enum RedbBackendError {
     #[error("Key encoding error: {0}")]
     KeyEncodingError(String),
 
+    /// A write was attempted on a storage opened with `read_only: true`.
+    #[error("the storage is read-only")]
+    ReadOnly,
+
     /// I/O error.
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),

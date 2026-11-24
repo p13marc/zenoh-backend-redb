@@ -514,6 +514,191 @@ impl StoredValue {
     }
 }
 
+/// The four tables a database of this backend holds, by name.
+const TABLE_NAMES: [&str; 4] = ["payloads", "data_info", "history_payloads", "history_info"];
+
+/// An open database: writable, or — for a `read_only` storage — not.
+///
+/// redb gives the two different types on purpose. A [`redb::ReadOnlyDatabase`]
+/// cannot begin a write transaction, opens a file the process may not write to, and
+/// shares it with any number of other read-only handles. Going through it is what
+/// makes `read_only: true` a property of the file access rather than a flag checked
+/// before each PUT: a read-only storage used to open its database read-write and
+/// commit a transaction to it on startup.
+enum Handle {
+    ReadWrite(Database),
+    ReadOnly(redb::ReadOnlyDatabase),
+}
+
+impl Handle {
+    /// Open (or create) the database with the cache budget and access the config
+    /// asks for, and leave it ready to serve: its tables exist.
+    ///
+    /// The cache size is always set explicitly. redb's own default is 1 GiB, which
+    /// on a small guest reads as a slow multi-day RSS climb ending at the OOM killer
+    /// rather than as a configuration mistake — so this backend never inherits it.
+    fn open(path: &Path, config: &RedbStorageConfig) -> Result<Self> {
+        let mut builder = Database::builder();
+        builder.set_cache_size(config.cache_size);
+
+        // A database that was not closed cleanly is repaired when it is opened, and
+        // on a multi-gigabyte file that takes minutes during which the router looks
+        // hung. Say what is happening, every ten percent.
+        let repairing = path.to_path_buf();
+        let last_decile = std::cell::Cell::new(None);
+        builder.set_repair_callback(move |session| {
+            let percent = (session.progress() * 100.0) as u32;
+            if last_decile.replace(Some(percent / 10)) != Some(percent / 10) {
+                warn!(
+                    "{:?} was not closed cleanly; repairing before opening: {}%",
+                    repairing, percent
+                );
+            }
+        });
+
+        if config.read_only {
+            let db = builder
+                .open_read_only(path)
+                .map_err(|e| Self::explain_open_error(path, config, e))?;
+            Self::require_tables(path, &db)?;
+            return Ok(Self::ReadOnly(db));
+        }
+
+        // `create_db: false` means "this file must already exist".
+        let db = if config.create_db {
+            builder.create(path)
+        } else {
+            builder.open(path)
+        }
+        .map_err(|e| Self::explain_open_error(path, config, e))?;
+
+        // Durable whatever `fsync` says: this runs once, and it gives an
+        // `fsync: false` storage a durable starting point to count its flush
+        // interval from.
+        let mut write_txn = db.begin_write()?;
+        write_txn.set_durability(Durability::Immediate)?;
+        {
+            write_txn.open_table(PAYLOADS_TABLE)?;
+            write_txn.open_table(DATA_INFO_TABLE)?;
+            // The history tables are created in both modes. Opening a table is
+            // cheap, and it means switching a volume to `history: "all"` needs no
+            // migration step on a database that already exists.
+            write_txn.open_table(HISTORY_PAYLOADS_TABLE)?;
+            write_txn.open_table(HISTORY_INFO_TABLE)?;
+        }
+        write_txn.commit()?;
+
+        Ok(Self::ReadWrite(db))
+    }
+
+    /// A read-only open cannot create what is missing, so check it is all there.
+    ///
+    /// The alternative — reading a missing table as an empty one — would serve
+    /// "no data" from a file that is not this backend's at all.
+    fn require_tables(path: &Path, db: &redb::ReadOnlyDatabase) -> Result<()> {
+        use redb::TableHandle;
+
+        let read_txn = db.begin_read()?;
+        let present: Vec<String> = read_txn
+            .list_tables()?
+            .map(|table| table.name().to_string())
+            .collect();
+        let missing: Vec<&str> = TABLE_NAMES
+            .into_iter()
+            .filter(|name| !present.iter().any(|p| p == name))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        Err(RedbBackendError::other(format!(
+            "{path:?} has no {} table, so it is not a database this backend wrote (or it \
+             was written before 0.4). A `read_only` storage cannot create it. Open the \
+             database once with `read_only: false`, or point this storage at the right file.",
+            missing.join(" / ")
+        )))
+    }
+
+    /// Turn the errors an operator can act on into ones that say how.
+    fn explain_open_error(
+        path: &Path,
+        config: &RedbStorageConfig,
+        e: redb::DatabaseError,
+    ) -> RedbBackendError {
+        // "No such file or directory" is technically true and completely
+        // unhelpful: the file is missing *because we were told not to create it*.
+        // Say which setting caused that, since the two that can are far apart in a
+        // config file.
+        if !path.exists() {
+            return RedbBackendError::other(format!(
+                "{path:?} does not exist, and this storage is configured not to \
+                 create it ({}). Either create the database first, or set \
+                 `create_db: true` and `read_only: false`. ({e})",
+                if config.read_only {
+                    "`read_only: true` implies the database must already exist"
+                } else {
+                    "`create_db: false`"
+                }
+            ));
+        }
+        match e {
+            // redb 3 dropped support for the v2 file format this crate wrote before
+            // 0.4. The error you get is about a bad magic number, which reads as
+            // corruption rather than as a version skew, so say what it really is.
+            redb::DatabaseError::UpgradeRequired(_) => RedbBackendError::other(format!(
+                "{path:?} was written by an older redb file format that this \
+                 version cannot open. Either delete it, or open it once with redb 2.6 \
+                 and call `Database::upgrade()` before using this version. ({e})"
+            )),
+            // A read-only open will not repair, and a writable one that is asked to
+            // abort a repair is not something this backend does.
+            redb::DatabaseError::RepairAborted if config.read_only => {
+                RedbBackendError::other(format!(
+                    "{path:?} was not closed cleanly and needs a repair, which a \
+                     `read_only` storage cannot do. Open it once with `read_only: false`."
+                ))
+            }
+            redb::DatabaseError::DatabaseAlreadyOpen => RedbBackendError::other(format!(
+                "{path:?} is already open{}. Two storages cannot share one database file \
+                 unless every one of them is `read_only`.",
+                if config.read_only {
+                    " for writing, by another storage or another process"
+                } else {
+                    ", by another storage or another process"
+                }
+            )),
+            e => RedbBackendError::from(e),
+        }
+    }
+
+    fn begin_read(&self) -> Result<redb::ReadTransaction> {
+        Ok(match self {
+            Self::ReadWrite(db) => db.begin_read()?,
+            Self::ReadOnly(db) => db.begin_read()?,
+        })
+    }
+
+    fn begin_write(&self) -> Result<redb::WriteTransaction> {
+        match self {
+            Self::ReadWrite(db) => Ok(db.begin_write()?),
+            Self::ReadOnly(_) => Err(RedbBackendError::ReadOnly),
+        }
+    }
+
+    fn cache_stats(&self) -> redb::CacheStats {
+        match self {
+            Self::ReadWrite(db) => db.cache_stats(),
+            Self::ReadOnly(db) => db.cache_stats(),
+        }
+    }
+
+    fn close(self) -> std::result::Result<(), redb::DatabaseError> {
+        match self {
+            Self::ReadWrite(db) => db.close(),
+            Self::ReadOnly(db) => db.close(),
+        }
+    }
+}
+
 /// The main storage implementation using redb.
 pub struct RedbStorage {
     /// The redb database instance. `None` only once the storage is being dropped.
@@ -522,7 +707,7 @@ pub struct RedbStorage {
     /// needs `&mut`, while every other operation needs `&`. Read guards are held
     /// just long enough to begin a transaction — redb's transactions are owned, not
     /// borrowed from the database — so concurrent readers do not contend.
-    db: RwLock<Option<Database>>,
+    db: RwLock<Option<Handle>>,
 
     /// The database file. The one copy of the path: what was opened is what
     /// `max_bytes` measures and what the statistics report.
@@ -545,80 +730,12 @@ pub struct RedbStorage {
 }
 
 impl RedbStorage {
-    /// Open (or create) the redb database with the cache budget and create/open
-    /// semantics the storage config asks for.
-    ///
-    /// The cache size is always set explicitly. redb's own default is 1 GiB, which
-    /// on a small guest reads as a slow multi-day RSS climb ending at the OOM killer
-    /// rather than as a configuration mistake — so this backend never inherits it.
-    ///
-    /// `read_only` is still enforced in this crate rather than by redb:
-    /// `Builder::open_read_only` returns a distinct `ReadOnlyDatabase` type, which
-    /// would split every transaction call site below for no behavioural gain.
-    fn open_database(path: &Path, config: &RedbStorageConfig) -> Result<Database> {
-        let mut builder = Database::builder();
-        builder.set_cache_size(config.cache_size);
-
-        // A database that was not closed cleanly is repaired when it is opened, and
-        // on a multi-gigabyte file that takes minutes during which the router looks
-        // hung. Say what is happening, every ten percent.
-        let repairing = path.to_path_buf();
-        let last_decile = std::cell::Cell::new(None);
-        builder.set_repair_callback(move |session| {
-            let percent = (session.progress() * 100.0) as u32;
-            if last_decile.replace(Some(percent / 10)) != Some(percent / 10) {
-                warn!(
-                    "{:?} was not closed cleanly; repairing before opening: {}%",
-                    repairing, percent
-                );
-            }
-        });
-
-        // `read_only` and `create_db: false` both mean "this file must already exist".
-        let result = if config.read_only || !config.create_db {
-            builder.open(path)
-        } else {
-            builder.create(path)
-        };
-
-        result.map_err(|e| {
-            // "No such file or directory" is technically true and completely
-            // unhelpful: the file is missing *because we were told not to create
-            // it*. Say which setting caused that, since the two that can are far
-            // apart in a config file.
-            if !path.exists() {
-                return RedbBackendError::other(format!(
-                    "{path:?} does not exist, and this storage is configured not to \
-                     create it ({}). Either create the database first, or set \
-                     `create_db: true` and `read_only: false`. ({e})",
-                    if config.read_only {
-                        "`read_only: true` implies the database must already exist"
-                    } else {
-                        "`create_db: false`"
-                    }
-                ));
-            }
-            // redb 3 dropped support for the v2 file format this crate wrote before
-            // 0.4. The error you get is about a bad magic number, which reads as
-            // corruption rather than as a version skew, so say what it really is.
-            if matches!(e, redb::DatabaseError::UpgradeRequired(_)) {
-                RedbBackendError::other(format!(
-                    "{path:?} was written by an older redb file format that this \
-                     version cannot open. Either delete it, or open it once with redb 2.6 \
-                     and call `Database::upgrade()` before using this version. ({e})"
-                ))
-            } else {
-                RedbBackendError::from(e)
-            }
-        })
-    }
-
     /// Run `f` against the database.
     ///
     /// A poisoned lock is recovered rather than propagated: the guard is only ever
     /// held to start a transaction, so a panic elsewhere cannot have left redb's own
     /// state torn — redb's transactions are atomic independently of this lock.
-    fn with_db<T>(&self, f: impl FnOnce(&Database) -> Result<T>) -> Result<T> {
+    fn with_db<T>(&self, f: impl FnOnce(&Handle) -> Result<T>) -> Result<T> {
         match self.db.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
             Some(db) => f(db),
             None => Err(RedbBackendError::other("the database is closed")),
@@ -627,13 +744,13 @@ impl RedbStorage {
 
     /// Begin a read transaction.
     fn begin_read(&self) -> Result<redb::ReadTransaction> {
-        self.with_db(|db| Ok(db.begin_read()?))
+        self.with_db(Handle::begin_read)
     }
 
     /// Begin a write transaction. Its durability is decided when it is committed,
     /// by [`RedbStorage::commit`].
     fn begin_write(&self) -> Result<redb::WriteTransaction> {
-        self.with_db(|db| Ok(db.begin_write()?))
+        self.with_db(Handle::begin_write)
     }
 
     /// Commit a write transaction with the configured durability.
@@ -723,25 +840,7 @@ impl RedbStorage {
         let name = name.into();
         info!("Opening redb storage '{}' at {:?}", name, path);
 
-        let db = Self::open_database(&path, &config)?;
-
-        // Initialize both tables
-        // Durable whatever `fsync` says: this runs once, and it gives an
-        // `fsync: false` storage a durable starting point to count its flush
-        // interval from.
-        let mut write_txn = db.begin_write()?;
-        write_txn.set_durability(Durability::Immediate)?;
-        {
-            // Create both tables if they don't exist
-            write_txn.open_table(PAYLOADS_TABLE)?;
-            write_txn.open_table(DATA_INFO_TABLE)?;
-            // Created unconditionally, in both modes. Opening a table is cheap, and
-            // creating them up front means switching a volume to `history: "all"`
-            // does not need a migration step on a database that already exists.
-            write_txn.open_table(HISTORY_PAYLOADS_TABLE)?;
-            write_txn.open_table(HISTORY_INFO_TABLE)?;
-        }
-        write_txn.commit()?;
+        let db = Handle::open(&path, &config)?;
 
         Ok(Self {
             db: RwLock::new(Some(db)),
@@ -780,7 +879,7 @@ impl RedbStorage {
     /// timestamp comparison.
     pub fn put(&self, key: &str, value: StoredValue) -> Result<WriteOutcome> {
         if self.config.read_only {
-            return Err(RedbBackendError::other("Storage is read-only"));
+            return Err(RedbBackendError::ReadOnly);
         }
 
         trace!("Putting key: {}", key);
@@ -907,7 +1006,7 @@ impl RedbStorage {
     /// Delete a key-value pair.
     pub fn delete(&self, key: &str, timestamp: Timestamp) -> Result<WriteOutcome> {
         if self.config.read_only {
-            return Err(RedbBackendError::other("Storage is read-only"));
+            return Err(RedbBackendError::ReadOnly);
         }
 
         trace!("Deleting key: {}", key);
@@ -1603,7 +1702,7 @@ impl RedbStorage {
         const BACKOFF: Duration = Duration::from_millis(50);
 
         let mut guard = self.db.write().unwrap_or_else(|e| e.into_inner());
-        let Some(db) = guard.as_mut() else {
+        let Some(Handle::ReadWrite(db)) = guard.as_mut() else {
             return Compaction::Refused;
         };
         for attempt in 1..=ATTEMPTS {
@@ -1962,7 +2061,7 @@ impl RedbStorage {
     /// Clear all entries from the storage.
     pub fn clear(&self) -> Result<()> {
         if self.config.read_only {
-            return Err(RedbBackendError::other("Storage is read-only"));
+            return Err(RedbBackendError::ReadOnly);
         }
 
         info!("Clearing all entries from storage");
@@ -3337,6 +3436,151 @@ mod tests {
         assert_eq!(pass.samples_dropped, 0);
         assert!(pass.ran_at.is_none());
         assert_eq!(storage.get_range("k", &full_range()).unwrap().len(), 10);
+    }
+
+    /// A database with a latest value, a tombstone and some history, closed cleanly.
+    fn populated(path: &std::path::Path) {
+        let id = TimestampId::rand();
+        let storage = bulk_storage(
+            RetentionPolicy {
+                max_age_secs: Some(u64::MAX),
+                ..Default::default()
+            },
+            path,
+        );
+        put_aged(&storage, "k", 20, 10, b"v", id);
+        put_aged(&storage, "gone", 1, 10, b"v", id);
+        storage.delete("gone", at(now_secs(), id)).unwrap();
+    }
+
+    fn read_only(path: &std::path::Path) -> Result<RedbStorage> {
+        let config = RedbStorageConfig::default()
+            .with_history(HistoryMode::All)
+            .with_read_only(true)
+            // A policy that would empty the storage, were it ever run.
+            .with_retention(RetentionPolicy {
+                max_age_secs: Some(1),
+                max_bytes: Some(1),
+                ..Default::default()
+            });
+        RedbStorage::open(path, config, "ro")
+    }
+
+    /// #47: a `read_only` storage must not change a byte of the file. It used to
+    /// open it read-write and commit a transaction to it at startup.
+    #[test]
+    fn a_read_only_storage_does_not_touch_the_file() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ro.redb");
+        populated(&path);
+        let before = std::fs::read(&path).unwrap();
+
+        {
+            let storage = read_only(&path).unwrap();
+
+            // It serves everything a writable one would...
+            assert_eq!(storage.get("k").unwrap().unwrap().payload, b"v");
+            assert!(storage.get("gone").unwrap().is_none());
+            assert_eq!(storage.get_range("k", &full_range()).unwrap().len(), 20);
+            assert_eq!(storage.count().unwrap(), 1);
+            assert_eq!(storage.get_all_timestamps().unwrap().len(), 2);
+            let stats = storage.stats().unwrap();
+            assert_eq!((stats.key_count, stats.sample_count), (2, 22));
+            assert_eq!(storage.usage().unwrap().tombstones, 1);
+
+            // ...and refuses everything that would write, including the things that
+            // are not requests: retention and flushing.
+            let id = TimestampId::rand();
+            let put = storage.put(
+                "k",
+                StoredValue::new(b"x".to_vec(), at(now_secs(), id), Encoding::ZENOH_BYTES),
+            );
+            assert!(matches!(put, Err(RedbBackendError::ReadOnly)), "{put:?}");
+            assert!(matches!(
+                storage.delete("k", at(now_secs(), id)),
+                Err(RedbBackendError::ReadOnly)
+            ));
+            assert!(matches!(storage.clear(), Err(RedbBackendError::ReadOnly)));
+            let pass = storage.enforce_retention().unwrap();
+            assert!(pass.ran_at.is_none(), "retention must not run");
+            assert!(!storage.flush().unwrap());
+        }
+
+        assert!(
+            std::fs::read(&path).unwrap() == before,
+            "opening, serving and closing a read-only storage changed the file"
+        );
+    }
+
+    /// #47: a file the process may not write to is exactly what `read_only` is for.
+    #[cfg(unix)]
+    #[test]
+    fn a_read_only_storage_opens_a_file_it_cannot_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("locked.redb");
+        populated(&path);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let storage = read_only(&path).expect("a 0444 file must open read-only");
+        assert_eq!(storage.get_range("k", &full_range()).unwrap().len(), 20);
+    }
+
+    /// #47: any number of read-only storages may share a file; a writer may not
+    /// join them, nor they a writer.
+    #[test]
+    fn read_only_storages_share_a_file_and_exclude_a_writer() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("shared.redb");
+        populated(&path);
+
+        let first = read_only(&path).unwrap();
+        let second = read_only(&path).expect("a second read-only storage must open");
+        assert_eq!(first.count().unwrap(), 1);
+        assert_eq!(second.count().unwrap(), 1);
+
+        let Err(err) = RedbStorage::open(&path, RedbStorageConfig::default(), "rw") else {
+            panic!("a writer must not open a file that read-only storages hold");
+        };
+        assert!(err.to_string().contains("already open"), "{err}");
+        drop((first, second));
+
+        let writer = RedbStorage::open(&path, RedbStorageConfig::default(), "rw").unwrap();
+        let Err(err) = read_only(&path) else {
+            panic!("a read-only storage must not open a file a writer holds");
+        };
+        assert!(
+            err.to_string().contains("already open for writing"),
+            "{err}"
+        );
+        drop(writer);
+    }
+
+    /// #47: a read-only open cannot create tables, and must not pretend a file that
+    /// has none is an empty storage.
+    #[test]
+    fn a_read_only_storage_refuses_a_database_that_is_not_ours() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("foreign.redb");
+        {
+            const OTHER: TableDefinition<&str, u64> = TableDefinition::new("someone_elses");
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(OTHER).unwrap().insert("a", 1).unwrap();
+            txn.commit().unwrap();
+        }
+
+        let Err(err) = read_only(&path) else {
+            panic!("a database without this backend's tables must be refused");
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("payloads"), "{msg}");
+        assert!(msg.contains("read_only"), "{msg}");
+
+        // Writable, the same file is simply adopted: the tables are created.
+        RedbStorage::open(&path, RedbStorageConfig::default(), "rw").unwrap();
+        read_only(&path).expect("and then it opens read-only");
     }
 
     /// `read_only` / `create_db: false` on a database that does not exist must fail

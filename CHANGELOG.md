@@ -39,6 +39,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never be full.
 - A compaction that is refused (a transaction was alive) no longer counts as "the
   file is as small as it gets".
+- **`read_only: true` opened the database read-write and committed to it** (#47).
+  It now opens through redb's read-only handle: the file is not modified, a file the
+  router cannot write to opens, and any number of read-only storages can share one
+  database. A read-only storage refuses a file that lacks this backend's tables or
+  needs a repair, instead of creating or repairing it.
+- **`dir` and `db_file` could point outside the backend root** (#50). An absolute
+  `db_file` replaced the root and a `..` walked out of it. Both are now rejected at
+  storage creation. **Breaking** for a config that used an absolute `db_file` on
+  purpose: move the root with `ZENOH_BACKEND_REDB_ROOT` instead. A name with
+  directories in it (`dir: "fleet/telemetry"`) works, and the directories are
+  created.
 
 ## [0.5.0] - 2026-11-23
 

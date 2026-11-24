@@ -79,13 +79,13 @@ Each storage instance can be individually configured:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `dir` | String | required | Database name: the file is `<dir>.redb` under the backend root. A dot in the name is kept (`telemetry.v1` → `telemetry.v1.redb`). |
-| `db_file` | String | - | Alternative to `dir`, explicit database filename |
+| `dir` | String | required | Database name: the file is `<dir>.redb` under the backend root. A dot in the name is kept (`telemetry.v1` → `telemetry.v1.redb`). Must stay inside the root: relative, no `..`. |
+| `db_file` | String | - | Alternative to `dir`: the file name as given (`.redb` is added only if it has no extension). Same rule: inside the root. |
 | `cache_size` | Number | `67108864` (64 MiB) | redb page-cache budget in bytes. See [Why `cache_size` has a default](#why-cache_size-has-a-default). |
 | `fsync` | Boolean | `true` | Every commit reaches the disk before it returns. See [Durability](#durability). |
 | `flush_interval_secs` | Number | `5` | With `fsync: false`, the longest a write stays unpersisted. Ignored with `fsync: true`. |
 | `create_db` | Boolean | `true` | Create database if it doesn't exist |
-| `read_only` | Boolean | `false` | Read-only mode |
+| `read_only` | Boolean | `false` | Open the database without write access. See [Read-Only Storage](#read-only-storage). |
 
 And one **volume**-level property:
 
@@ -523,6 +523,18 @@ Strip prefix saves storage space by removing the common prefix from stored keys:
   }
 }
 ```
+
+A read-only storage opens its database without write access, through redb's
+read-only handle. That is a property of how the file is opened, not a flag checked
+before each PUT:
+
+- **the file is not modified**, not even at startup — it can be on read-only media,
+  or owned by someone else;
+- **any number of read-only storages can share one file**, in one router or several;
+  a writable storage and a read-only one cannot;
+- the database **must already exist**, be this backend's, and have been closed
+  cleanly: a read-only storage cannot create tables or repair a file;
+- PUT and DELETE are refused, and retention, flushing and compaction do not run.
 
 ### Custom Cache Size
 
